@@ -52,10 +52,31 @@ dmypy.json
 
 # Data & Logs (local, not committed)
 data/
+data/parquet/
 logs/
 *.parquet
 *.db
 *.sqlite
+*.duckdb
+*.duckdb-wal
+
+# Backtest & research outputs
+backtest_results/
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.pt
+*.pth
+model_artifacts/
+backtest_cache/
+factor_cache/
+
+# Reports & analysis outputs
+reports/
+*.html
+*.pdf
+attribution_reports/
 
 # Secrets & env
 .env
@@ -63,11 +84,32 @@ logs/
 .env.*.local
 *.pem
 *.key
+secrets/
 
-# Scratch (research notebooks, demos — optional)
+# Scratch (research notebooks, demos — optional; commit .py only)
 scratch/*.ipynb
+scratch/.ipynb_checkpoints/
 scratch/*.csv
 scratch/*.xlsx
+scratch/*.json
+scratch/data/
+scratch/plots/
+scratch/*.png
+scratch/*.jpg
+
+# Exchange API response caches (if used during dev)
+api_cache/
+ccxt_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+jupyter_notebooks/
+
+# Polars/Pandas temporary files
+.polars_cache/
+*.feather
+*.arrow
 
 # MacOS
 .DS_Store
