@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "c=$(jq -r '.tool_input.command // \"\"'); printf '%s' \"$c\" | grep -qE 'git[[:space:]]+commit' && printf '%s' \"$c\" | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com' && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the git commit. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Co-Authored-By, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in commit messages. Strip every such line and retry.\"}}' || true",
+            "statusMessage": "Attribution guard"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__github__(create_pull_request|update_pull_request|add_issue_comment|pull_request_review_write|add_comment_to_pending_review|add_reply_to_pull_request_comment)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input | tostring' | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com' && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the PR/comment. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in PR titles, bodies, and comments. Strip it and retry.\"}}' || true",
+            "statusMessage": "Attribution guard"
+          }
+        ]
+      }
+    ]
+  }
+}
