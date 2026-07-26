@@ -20,6 +20,22 @@ dependencies = [
     "pydantic>=2.0.0",
 ]
 
+[tool.setuptools]
+packages = [
+    "datastore",
+    "loaders",
+    "audit",
+    "universe",
+    "backtest",
+    "signals",
+    "risk",
+    "portfolio",
+    "execution",
+    "attribution",
+    "pipeline",
+    "tests",
+]
+
 [project.optional-dependencies]
 dev = [
     "ruff>=0.1.0",
