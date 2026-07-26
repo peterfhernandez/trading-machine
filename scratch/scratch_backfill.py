@@ -35,12 +35,31 @@ def main():
         asset_master_path = f"{tmpdir}/asset_master.parquet"
         am = AssetMaster(asset_master_path)
 
-        base_date = datetime(2024, 1, 1)
-        am.add_mapping("BTC", "binance", "BTC/USDT", base_date)
-        am.add_mapping("ETH", "binance", "ETH/USDT", base_date)
-        am.add_mapping("BNB", "binance", "BNB/USDT", base_date)
+        # Dynamically fetch symbols from binance and populate asset master
+        try:
+            import ccxt
+            exchange = ccxt.binance()
+            symbols = exchange.symbols
 
-        logger.info("Asset master initialized with BTC, ETH, BNB")
+            # Extract unique base assets and add mappings
+            base_assets = set()
+            for symbol in symbols:
+                if "/USDT" in symbol:
+                    base = symbol.split("/")[0]
+                    base_assets.add(base)
+
+            base_date = datetime(2024, 1, 1)
+            for asset in sorted(base_assets)[:50]:  # Limit to first 50 to avoid timeout
+                am.add_mapping(asset, "binance", f"{asset}/USDT", base_date)
+
+            logger.info(f"Asset master initialized with {len(base_assets)} binance symbols")
+        except Exception as e:
+            logger.warning(f"Failed to fetch symbols from binance: {e}; using fallback")
+            base_date = datetime(2024, 1, 1)
+            am.add_mapping("BTC", "binance", "BTC/USDT", base_date)
+            am.add_mapping("ETH", "binance", "ETH/USDT", base_date)
+            am.add_mapping("BNB", "binance", "BNB/USDT", base_date)
+            logger.info("Asset master initialized with fallback symbols")
 
         try:
             checkpoint_dir = f"{tmpdir}/checkpoints"
@@ -61,10 +80,10 @@ def main():
             info_oi = store.dataset_info("open_interest")
 
             print("\nDataset sizes after backfill:")
-            print(f"  OHLCV Daily: {info_daily['row_count']} rows")
-            print(f"  OHLCV Hourly: {info_hourly['row_count']} rows")
-            print(f"  Funding Rate: {info_fr['row_count']} rows")
-            print(f"  Open Interest: {info_oi['row_count']} rows")
+            print(f"  OHLCV Daily: {info_daily.get('row_count', 0)} rows")
+            print(f"  OHLCV Hourly: {info_hourly.get('row_count', 0)} rows")
+            print(f"  Funding Rate: {info_fr.get('row_count', 0)} rows")
+            print(f"  Open Interest: {info_oi.get('row_count', 0)} rows")
             print()
 
         except Exception as e:
