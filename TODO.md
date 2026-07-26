@@ -15,12 +15,12 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [x] Copy CLAUDE.md into repo root
 
 ## Phase 1 — Datastore & asset master (M1)
-- [ ] Parquet store: append-only writer with schema enforcement, partition by
+- [x] Parquet store: append-only writer with schema enforcement, partition by
       dataset/date
-- [ ] Reader API (Polars lazy scans; date-range + column pruning)
-- [ ] `event_ts` / `ingested_ts` convention enforced by writer
-- [ ] Asset master: canonical asset_id, venue symbol maps with validity ranges
-- [ ] Tests: no-overwrite guarantee, point-in-time reads, symbol resolution
+- [x] Reader API (Polars lazy scans; date-range + column pruning)
+- [x] `event_ts` / `ingested_ts` convention enforced by writer
+- [x] Asset master: canonical asset_id, venue symbol maps with validity ranges
+- [x] Tests: no-overwrite guarantee, point-in-time reads, symbol resolution
       across a rename/delisting fixture
 
 ## Phase 2 — Loaders & audit (M2, M3)
@@ -96,3 +96,4 @@ Legend: [ ] todo · [~] in progress · [x] done
 ## Progress log
 - 2026-07-24: Plan created from video analysis; phases defined.
 - 2026-07-25: Phase 0 scaffold complete — directories, config.py, pytest+ruff configured, README.md created.
+- 2026-07-26: Phase 1 complete — ParquetStore (append-only, point-in-time), AssetMaster (symbol resolution), 15 tests passing, scratch demo working.

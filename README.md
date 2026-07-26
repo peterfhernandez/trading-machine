@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 0 (Scaffold) — In Progress**
+**Status: Phase 1 (Datastore & asset master) — In Progress**
 
 ## Quick Start
 
@@ -77,13 +77,14 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - Has narrowly-scoped public interfaces
 - Communicates only through the datastore and typed dataclasses
 
-### Current Phase: Phase 0 (Scaffold)
+### Current Phase: Phase 1 (Datastore & asset master)
 
-- [x] Repo skeleton with all packages
-- [x] `config.py` with environment configuration
-- [x] pytest + ruff configured
-- [x] CLAUDE.md in repo root
-- [ ] Ready for Phase 1 (Datastore & asset master)
+- [x] Parquet store: append-only writer with schema enforcement, partition by dataset/date
+- [x] Reader API (Polars lazy scans; date-range + column pruning)
+- [x] `event_ts` / `ingested_ts` convention enforced by writer
+- [x] Asset master: canonical asset_id, venue symbol maps with validity ranges
+- [x] Tests: no-overwrite guarantee, point-in-time reads, symbol resolution across a rename/delisting fixture
+- [ ] Ready for Phase 2 (Loaders & audit)
 
 ## Testing
 
@@ -175,4 +176,4 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: Phase 1 — Datastore & asset master
+**Next Phase**: Phase 2 — Loaders & audit
