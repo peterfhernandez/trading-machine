@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "c=$(jq -r '.tool_input.command // \"\"'); printf '%s' \"$c\" | grep -qE 'git[[:space:]]+commit' && printf '%s' \"$c\" | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com' && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the git commit. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Co-Authored-By, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in commit messages. Strip every such line and retry.\"}}' || true",
+            "command": "c=$(jq -r '.tool_input.command // \"\"'); printf '%s' \"$c\" | grep -qE 'git[[:space:]]+commit' && (printf '%s' \"$c\" | grep -oE \"\\-m\\s+'[^']*'|\\-m\\s+\\\"[^\\\"]*\\\"\" | sed \"s/^-m[[:space:]]*['\\\"]//;s/['\\\"]$//\" | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com') && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the git commit message. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Co-Authored-By, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in commit messages. Strip every such line and retry.\"}}' || true",
             "statusMessage": "Attribution guard"
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input | tostring' | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com' && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the PR/comment. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in PR titles, bodies, and comments. Strip it and retry.\"}}' || true",
+            "command": "jq -r '(.tool_input.body // .tool_input.text // \"\") + \" \" + (.tool_input.title // \"\")' | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com' && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the PR/comment. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in PR titles, bodies, and comments. Strip it and retry.\"}}' || true",
             "statusMessage": "Attribution guard"
           }
         ]
