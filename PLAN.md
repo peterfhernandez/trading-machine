@@ -207,3 +207,120 @@ order below possible.
 - Multi-region equities, terabyte alt-data, cluster compute.
 - Live money until the paper machine has run unattended for weeks and the
   attribution says the edge survives costs.
+
+---
+
+## Phase 2 Implementation Notes (Loaders & Audit)
+
+### Architectural Decision: Schemas in Module Namespaces
+
+Dataset schemas (OHLCV, funding rate, open interest) are defined in
+`loaders/schemas.py` and `audit/schemas.py` rather than centralized in
+`config.py`. This follows the "narrow public interfaces" principle: each
+module owns and exports its schema definitions via `__init__.py`.
+
+**Why:** Keeps concerns separate (configuration vs. type definitions),
+makes module dependencies explicit, and allows future modules (e.g., new
+loaders for equities) to define their own schemas without polluting a
+central config file.
+
+### BaseLoader Pattern
+
+All three loaders (OHLCV, funding rate, open interest) inherit from
+`BaseLoader` (in `loaders/base.py`), which provides:
+
+- **Idempotency checks:** Skip data already ingested for a date
+- **Symbol resolution:** Bulk resolve venue symbols → canonical asset_ids via AssetMaster
+- **Timestamp management:** Ensure `event_ts` and `ingested_ts` are present
+- **Append wrapper:** Validate and append to datastore with error logging
+
+This eliminates code duplication and enforces the point-in-time pattern
+consistently across all three loaders.
+
+### Backfill Runner & Checkpoint Tracking
+
+The `BackfillRunner` orchestrates all three loaders in sequence (OHLCV →
+funding → OI) and persists checkpoint state (last_ingested_date per dataset)
+to JSON files. On retry, each loader resumes from its checkpoint rather than
+re-fetching from scratch. Checkpoints are venue-specific:
+`data/checkpoints/binance_backfill.json`, etc.
+
+**Why:** Multi-year historical pulls can take hours or days. Checkpoints
+enable resumable, incremental backfills without duplicating data or
+wasting API quota.
+
+### Audit Module: Five Checks
+
+The `DataAudit` class runs five checks on each dataset:
+
+1. **data_presence:** Fails if no data exists for the audit date
+2. **coverage:** % of assets present (threshold: 80% of universe)
+3. **null_rate_*:** Per-column null % (threshold: 1%)
+4. **freshness:** Data age check (threshold: 24 hours)
+5. **price_outliers:** Detects suspicious price jumps (threshold: 10%)
+
+Each check returns an `AuditResult` with severity ("info", "warning", "error").
+Critical errors set `should_halt_trading() = True`, halting the pipeline.
+Telegram alerts are sent for any failed checks (configurable; requires
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` env vars).
+
+### Nightly Pipeline: Load → Audit → Report
+
+The `NightlyPipeline` class orchestrates the full end-to-end flow:
+
+- **Load stage:** Runs `BackfillRunner` (fetch last N days)
+- **Audit stage:** Runs `DataAudit` on all four datasets; halts if critical failures
+- **Report stage:** Prints dataset summaries
+
+Supports **dry-run mode** (`--dry-run` flag) for testing without writing.
+Failures in the load stage are non-fatal (continue to audit); failures in
+audit can halt trading. The report stage always runs.
+
+**CLI entry point:**
+```bash
+python -m pipeline.nightly --venue binance --days 1 --dry-run
+```
+
+### Datasets Produced (Phase 2)
+
+1. **ohlcv_daily:** Daily candles (asset_id, venue, event_ts, ingested_ts, close, volume, ...)
+2. **ohlcv_hourly:** Hourly candles (same schema as daily)
+3. **funding_rate:** Funding rates (asset_id, venue, event_ts, ingested_ts, funding_rate, mark_price, index_price)
+4. **open_interest:** OI snapshots (asset_id, venue, event_ts, ingested_ts, open_interest, open_interest_usd)
+
+All maintain strict point-in-time discipline: `event_ts` = when the data
+happened; `ingested_ts` = when we fetched it. Append-only to datastore;
+never overwrite history.
+
+### Testing Coverage (Phase 2)
+
+- `tests/test_ohlcv.py`: 8 tests (fetch, append, symbol resolution, golden fixture)
+- `tests/test_funding_rate.py`: 5 tests
+- `tests/test_open_interest.py`: 5 tests
+- `tests/test_backfill.py`: 6 tests (checkpoint save/load, resumability)
+- `tests/test_audit.py`: 9 tests (all five audit checks, halt logic)
+- `tests/test_nightly.py`: 8 tests (orchestration, dry-run, trading halt)
+
+All tests use mocked ccxt exchanges and temporary datastores; no real API calls.
+Golden tests verify hand-computed fixtures match exactly.
+
+### Scratch Demos (Phase 2)
+
+Each module has a demo script (`scratch/scratch_*.py`) that:
+- Runs only in `PAPER=true` mode (safety guard)
+- Uses temporary directories (doesn't pollute production data)
+- Shows typical usage patterns
+
+Example:
+```bash
+PAPER=true python scratch/scratch_ohlcv.py
+```
+
+### Future: Phase 3 (Universe)
+
+Phase 2 produces raw OHLCV, funding, and OI data. Phase 3 will:
+- Define daily universe membership rules (liquidity, listing age, exclusions)
+- Filter datasets to universe members only
+- Build universe filters for downstream signal/risk/portfolio modules
+
+No breaking changes to Phase 2 loaders/audit.

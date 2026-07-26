@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 1 (Datastore & asset master) — In Progress**
+**Status: Phase 2 (Loaders & audit) — Complete**
 
 ## Quick Start
 
@@ -77,14 +77,14 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - Has narrowly-scoped public interfaces
 - Communicates only through the datastore and typed dataclasses
 
-### Current Phase: Phase 1 (Datastore & asset master)
+### Current Phase: Phase 2 (Loaders & audit)
 
-- [x] Parquet store: append-only writer with schema enforcement, partition by dataset/date
-- [x] Reader API (Polars lazy scans; date-range + column pruning)
-- [x] `event_ts` / `ingested_ts` convention enforced by writer
-- [x] Asset master: canonical asset_id, venue symbol maps with validity ranges
-- [x] Tests: no-overwrite guarantee, point-in-time reads, symbol resolution across a rename/delisting fixture
-- [ ] Ready for Phase 2 (Loaders & audit)
+- [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
+- [x] Funding-rate loader; open-interest loader
+- [x] Backfill runner (resumable, checkpoint-tracked) — pull 3–5 years history
+- [x] Audit module: coverage %, null rates, outlier price jumps, freshness checks; Telegram alerts
+- [x] Nightly pipeline: end-to-end load → audit → report orchestration
+- [ ] Ready for Phase 3 (Universe)
 
 ## Testing
 
@@ -143,6 +143,65 @@ store.append("ohlcv", df, schema=my_schema)
 # Read (point-in-time)
 df = store.read("ohlcv", date_range=("2024-01-01", "2024-12-31"), asof="2024-12-31")
 ```
+
+### Loaders
+
+Three data loaders fetch from Binance/Deribit via ccxt and ingest to the datastore:
+
+```python
+from loaders import OHLCVLoader, FundingRateLoader, OpenInterestLoader
+
+# Fetch last 7 days of daily and hourly OHLCV
+loader = OHLCVLoader("binance", lookback_days=7)
+loader.run_daily()
+loader.run_hourly()
+
+# Fetch funding rates and open interest
+fr_loader = FundingRateLoader("binance", lookback_days=30)
+fr_loader.run()
+
+oi_loader = OpenInterestLoader("binance", lookback_days=30)
+oi_loader.run()
+```
+
+**Backfill runner** orchestrates all loaders with resumable checkpoint tracking:
+
+```python
+from loaders import BackfillRunner
+
+runner = BackfillRunner("binance")
+runner.run(days_back=30)  # Fetches 30 days; resumes from checkpoint on retry
+```
+
+### Audit
+
+Data quality audit with 5 checks: coverage (% of universe), null rates per column,
+price outliers, freshness (data age), and row count. Sends Telegram alerts on breaches.
+
+```python
+from audit import DataAudit
+
+audit = DataAudit()
+results = audit.audit_dataset("ohlcv_daily")
+audit.send_alerts()
+
+if audit.should_halt_trading():
+    print("Critical failure; trading halted")
+```
+
+### Nightly Pipeline
+
+Run the complete data pipeline end-to-end: load → audit → report.
+
+```bash
+# Dry-run mode (simulate without writing)
+python -m pipeline.nightly --dry-run --days 1
+
+# Live run
+python -m pipeline.nightly --venue binance --days 1
+```
+
+Datasets produced: `ohlcv_daily`, `ohlcv_hourly`, `funding_rate`, `open_interest`.
 
 ### Methodology & Signals
 
