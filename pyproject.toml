@@ -2,6 +2,23 @@
 requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "datastore*",
+    "loaders*",
+    "audit*",
+    "universe*",
+    "backtest*",
+    "signals*",
+    "risk*",
+    "portfolio*",
+    "execution*",
+    "attribution*",
+    "pipeline*",
+]
+exclude = ["tests*", "scratch*"]
+
 [project]
 name = "trading-machine"
 version = "0.1.0"
