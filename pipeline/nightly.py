@@ -58,8 +58,14 @@ class NightlyPipeline:
 
         try:
             import ccxt
-            exchange = ccxt.binance() if venue == "binance" else getattr(ccxt, venue)()
+            exchange_class = getattr(ccxt, venue)
+            exchange = exchange_class()
+            exchange.load_markets()
             symbols = exchange.symbols
+
+            if not symbols:
+                logger.warning(f"No symbols returned from {venue}")
+                return am
 
             # Extract unique base assets and add mappings
             base_assets = set()
@@ -67,6 +73,10 @@ class NightlyPipeline:
                 if "/USDT" in symbol:
                     base = symbol.split("/")[0]
                     base_assets.add(base)
+
+            if not base_assets:
+                logger.warning(f"No USDT pairs found in {venue}")
+                return am
 
             base_date = datetime.now(timezone.utc)
             count = 0
@@ -79,7 +89,9 @@ class NightlyPipeline:
 
             logger.info(f"✓ Populated asset master with {count} {venue} symbols")
         except Exception as e:
-            logger.warning(f"Failed to auto-populate asset master: {e}")
+            logger.warning(f"Failed to auto-populate asset master: {e}", exc_info=True)
+
+        return am
 
         return am
 
