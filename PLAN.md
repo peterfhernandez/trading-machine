@@ -1,8 +1,8 @@
 # Poor Man's Trading Machine — PLAN
 
 A single-person, low-cost implementation of the institutional multifactor trading
-architecture described in "What Nobody Tells You About Being a Quant"
-(The Quant Insider, https://youtu.be/tzTftCzmr7k).
+architecture described in ["What Nobody Tells You About Being a Quant"](https://youtu.be/tzTftCzmr7k)
+(The Quant Insider).
 
 Crypto first, asset-agnostic by design, equities later.
 
@@ -20,7 +20,7 @@ substitute.
 ## 2. Institutional stack → poor man's stack
 
 | Video component | Firm version | Our version |
-|---|---|---|
+| --- | --- | --- |
 | Compute | AWS + Databricks + Spark cluster | One PC. Polars (lazy, parallel, out-of-core) covers crypto-scale data easily |
 | Storage / warehouse | Delta Lake on S3 | Local Parquet files partitioned by date, append-only |
 | Time travel / point-in-time | Delta transaction log | Append-only convention: never overwrite history; store `knowledge_date` alongside `event_date` |
@@ -32,7 +32,7 @@ substitute.
 
 ## 3. Architecture (the whiteboard)
 
-```
+```flow
                     ┌─────────────────────────────────────────────┐
                     │                DATA LAYER                   │
                     │  loaders (per venue) → parquet store        │
@@ -81,6 +81,7 @@ through the parquet store and typed dataclasses. That is what makes the build
 order below possible.
 
 ### M1 `datastore` — parquet store + asset master
+
 - Append-only Parquet, partitioned `dataset/date=YYYY-MM-DD/*.parquet`.
 - Read API returns Polars frames; write API enforces schema + no-overwrite.
 - **Asset master**: canonical `asset_id`, per-venue symbol maps with validity
@@ -89,6 +90,7 @@ order below possible.
   backtests can ask "what did I know then?" — the look-ahead-bias defence.
 
 ### M2 `loaders` — one loader per venue/dataset
+
 - v1 targets (all free): daily+hourly OHLCV for top ~100 perps (ccxt),
   funding rates, open interest; Deribit options summary (reuse calendar-bot
   knowledge later).
@@ -96,17 +98,20 @@ order below possible.
   resumable, unique per vendor cadence — exactly the video's "data loader".
 
 ### M3 `audit` — data auditing
+
 - Per-dataset statistical checks on every refresh: row counts, coverage
   (% of universe present), null rates, price jump outliers vs. a second source.
 - Threshold breaches raise alerts (Telegram, reusing the calendar-bot pattern)
   and can halt downstream factors. Cheap to build, disproportionate value.
 
 ### M4 `universe`
+
 - Rules → daily universe membership list, stored like any other dataset.
 - v1: top N by rolling median dollar volume, minimum listing age, exclude
   stablecoins and wrapped duplicates. Universe membership is point-in-time too.
 
 ### M5 `backtest` — walk-forward research engine
+
 - Vectorized Polars event loop: for each rebalance date, expose only data with
   `ingested_ts ≤ date`, produce target weights, apply next-period returns minus
   cost model.
@@ -114,6 +119,7 @@ order below possible.
   every later module is tested against, so it comes early.
 
 ### M6 `signals` → `alphas`
+
 - A signal is a function `(datastore, date, universe) → score per asset`.
 - v1 signal set (documented, no data mining yet): cross-sectional momentum,
   time-series momentum, carry (funding rate), short-term reversal,
@@ -123,6 +129,7 @@ order below possible.
   IC estimated from the backtester, shrunk hard toward zero (be humble).
 
 ### M7 `risk` — factor risk model
+
 - Cross-sectional regression of daily returns on: market beta, size (log mcap
   or volume proxy), momentum, volatility, and sector buckets (L1/L2 ecosystem
   tags: majors, DeFi, L2s, memes...).
@@ -131,23 +138,27 @@ order below possible.
   covariances" collapse from the video, at a scale a laptop laughs at.
 
 ### M8 `portfolio` — construction/optimizer
+
 - v1: simple and robust — rank-based long/short buckets with vol targeting and
   position caps. v2: mean-variance via cvxpy: max α − λ·σ² − costs, subject to
   market-neutrality, max weight, turnover cap, gross leverage cap.
 - Output: target weights per rebalance, written to the store.
 
 ### M9 `execution`
+
 - Paper broker first: fills at next bar open ± spread assumption; tracks
   positions, PnL. Then exchange testnet, then (much later, tiny) live.
 - **Implementation shortfall**: run the zero-cost paper portfolio in parallel
   with the real/testnet one; the gap is your cost of trading. Alert on drift.
 
 ### M10 `attribution` — performance analysis
+
 - Decompose realized PnL into factor bets vs. specific vs. costs.
 - Track per-signal IC decay over time (factors decay; this tells you when).
 - Daily report via Telegram/HTML: IR, exposures, drawdown, shortfall.
 
 ### M11 `pipeline` — the daily production run
+
 - Scheduler chaining: loaders → audit → universe → alphas → risk → optimizer →
   execution → attribution, with per-stage failure handling (audit failure halts
   trading stages, not reporting stages). Crypto is 24/7 so the "trading window"
@@ -155,6 +166,7 @@ order below possible.
   00:10 UTC) and keep the whole run under minutes, not half-days.
 
 ### Later: `equities` extension
+
 - The interfaces above are asset-agnostic on purpose (asset master, loaders,
   signals take `(datastore, date, universe)`). Equities means: new loaders
   (e.g. EOD data), a real security master (tickers change, mergers — true
