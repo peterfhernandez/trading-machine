@@ -23,7 +23,7 @@ exclude = ["tests*", "scratch*"]
 name = "trading-machine"
 version = "0.1.0"
 description = "Poor Man's Trading Machine: a single-person multifactor crypto trading system"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "polars>=0.20.0",
     "pyarrow>=14.0.0",
@@ -35,22 +35,6 @@ dependencies = [
     "requests>=2.31.0",
     "python-dateutil>=2.8.2",
     "pydantic>=2.0.0",
-]
-
-[tool.setuptools]
-packages = [
-    "datastore",
-    "loaders",
-    "audit",
-    "universe",
-    "backtest",
-    "signals",
-    "risk",
-    "portfolio",
-    "execution",
-    "attribution",
-    "pipeline",
-    "tests",
 ]
 
 [project.optional-dependencies]
