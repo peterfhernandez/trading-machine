@@ -26,13 +26,12 @@ Legend: [ ] todo · [~] in progress · [x] done
       across a rename/delisting fixture
 
 ## Phase 2 — Loaders & audit (M2, M3)
-
-- [ ] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
-- [ ] Funding-rate loader; open-interest loader
-- [ ] Backfill runner (resumable, rate-limit aware) — pull 3–5 years history
-- [ ] Audit module: coverage %, null rates, outlier price jumps vs. second
+- [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
+- [x] Funding-rate loader; open-interest loader
+- [x] Backfill runner (resumable, rate-limit aware) — pull 3–5 years history
+- [x] Audit module: coverage %, null rates, outlier price jumps vs. second
       venue, freshness checks; Telegram alert on threshold breach
-- [ ] Nightly loader+audit job runnable end-to-end from one command
+- [x] Nightly loader+audit job runnable end-to-end from one command
 
 ## Phase 3 — Universe (M4)
 
@@ -109,3 +108,4 @@ Legend: [ ] todo · [~] in progress · [x] done
 - 2026-07-24: Plan created from video analysis; phases defined.
 - 2026-07-25: Phase 0 scaffold complete — directories, config.py, pytest+ruff configured, README.md created.
 - 2026-07-26: Phase 1 complete — ParquetStore (append-only, point-in-time), AssetMaster (symbol resolution), 15 tests passing, scratch demo working.
+- 2026-07-26: Phase 2 complete — OHLCV/funding/OI loaders via ccxt, backfill runner with checkpoint tracking, data audit (5 checks + Telegram alerts), nightly pipeline orchestration. 31 tests passing, 5 scratch demos working. Ready for Phase 3 (universe).
