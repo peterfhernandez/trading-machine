@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import DATASTORE_PATH
-from datastore import ParquetStore
+from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
 from audit.auditor import DataAudit
 
@@ -51,16 +51,51 @@ class NightlyPipeline:
             logger.error(f"Pipeline failed: {e}", exc_info=True)
             return False
 
+    def _populate_asset_master(self, venue: str) -> AssetMaster:
+        """Populate asset master with venue symbols."""
+        asset_master_path = DATASTORE_PATH / "asset_master.parquet"
+        am = AssetMaster(asset_master_path)
+
+        try:
+            import ccxt
+            exchange = ccxt.binance() if venue == "binance" else getattr(ccxt, venue)()
+            symbols = exchange.symbols
+
+            # Extract unique base assets and add mappings
+            base_assets = set()
+            for symbol in symbols:
+                if "/USDT" in symbol:
+                    base = symbol.split("/")[0]
+                    base_assets.add(base)
+
+            base_date = datetime.now(timezone.utc)
+            count = 0
+            for asset in sorted(base_assets):
+                try:
+                    am.add_mapping(asset, venue, f"{asset}/USDT", base_date)
+                    count += 1
+                except Exception as e:
+                    logger.debug(f"Failed to add mapping for {asset}: {e}")
+
+            logger.info(f"✓ Populated asset master with {count} {venue} symbols")
+        except Exception as e:
+            logger.warning(f"Failed to auto-populate asset master: {e}")
+
+        return am
+
     def _load_stage(self, days: int) -> None:
         """Load data via backfill runner."""
         logger.info("\n[LOAD STAGE] Fetching latest data...")
 
         if self.dry_run:
-            logger.info("(DRY RUN) Would run backfill for {days} days")
+            logger.info(f"(DRY RUN) Would run backfill for {days} days")
             return
 
         try:
-            runner = BackfillRunner(self.venue)
+            # Populate asset master with venue symbols
+            asset_master = self._populate_asset_master(self.venue)
+
+            runner = BackfillRunner(self.venue, asset_master=asset_master)
             runner.run(days_back=days)
             logger.info("✓ Load stage complete")
         except Exception as e:
