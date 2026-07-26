@@ -2,7 +2,7 @@
 
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from config import DATASTORE_PATH
@@ -71,7 +71,7 @@ class NightlyPipeline:
         logger.info("\n[AUDIT STAGE] Running data quality checks...")
 
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
-        today = datetime.utcnow()
+        today = datetime.now(timezone.utc)
 
         all_passed = True
 
@@ -120,8 +120,12 @@ class NightlyPipeline:
         for dataset in datasets:
             try:
                 info = self.store.dataset_info(dataset)
-                print(f"{dataset:20s} | Rows: {info['row_count']:8d} | "
-                      f"Dates: {info['date_range'][0]} to {info['date_range'][1]}")
+                if not info:
+                    print(f"{dataset:20s} | No data")
+                else:
+                    date_range_str = f"{info['date_range'][0]} to {info['date_range'][1]}" if info['date_range'] else "N/A"
+                    print(f"{dataset:20s} | Rows: {info['row_count']:8d} | "
+                          f"Dates: {date_range_str}")
             except Exception as e:
                 print(f"{dataset:20s} | Error: {e}")
 

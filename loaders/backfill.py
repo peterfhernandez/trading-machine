@@ -28,7 +28,8 @@ class BackfillRunner:
         asset_master: Optional[AssetMaster] = None,
     ):
         self.venue = venue
-        self.checkpoint_dir = checkpoint_dir or (DATASTORE_PATH.parent / "checkpoints")
+        checkpoint_path = checkpoint_dir or (DATASTORE_PATH.parent / "checkpoints")
+        self.checkpoint_dir = Path(checkpoint_path)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or ParquetStore(DATASTORE_PATH)
         self.asset_master = asset_master or AssetMaster(DATASTORE_PATH / "asset_master.parquet")
