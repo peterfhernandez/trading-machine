@@ -5,6 +5,7 @@ from loaders.schemas import OHLCV_SCHEMA, FUNDING_RATE_SCHEMA, OPEN_INTEREST_SCH
 from loaders.ohlcv import OHLCVLoader, load_ohlcv
 from loaders.funding_rate import FundingRateLoader, load_funding_rates
 from loaders.open_interest import OpenInterestLoader, load_open_interest
+from loaders.backfill import BackfillRunner, run_backfill
 
 __all__ = [
     "BaseLoader",
@@ -14,6 +15,8 @@ __all__ = [
     "load_funding_rates",
     "OpenInterestLoader",
     "load_open_interest",
+    "BackfillRunner",
+    "run_backfill",
     "OHLCV_SCHEMA",
     "FUNDING_RATE_SCHEMA",
     "OPEN_INTEREST_SCHEMA",
