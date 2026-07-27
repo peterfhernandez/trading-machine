@@ -36,10 +36,10 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 3 — Universe (M4)
 
-- [ ] Liquidity metrics (rolling median dollar volume), listing-age filter,
+- [x] Liquidity metrics (rolling median dollar volume), listing-age filter,
       stablecoin/wrapped exclusion list
-- [ ] Daily universe membership written point-in-time to the store
-- [ ] Sanity scratch: plot universe size and turnover over history
+- [x] Daily universe membership written point-in-time to the store
+- [x] Sanity scratch: plot universe size and turnover over history
 
 ## Phase 4 — Backtester (M5)
 
@@ -110,3 +110,10 @@ Legend: [ ] todo · [~] in progress · [x] done
 - 2026-07-25: Phase 0 scaffold complete — directories, config.py, pytest+ruff configured, README.md created.
 - 2026-07-26: Phase 1 complete — ParquetStore (append-only, point-in-time), AssetMaster (symbol resolution), 15 tests passing, scratch demo working.
 - 2026-07-26: Phase 2 complete — OHLCV/funding/OI loaders via ccxt, backfill runner with checkpoint tracking, data audit (5 checks + Telegram alerts), nightly pipeline orchestration. 31 tests passing, 5 scratch demos working. Ready for Phase 3 (universe).
+- 2026-07-27: Phase 3 complete — UniverseBuilder computes rolling median dollar
+  volume, listing age, and stablecoin/wrapped exclusions from `ohlcv_daily`,
+  ranks eligible assets by liquidity, caps at `target_size`, and writes
+  point-in-time membership to the `universe` dataset (one row per asset
+  considered, with `exclusion_reason` for anything left out). `compute_turnover`
+  added for size/turnover monitoring. 15 tests passing, scratch demo shows
+  weekly snapshots and a turnover event. Ready for Phase 4 (backtester).
