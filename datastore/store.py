@@ -142,12 +142,22 @@ class ParquetStore:
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset {dataset} not found at {dataset_path}")
 
+        # Normalize date_range endpoints to "YYYY-MM-DD" strings. Callers may pass
+        # str, datetime.date, or datetime.datetime; partition dirs are always
+        # named with plain date strings, so comparisons must be string-to-string.
+        normalized_range = None
+        if date_range:
+            start, end = date_range
+            start = start.isoformat()[:10] if hasattr(start, "isoformat") else str(start)
+            end = end.isoformat()[:10] if hasattr(end, "isoformat") else str(end)
+            normalized_range = (start, end)
+
         # Collect all partition paths matching the date range
         partitions = []
         for part_dir in sorted(dataset_path.glob("date=*")):
             part_date_str = part_dir.name.split("=")[1]
-            if date_range:
-                start, end = date_range
+            if normalized_range:
+                start, end = normalized_range
                 if not (start <= part_date_str <= end):
                     continue
             partitions.append(part_dir)

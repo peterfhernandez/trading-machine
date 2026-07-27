@@ -39,20 +39,21 @@ def main():
         try:
             import ccxt
             exchange = ccxt.binance()
+            exchange.load_markets()
             symbols = exchange.symbols
 
-            # Extract unique base assets and add mappings
-            base_assets = set()
-            for symbol in symbols:
-                if "/USDT" in symbol:
-                    base = symbol.split("/")[0]
-                    base_assets.add(base)
+            # Map every exact USDT-quoted symbol string to its base asset (not a
+            # reconstructed "{asset}/USDT" string) so resolve_symbol()'s literal
+            # match works regardless of spot/perpetual/quarterly notation.
+            usdt_symbols = [s for s in symbols if "/USDT" in s][:50]  # cap for demo speed
 
             base_date = datetime(2024, 1, 1)
-            for asset in sorted(base_assets)[:50]:  # Limit to first 50 to avoid timeout
-                am.add_mapping(asset, "binance", f"{asset}/USDT", base_date)
+            for symbol in usdt_symbols:
+                market = exchange.markets.get(symbol, {})
+                base = market.get("base") or symbol.split("/")[0]
+                am.add_mapping(base, "binance", symbol, base_date)
 
-            logger.info(f"Asset master initialized with {len(base_assets)} binance symbols")
+            logger.info(f"Asset master initialized with {len(usdt_symbols)} binance symbols")
         except Exception as e:
             logger.warning(f"Failed to fetch symbols from binance: {e}; using fallback")
             base_date = datetime(2024, 1, 1)
