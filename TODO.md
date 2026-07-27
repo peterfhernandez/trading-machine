@@ -26,6 +26,7 @@ Legend: [ ] todo · [~] in progress · [x] done
       across a rename/delisting fixture
 
 ## Phase 2 — Loaders & audit (M2, M3)
+
 - [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
 - [x] Funding-rate loader; open-interest loader
 - [x] Backfill runner (resumable, rate-limit aware) — pull 3–5 years history
