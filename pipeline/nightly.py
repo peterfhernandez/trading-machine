@@ -2,7 +2,7 @@
 
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from config import DATASTORE_PATH
@@ -119,7 +119,7 @@ class NightlyPipeline:
         logger.info("\n[AUDIT STAGE] Running data quality checks...")
 
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
-        today = datetime.now(timezone.utc)
+        today = datetime.utcnow()
 
         all_passed = True
 
