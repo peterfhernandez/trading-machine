@@ -38,6 +38,9 @@ order are defined in PLAN.md and TODO.md — follow them.
 - The backtester keeps golden tests (hand-computed fixtures reproduced
   exactly).
 - No regression
+- Each test must run in under 100ms. Mock network/exchange calls and
+  filesystem/datastore I/O; if a test needs real latency, mark it and keep
+  it out of the default run.
 
 ### Create debug files
 
@@ -65,10 +68,7 @@ order are defined in PLAN.md and TODO.md — follow them.
 - Never use deprecated stdlib or library APIs (e.g. `datetime.utcnow()`,
   `datetime.utcfromtimestamp()`) — use their timezone-aware replacements
   (`datetime.now(datetime.UTC)`, `datetime.fromtimestamp(ts, datetime.UTC)`).
-  Fix deprecation warnings when touching a file, don't just silence them.
-- Each test must run in under 100ms. Mock network/exchange calls and
-  filesystem/datastore I/O; if a test needs real latency, mark it and keep
-  it out of the default run.
+- Fix deprecation warnings when touching a file, don't just silence them.
 
 ### Committing changes
 
