@@ -3,7 +3,7 @@
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -75,7 +75,7 @@ class BackfillRunner:
             days_back: How many days of history to pull (default: 5 years)
         """
         if end_date is None:
-            end_date = datetime.utcnow()
+            end_date = datetime.now(timezone.utc).replace(tzinfo=None)
         if start_date is None:
             start_date = end_date - timedelta(days=days_back)
 
@@ -194,7 +194,7 @@ def run_backfill(
         days: How many days of history to pull (default: 30)
         checkpoint_dir: Directory for checkpoint files (default: data/checkpoints)
     """
-    end_date = datetime.utcnow()
+    end_date = datetime.now(timezone.utc).replace(tzinfo=None)
     start_date = end_date - timedelta(days=days)
 
     runner = BackfillRunner(venue, checkpoint_dir)

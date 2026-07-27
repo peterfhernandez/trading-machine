@@ -2,7 +2,7 @@
 
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from config import DATASTORE_PATH
@@ -79,7 +79,7 @@ class NightlyPipeline:
                 logger.warning(f"No USDT pairs found in {venue}")
                 return am
 
-            base_date = datetime.utcnow()
+            base_date = datetime.now(timezone.utc).replace(tzinfo=None)
             count = 0
             for symbol in usdt_symbols:
                 market = exchange.markets.get(symbol, {})
@@ -119,7 +119,7 @@ class NightlyPipeline:
         logger.info("\n[AUDIT STAGE] Running data quality checks...")
 
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
-        today = datetime.utcnow()
+        today = datetime.now(timezone.utc).replace(tzinfo=None)
 
         all_passed = True
 

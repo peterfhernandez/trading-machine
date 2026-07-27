@@ -2,7 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import polars as pl
@@ -92,7 +92,7 @@ class BaseLoader(ABC):
             DataFrame with both timestamps guaranteed
         """
         if ingested_ts is None:
-            ingested_ts = datetime.utcnow()
+            ingested_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
         df = df.clone()
 

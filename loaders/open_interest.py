@@ -1,7 +1,7 @@
 """Open interest loader for perpetual swaps."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import ccxt
@@ -57,7 +57,11 @@ class OpenInterestLoader(BaseLoader):
                 if hasattr(self.exchange, 'fetch_open_interest'):
                     oi_data = self.exchange.fetch_open_interest(symbol)
                     if oi_data:
-                        ts = datetime.utcfromtimestamp(oi_data.get('timestamp', 0) / 1000) if oi_data.get('timestamp') else datetime.utcnow()
+                        ts = (
+                            datetime.fromtimestamp(oi_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
+                            if oi_data.get('timestamp')
+                            else datetime.now(timezone.utc).replace(tzinfo=None)
+                        )
                         rows.append({
                             "symbol": symbol,
                             "event_ts": ts,

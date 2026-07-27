@@ -11,7 +11,7 @@ asset was excluded and measure turnover over time.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import polars as pl
@@ -125,7 +125,7 @@ class UniverseBuilder:
         low_volume, or rank_cutoff).
         """
         if asof is None:
-            asof = datetime.utcnow()
+            asof = datetime.now(timezone.utc).replace(tzinfo=None)
 
         volume_df = self._dollar_volume(asof)
         age_df = self._listing_age(asof)
@@ -169,7 +169,7 @@ class UniverseBuilder:
             pl.col("exclusion_reason").is_null().alias("in_universe")
         )
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         event_ts = datetime(asof.year, asof.month, asof.day)
 
         universe = universe.with_columns(

@@ -1,7 +1,7 @@
 """OHLCV loader for daily and hourly candles via ccxt."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import ccxt
@@ -51,7 +51,7 @@ class OHLCVLoader(BaseLoader):
         logger.info(f"Fetching {timeframe} OHLCV for {self.venue}")
 
         rows = []
-        since = int((datetime.utcnow() - timedelta(days=self.lookback_days)).timestamp() * 1000)
+        since = int((datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp() * 1000)
 
         usdt_symbols = [
             s for s in self.exchange.symbols
@@ -66,7 +66,7 @@ class OHLCVLoader(BaseLoader):
                     continue
 
                 for candle in candles:
-                    ts = datetime.utcfromtimestamp(candle[0] / 1000)
+                    ts = datetime.fromtimestamp(candle[0] / 1000, timezone.utc).replace(tzinfo=None)
                     rows.append({
                         "symbol": symbol,
                         "timeframe": timeframe,
