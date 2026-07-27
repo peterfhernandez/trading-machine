@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 3 (Universe) — Complete**
+**Status: Phase 4 (Backtester) — Complete**
 
 ## Quick Start
 
@@ -77,16 +77,20 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - Has narrowly-scoped public interfaces
 - Communicates only through the datastore and typed dataclasses
 
-### Current Phase: Phase 3 (Universe)
+### Completed: Phase 3 (Universe)
 
-- [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
-- [x] Funding-rate loader; open-interest loader
-- [x] Backfill runner (resumable, checkpoint-tracked) — pull 3–5 years history
-- [x] Audit module: coverage %, null rates, outlier price jumps, freshness checks; Telegram alerts
-- [x] Nightly pipeline: end-to-end load → audit → report orchestration
 - [x] Liquidity metrics (rolling median dollar volume), listing-age filter, stablecoin/wrapped exclusions
 - [x] Daily universe membership written point-in-time to the store
-- [ ] Ready for Phase 4 (Backtester)
+- [x] Sanity scratch: universe size and turnover over history
+
+### Current Phase: Phase 4 (Backtester)
+
+- [x] Walk-forward engine: rebalance calendar, point-in-time data exposure, next-bar execution
+- [x] Cost model: half-spread + linear impact stub, charged on traded notional
+- [x] Metrics: returns, vol, IR, drawdown, turnover, per-signal rank IC series
+- [x] Golden tests: hand-computed 3-asset fixture reproduced exactly
+- [x] Validated: buy-and-hold BTC through the engine matches the raw price series
+- [ ] Ready for Phase 5 (Signals → alphas)
 
 ## Testing
 
@@ -225,6 +229,50 @@ python -m pipeline.nightly --venue binance --days 1
 
 Datasets produced: `ohlcv_daily`, `ohlcv_hourly`, `funding_rate`, `open_interest`.
 
+### Backtester
+
+Walk-forward research engine. At each rebalance date the strategy sees only
+point-in-time data; weights fill at the **next bar's open**, are held until the
+next fill, and pay spread + impact costs on traded notional.
+
+```python
+from backtest import Backtester, CostModel, DatastoreUniverse
+
+def momentum(ctx):
+    bars = ctx.ohlcv(lookback_days=30)          # only data known at ctx.asof
+    return {asset_id: 1 / len(ctx.universe) for asset_id in ctx.universe}
+
+bt = Backtester(
+    store,
+    cost_model=CostModel(spread_bps=10.0, impact_bps_per_million=1.0),
+    universe_provider=DatastoreUniverse(store, "binance"),
+)
+result = bt.run(momentum, signals={"momentum_30d": score_fn})
+
+result.metrics.to_dict()   # total/annualized return, vol, IR, max drawdown, turnover, costs
+result.returns             # per-period gross/cost/net return, turnover, equity, exposures
+result.weights             # target weights actually taken, per rebalance
+result.ic_summary()        # mean IC, IC volatility, IC IR per signal
+```
+
+Engine semantics (fully documented in `backtest/engine.py`):
+
+- **Next-bar execution** — the close of the decision bar is the last thing the
+  strategy saw, so fills happen at the following bar's open.
+- **Drift-aware turnover** — positions drift with returns between rebalances, so
+  a buy-and-hold book pays costs once, not every period.
+- **Annualization follows the holding period** — weekly rebalances annualize at
+  ~365/7, not 365.
+- **`pit_mode`** — `"ingestion"` (default) filters `ingested_ts <= asof`, the
+  full look-ahead defence. `"event"` filters `event_ts <= asof` only; it exists
+  because a backfill stamps every row with one ingestion timestamp, which would
+  otherwise make backfilled history invisible. Event mode is weaker (no defence
+  against revisions) and must be chosen explicitly.
+
+```bash
+PAPER=true python scratch/scratch_backtest.py   # demo: buy & hold, equal weight, L/S momentum
+```
+
 ### Methodology & Signals
 
 Every signal gets a `METHODOLOGY.md` documenting:
@@ -240,7 +288,9 @@ The doc is the spec; code follows the doc.
 
 1. **Point-in-time discipline**: Every dataset row carries `event_ts` and `ingested_ts`.
 2. **Append-only**: Never overwrite history in the datastore.
-3. **No look-ahead bias**: Backtests only read data with `ingested_ts <= asof`.
+3. **No look-ahead bias**: Backtests only read data with `ingested_ts <= asof`
+   (relaxable to `event_ts <= asof` for backfilled history — explicitly, via
+   `pit_mode="event"`, never by default).
 4. **Risk model is not optional**: Half the value is understanding volatility costs.
 5. **Breadth over hero bets**: Many independent bets beat big single bets.
 6. **Measure costs pessimistically**: Model spreads, impact, slippage from day one.
@@ -257,4 +307,4 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: Phase 4 — Backtester
+**Next Phase**: Phase 5 — Signals → alphas

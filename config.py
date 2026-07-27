@@ -11,10 +11,8 @@ All configuration lives here, including:
 """
 
 import os
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict
-
+from pathlib import Path
 
 # ============================================================================
 # Environment & Paths
@@ -111,23 +109,30 @@ UNIVERSE_CONFIG = UniverseConfig()
 class BacktestConfig:
     """Parameters for the walk-forward backtester."""
 
-    # Rebalance frequency: e.g., "daily", "weekly"
+    # Rebalance frequency: "daily", "weekly", or "monthly"
     rebalance_freq: str = "daily"
 
     # Start date for backtests (YYYY-MM-DD)
     backtest_start: str = "2021-01-01"
 
     # End date for backtests (YYYY-MM-DD); None = use all available data
-    backtest_end: str = None
+    backtest_end: str | None = None
 
     # Initial portfolio value (for returns calculation)
     initial_cash: float = 100_000.0
 
-    # Assumed one-way spread (bps) for cost model
+    # Assumed round-trip spread (bps) for cost model; half is paid per trade
     spread_bps: float = 5.0
 
     # Assumed market impact (bps per $M traded)
     impact_bps_per_million: float = 1.0
+
+    # Venue and bar timeframe the backtester prices against
+    venue: str = "binance"
+    timeframe: str = "1d"
+
+    # Periods per year for annualization (crypto trades 24/7 -> 365 daily bars)
+    periods_per_year: float = 365.0
 
 
 BACKTEST_CONFIG = BacktestConfig()
@@ -195,7 +200,7 @@ class AuditConfig:
     # than this should not be flagged stale, and one ingested much more often
     # (e.g. hourly candles) should be held to a tighter bar. Falls back to
     # freshness_threshold_hours for any dataset not listed here.
-    freshness_threshold_hours_by_dataset: Dict[str, float] = field(default_factory=lambda: {
+    freshness_threshold_hours_by_dataset: dict[str, float] = field(default_factory=lambda: {
         "ohlcv_daily": 24.0,
         "ohlcv_hourly": 2.0,
         "funding_rate": 24.0,
