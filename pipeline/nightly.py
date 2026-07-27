@@ -67,25 +67,28 @@ class NightlyPipeline:
                 logger.warning(f"No symbols returned from {venue}")
                 return am
 
-            # Extract unique base assets and add mappings
-            base_assets = set()
-            for symbol in symbols:
-                if "/USDT" in symbol:
-                    base = symbol.split("/")[0]
-                    base_assets.add(base)
+            # Map every exact USDT-quoted symbol string to its base asset. Loaders
+            # iterate exchange.symbols directly and may see spot ("BTC/USDT"),
+            # perpetual ("BTC/USDT:USDT"), or quarterly ("BTC/USDT:USDT-260327")
+            # notation; resolve_symbol() matches on the literal string, so the
+            # mapping must preserve whatever exact form each market uses rather
+            # than reconstructing a synthetic "{asset}/USDT" symbol.
+            usdt_symbols = [s for s in symbols if "/USDT" in s]
 
-            if not base_assets:
+            if not usdt_symbols:
                 logger.warning(f"No USDT pairs found in {venue}")
                 return am
 
             base_date = datetime.utcnow()
             count = 0
-            for asset in sorted(base_assets):
+            for symbol in usdt_symbols:
+                market = exchange.markets.get(symbol, {})
+                base = market.get("base") or symbol.split("/")[0]
                 try:
-                    am.add_mapping(asset, venue, f"{asset}/USDT", base_date)
+                    am.add_mapping(base, venue, symbol, base_date)
                     count += 1
                 except Exception as e:
-                    logger.warning(f"Failed to add mapping for {asset}: {e}")
+                    logger.warning(f"Failed to add mapping for {symbol}: {e}")
 
             logger.info(f"✓ Populated asset master with {count} {venue} symbols")
         except Exception as e:

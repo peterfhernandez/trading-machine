@@ -134,7 +134,7 @@ class DataAudit:
             ))
             return
 
-        age = audit_date - latest_ingested.to_pydatetime()
+        age = audit_date - latest_ingested
         passed = age <= freshness_window
         severity = "error" if not passed else "info"
 
