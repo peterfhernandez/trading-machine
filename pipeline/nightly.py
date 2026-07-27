@@ -78,20 +78,18 @@ class NightlyPipeline:
                 logger.warning(f"No USDT pairs found in {venue}")
                 return am
 
-            base_date = datetime.now(timezone.utc)
+            base_date = datetime.utcnow()
             count = 0
             for asset in sorted(base_assets):
                 try:
                     am.add_mapping(asset, venue, f"{asset}/USDT", base_date)
                     count += 1
                 except Exception as e:
-                    logger.debug(f"Failed to add mapping for {asset}: {e}")
+                    logger.warning(f"Failed to add mapping for {asset}: {e}")
 
             logger.info(f"✓ Populated asset master with {count} {venue} symbols")
         except Exception as e:
             logger.warning(f"Failed to auto-populate asset master: {e}", exc_info=True)
-
-        return am
 
         return am
 
@@ -198,6 +196,11 @@ def run_nightly(venue: str = "binance", dry_run: bool = False, days: int = 1) ->
 
 if __name__ == "__main__":
     import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
     parser = argparse.ArgumentParser(description="Run nightly data pipeline")
     parser.add_argument("--venue", default="binance", help="Exchange name")
