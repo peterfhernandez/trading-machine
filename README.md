@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 2 (Loaders & audit) — Complete**
+**Status: Phase 3 (Universe) — Complete**
 
 ## Quick Start
 
@@ -77,14 +77,16 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - Has narrowly-scoped public interfaces
 - Communicates only through the datastore and typed dataclasses
 
-### Current Phase: Phase 2 (Loaders & audit)
+### Current Phase: Phase 3 (Universe)
 
 - [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
 - [x] Funding-rate loader; open-interest loader
 - [x] Backfill runner (resumable, checkpoint-tracked) — pull 3–5 years history
 - [x] Audit module: coverage %, null rates, outlier price jumps, freshness checks; Telegram alerts
 - [x] Nightly pipeline: end-to-end load → audit → report orchestration
-- [ ] Ready for Phase 3 (Universe)
+- [x] Liquidity metrics (rolling median dollar volume), listing-age filter, stablecoin/wrapped exclusions
+- [x] Daily universe membership written point-in-time to the store
+- [ ] Ready for Phase 4 (Backtester)
 
 ## Testing
 
@@ -115,7 +117,7 @@ ruff check .
 ruff format .
 
 # Type checking (mypy)
-mypy datastore/ loaders/ audit/
+mypy datastore/ loaders/ audit/ universe/
 ```
 
 ## Development
@@ -189,6 +191,26 @@ if audit.should_halt_trading():
     print("Critical failure; trading halted")
 ```
 
+### Universe
+
+Point-in-time daily universe membership from `ohlcv_daily`: rolling median dollar
+volume, minimum listing age, and stablecoin/wrapped exclusions, ranked by liquidity
+and capped at `UNIVERSE_CONFIG.target_size`. Writes one row per asset ever
+considered (not just members), with `exclusion_reason` explaining any asset left
+out (`stablecoin`, `wrapped`, `listing_age`, `low_volume`, or `rank_cutoff`).
+
+```python
+from universe import UniverseBuilder, compute_turnover
+
+builder = UniverseBuilder(venue="binance")
+snapshot = builder.build_and_store(asof=datetime(2024, 3, 1))
+
+members = snapshot.filter(snapshot["in_universe"])["asset_id"].to_list()
+
+# Turnover between two snapshots (for monitoring universe stability)
+turnover = compute_turnover(previous_snapshot, snapshot)
+```
+
 ### Nightly Pipeline
 
 Run the complete data pipeline end-to-end: load → audit → report.
@@ -235,4 +257,4 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: Phase 2 — Loaders & audit
+**Next Phase**: Phase 4 — Backtester

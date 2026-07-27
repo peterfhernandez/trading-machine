@@ -74,14 +74,27 @@ class UniverseConfig:
     # Minimum rolling median dollar volume (USDT over last 30 days)
     min_volume_usdt: float = 1_000_000.0
 
+    # Lookback window (days) for the rolling median dollar volume calculation
+    volume_lookback_days: int = 30
+
     # Minimum days since listing
     min_listing_age_days: int = 30
 
     # Exclude stablecoins (USDT, USDC, BUSD, etc.)
     exclude_stablecoins: bool = True
 
+    # Canonical asset_ids treated as stablecoins when exclude_stablecoins=True
+    stablecoin_symbols: set[str] = field(default_factory=lambda: {
+        "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD", "PYUSD", "GUSD", "USDD", "FRAX",
+    })
+
     # Exclude wrapped/bridge assets (wBTC, wETH, etc.)
     exclude_wrapped: bool = True
+
+    # Canonical asset_ids treated as wrapped/bridged duplicates when exclude_wrapped=True
+    wrapped_symbols: set[str] = field(default_factory=lambda: {
+        "WBTC", "WETH", "WBNB", "WMATIC", "WAVAX", "STETH", "WSTETH", "CBETH", "RETH", "METH",
+    })
 
     # Rebalance frequency: "daily" for daily universe updates
     rebalance_freq: str = "daily"
