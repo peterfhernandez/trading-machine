@@ -53,7 +53,12 @@ class OHLCVLoader(BaseLoader):
         rows = []
         since = int((datetime.utcnow() - timedelta(days=self.lookback_days)).timestamp() * 1000)
 
-        for symbol in self.exchange.symbols[:50]:
+        usdt_symbols = [
+            s for s in self.exchange.symbols
+            if s.endswith(":USDT") or s.endswith("USDT")
+        ]
+
+        for symbol in usdt_symbols[:50]:
             try:
                 candles = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
                 if not candles:

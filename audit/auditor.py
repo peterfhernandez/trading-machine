@@ -93,7 +93,7 @@ class DataAudit:
             return
 
         asset_count = df["asset_id"].n_unique()
-        threshold = int(150 * AUDIT_CONFIG.coverage_threshold_pct)
+        threshold = int(150 * AUDIT_CONFIG.coverage_threshold_pct / 100.0)
 
         passed = asset_count >= threshold
         severity = "error" if not passed else "info"
@@ -158,24 +158,32 @@ class DataAudit:
         ))
 
     def _check_price_outliers(self, df: pl.DataFrame) -> None:
-        """Check for suspicious price jumps (simplified check)."""
+        """Check for suspicious price jumps within each asset's own price series.
+
+        Consecutive rows in df interleave different assets, so a plain
+        row-over-row diff would compare e.g. BTC's close to an unrelated
+        asset's close. Compute pct_change per asset_id (sorted by event_ts
+        when available) so a jump is only flagged within one asset's series.
+        """
         if "close" not in df.columns or len(df) < 2:
             return
 
-        closes = df["close"].drop_nulls()
-        if len(closes) < 2:
+        working = df.filter(pl.col("close").is_not_null() & (pl.col("close") > 0))
+        if len(working) < 2:
             return
 
-        threshold = AUDIT_CONFIG.price_jump_threshold_pct / 100.0
+        sort_cols = [c for c in ("asset_id", "event_ts") if c in working.columns]
+        if sort_cols:
+            working = working.sort(sort_cols)
 
-        price_changes = []
-        for i in range(1, len(closes)):
-            prev = closes[i - 1]
-            curr = closes[i]
-            if prev > 0:
-                change = abs((curr - prev) / prev)
-                if change > threshold:
-                    price_changes.append(change)
+        pct_change = pl.col("close").pct_change()
+        if "asset_id" in working.columns:
+            pct_change = pct_change.over("asset_id")
+        working = working.with_columns(pct_change.abs().alias("_pct_change"))
+
+        threshold = AUDIT_CONFIG.price_jump_threshold_pct / 100.0
+        changes = working["_pct_change"].drop_nulls()
+        price_changes = changes.filter(changes > threshold).to_list()
 
         if price_changes:
             max_change = max(price_changes)
