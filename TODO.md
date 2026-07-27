@@ -43,12 +43,12 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 4 — Backtester (M5)
 
-- [ ] Walk-forward engine: rebalance calendar, point-in-time data exposure,
+- [x] Walk-forward engine: rebalance calendar, point-in-time data exposure,
       next-bar execution, cost model (spread + impact stub)
-- [ ] Metrics: returns, vol, IR, drawdown, turnover, per-signal IC series
-- [ ] Golden tests: a hand-computed 3-asset fixture the engine must reproduce
+- [x] Metrics: returns, vol, IR, drawdown, turnover, per-signal IC series
+- [x] Golden tests: a hand-computed 3-asset fixture the engine must reproduce
       exactly
-- [ ] Validate: buy-and-hold BTC through the engine matches raw data
+- [x] Validate: buy-and-hold BTC through the engine matches raw data
 
 ## Phase 5 — Signals → alphas (M6)
 
@@ -117,3 +117,15 @@ Legend: [ ] todo · [~] in progress · [x] done
   considered, with `exclusion_reason` for anything left out). `compute_turnover`
   added for size/turnover monitoring. 15 tests passing, scratch demo shows
   weekly snapshots and a turnover event. Ready for Phase 4 (backtester).
+- 2026-07-27: Phase 4 complete — walk-forward `Backtester` with next-bar
+  execution, drift-aware turnover, spread+impact `CostModel`, rebalance
+  calendar (daily/weekly/monthly), per-signal rank IC series, and a metrics
+  module (returns, vol, IR, drawdown, hit rate, turnover, costs). Two
+  point-in-time modes: strict `ingested_ts <= asof` by default, opt-in
+  `pit_mode="event"` so backfilled history — where every row shares one
+  ingestion timestamp — is researchable without silently pretending it is
+  live-fidelity. Annualization follows the holding period, not the bar, so
+  weekly rebalances no longer annualize as if daily. 77 tests passing (golden
+  3-asset fixture reproduced exactly; buy-and-hold BTC matches the raw
+  open-to-open series to 2e-16), scratch demo runs three strategies end to
+  end. Ready for Phase 5 (signals → alphas).

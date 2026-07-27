@@ -334,3 +334,97 @@ Phase 2 produces raw OHLCV, funding, and OI data. Phase 3 will:
 - Build universe filters for downstream signal/risk/portfolio modules
 
 No breaking changes to Phase 2 loaders/audit.
+
+---
+
+## Phase 4 Implementation Notes (Backtester)
+
+### The engine's contract
+
+`backtest.Backtester` is the module every later module is tested against, so
+its semantics are fixed and documented in `backtest/engine.py`:
+
+- **Point-in-time exposure.** At rebalance date `t` the strategy receives a
+  `RebalanceContext` whose reads go through `store.read(..., asof=t)` and are
+  further filtered to `event_ts <= t`. The engine's price panel — used for
+  fills and return accounting — is never handed to a strategy, so there is no
+  code path by which a strategy can see a bar it could not have seen live.
+- **Next-bar execution.** The close of the decision bar is the last thing the
+  strategy saw, so weights fill at the *open of the following bar*. A rebalance
+  date with no following bar cannot be executed and is dropped.
+- **Holding periods tile the sample.** Weights set at `t_k` are held from
+  `f(t_k)` open to `f(t_k+1)` open; asset returns are open-to-open, with no
+  overlap and no gaps. The final rebalance is recorded but earns no return.
+- **Drift-aware turnover.** Positions drift with returns between rebalances
+  (`w * (1+r) / (1+r_p)`), and turnover is measured against the *drifted* book.
+  Without this a buy-and-hold strategy would appear to pay costs every period.
+- **Costs from day one.** Half the quoted spread on every traded dollar plus a
+  linear impact stub (bps per $M traded), charged on traded notional at the
+  start of each period. `ZERO_COST` exists for validation and the Phase 8
+  zero-cost shadow portfolio.
+
+### Two point-in-time modes (`pit_mode`) — a deliberate, flagged relaxation
+
+Strict point-in-time (`ingested_ts <= asof`) is the correct defence, and stays
+the default. But a **backfill stamps every row it pulls with the same
+`ingested_ts`** (the moment the backfill ran), so under strict mode a backtest
+over backfilled history sees literally nothing and every book comes back empty.
+That is not a bug in the store — the store is being honest about when we
+learned things — it is an inherent property of researching history you did not
+collect as it happened.
+
+So the engine offers `pit_mode`:
+
+- `"ingestion"` (default, strict): `ingested_ts <= asof`. The number to trust;
+  correct whenever the nightly pipeline collected the data day by day.
+- `"event"` (opt-in, weaker): `event_ts <= asof` only. Still prevents a strategy
+  from seeing a bar dated after the rebalance, but concedes protection against
+  vendor revisions and genuinely-late data. Research indications, not
+  live-fidelity results.
+
+`DatastoreUniverse` takes the same flag. A Phase 3 universe snapshot dated `T`
+was itself built only from data with `ingested_ts <= T`, so reusing it in event
+mode introduces no look-ahead in the *rules* — only the possibility that the
+snapshot was built from later-revised inputs.
+
+This is the one place in the codebase where look-ahead protection can be
+loosened, it can only be loosened explicitly, and both modes are covered by
+tests.
+
+### Annualization follows the holding period, not the bar
+
+`BacktestConfig.periods_per_year` counts *bars* per year (365 for daily crypto
+bars). A weekly rebalance holds each book for ~7 bars, so the engine divides by
+the mean holding period before annualizing. Without this, weekly backtests
+reported annualized returns roughly an order of magnitude too high.
+
+### Module layout
+
+- `backtest/engine.py` — `Backtester`, `RebalanceContext`, `PricePanel`,
+  `BacktestResult`, `DatastoreUniverse`
+- `backtest/costs.py` — `CostModel` (half-spread + impact stub), `ZERO_COST`
+- `backtest/calendar.py` — daily/weekly/monthly rebalance calendars
+- `backtest/metrics.py` — pure functions (total/annualized return, vol, IR,
+  drawdown, hit rate, Spearman IC) plus `BacktestMetrics`
+- `backtest/strategies.py` — reference books (buy-and-hold, equal weight,
+  rank-based long/short) used for validation and as baselines to beat
+
+Metrics are plain Python rather than Polars/NumPy expressions specifically so
+that every number in the golden tests can be checked by hand.
+
+### Testing Coverage (Phase 4)
+
+- `tests/test_backtest.py`: 41 tests — the golden 3-asset fixture (every
+  gross/net return, turnover, cost, equity value and metric derived by hand),
+  buy-and-hold validation against the raw open-to-open series, point-in-time
+  and `pit_mode` behaviour, universe/tradability handling, calendars, IC series
+- `tests/test_backtest_metrics.py`: 36 tests — metrics, cost model, calendar
+
+All use temporary datastores and synthetic bars; each runs in well under 100ms.
+
+### Future: Phase 5 (Signals → alphas)
+
+The engine already accepts named signal functions and produces a per-signal
+rank IC series, which is exactly the input Phase 5 needs for IC estimation and
+shrinkage (`alpha = vol × IC × z`). Phase 5 adds the signal interface/registry
+and the first five signals; no engine changes are expected.
