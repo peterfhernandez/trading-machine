@@ -47,21 +47,32 @@ class DataAudit:
         self.results = []
         logger.info(f"Auditing {dataset} for {date.date()}")
 
+        # Read a bounded lookback window rather than the exact audit day, so
+        # data ingested a day (or more) late shows up as stale rather than
+        # being indistinguishable from never having been ingested at all.
+        lookback_start = (date - timedelta(days=AUDIT_CONFIG.audit_lookback_days)).date()
+
         try:
-            df = self.store.read(dataset, date_range=(date.date(), date.date()))
+            try:
+                df = self.store.read(dataset, date_range=(lookback_start, date.date()))
+            except FileNotFoundError:
+                # Dataset has never been ingested at all (e.g. first-ever run);
+                # this is the same "no data" outcome as an empty read, not a
+                # separate execution failure.
+                df = pl.DataFrame()
 
             if len(df) == 0:
                 self.results.append(AuditResult(
                     check_name="data_presence",
                     passed=False,
-                    message=f"No data found for {date.date()}",
+                    message=f"No data found in the last {AUDIT_CONFIG.audit_lookback_days} days (as of {date.date()})",
                     severity="error",
                 ))
                 return self.results
 
             self._check_coverage(df)
             self._check_null_rates(df)
-            self._check_freshness(df, date)
+            self._check_freshness(df, date, AUDIT_CONFIG.freshness_threshold_for(dataset))
             if "close" in df.columns:
                 self._check_price_outliers(df)
 
@@ -116,13 +127,14 @@ class DataAudit:
                     severity=severity,
                 ))
 
-    def _check_freshness(self, df: pl.DataFrame, audit_date: datetime) -> None:
+    def _check_freshness(
+        self, df: pl.DataFrame, audit_date: datetime, threshold_hours: float
+    ) -> None:
         """Check data freshness: ingested_ts should be recent."""
         if "ingested_ts" not in df.columns:
             return
 
-        freshness_window = timedelta(hours=AUDIT_CONFIG.freshness_threshold_hours)
-        cutoff = audit_date - freshness_window
+        freshness_window = timedelta(hours=threshold_hours)
 
         latest_ingested = df["ingested_ts"].max()
         if latest_ingested is None:
@@ -141,7 +153,7 @@ class DataAudit:
         self.results.append(AuditResult(
             check_name="freshness",
             passed=passed,
-            message=f"Latest data is {age.total_seconds() / 3600:.1f}h old (threshold: {AUDIT_CONFIG.freshness_threshold_hours}h)",
+            message=f"Latest data is {age.total_seconds() / 3600:.1f}h old (threshold: {threshold_hours}h)",
             severity=severity,
         ))
 

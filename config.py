@@ -12,7 +12,8 @@ All configuration lives here, including:
 
 import os
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict
 
 
 # ============================================================================
@@ -174,8 +175,28 @@ class AuditConfig:
     # Alert if price jump > this % vs. second venue (outlier detection)
     price_jump_threshold_pct: float = 10.0
 
-    # Alert if data is older than this (hours)
+    # Default freshness threshold (hours) for any dataset not listed below
     freshness_threshold_hours: float = 24.0
+
+    # Per-dataset freshness thresholds (hours); a dataset ingested less often
+    # than this should not be flagged stale, and one ingested much more often
+    # (e.g. hourly candles) should be held to a tighter bar. Falls back to
+    # freshness_threshold_hours for any dataset not listed here.
+    freshness_threshold_hours_by_dataset: Dict[str, float] = field(default_factory=lambda: {
+        "ohlcv_daily": 24.0,
+        "ohlcv_hourly": 2.0,
+        "funding_rate": 24.0,
+        "open_interest": 24.0,
+    })
+
+    # How many days back the audit looks for *any* data before concluding a
+    # dataset is genuinely missing (as opposed to merely stale). Bounds the
+    # read regardless of how large freshness_threshold_hours is.
+    audit_lookback_days: int = 7
+
+    def freshness_threshold_for(self, dataset: str) -> float:
+        """Freshness threshold (hours) for a dataset, falling back to the default."""
+        return self.freshness_threshold_hours_by_dataset.get(dataset, self.freshness_threshold_hours)
 
 
 LOADER_CONFIG = LoaderConfig()

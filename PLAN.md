@@ -253,11 +253,21 @@ wasting API quota.
 
 The `DataAudit` class runs five checks on each dataset:
 
-1. **data_presence:** Fails if no data exists for the audit date
+1. **data_presence:** Fails if no data exists anywhere in the lookback window
+   (`AUDIT_CONFIG.audit_lookback_days`, default 7 days back from the audit date)
 2. **coverage:** % of assets present (threshold: 80% of universe)
 3. **null_rate_*:** Per-column null % (threshold: 1%)
-4. **freshness:** Data age check (threshold: 24 hours)
+4. **freshness:** Data age check against a per-dataset threshold
+   (`AUDIT_CONFIG.freshness_threshold_hours_by_dataset`, falling back to
+   `freshness_threshold_hours` for any unlisted dataset)
 5. **price_outliers:** Detects suspicious price jumps (threshold: 10%)
+
+`audit_dataset()` reads a bounded lookback window (not just the exact audit
+day) so data ingested late is correctly reported as **stale** (via the
+freshness check, with a precise age) rather than being indistinguishable from
+data that was **never ingested at all** (data_presence). A dataset directory
+that doesn't exist yet (first-ever run) is also treated as "no data" rather
+than surfacing as a raw execution error.
 
 Each check returns an `AuditResult` with severity ("info", "warning", "error").
 Critical errors set `should_halt_trading() = True`, halting the pipeline.

@@ -157,6 +157,63 @@ class TestDataAudit:
         outlier_results = [r for r in results if r.check_name == "price_outliers"]
         assert len(outlier_results) > 0
 
+    def test_freshness_check_flags_stale_data_within_lookback(self, temp_store, sample_ohlcv_schema):
+        """Data ingested 2 days ago, audited today, is stale under the 24h default
+        threshold but still within the 7-day lookback window: the audit should
+        find it and report it as stale via the freshness check, not report it
+        as "no data" (which would hide the actual cause)."""
+        audit_date = datetime(2024, 1, 3)
+        stale_date = datetime(2024, 1, 1)  # 2 days before audit_date
+
+        df = pl.DataFrame({
+            "asset_id": ["BTC"] * 10,
+            "venue": ["binance"] * 10,
+            "event_ts": [stale_date] * 10,
+            "ingested_ts": [stale_date] * 10,
+            "close": [42000.0] * 10,
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", audit_date)
+
+        assert not any(r.check_name == "data_presence" for r in results)
+        freshness_results = [r for r in results if r.check_name == "freshness"]
+        assert len(freshness_results) == 1
+        assert not freshness_results[0].passed
+        assert freshness_results[0].severity == "error"
+        assert "48.0h old" in freshness_results[0].message
+
+    def test_data_presence_fails_outside_lookback_window(self, temp_store, sample_ohlcv_schema):
+        """Data ingested well beyond the lookback window (8 days ago, window is
+        7 days) should be reported as missing, not silently found stale."""
+        audit_date = datetime(2024, 1, 10)
+        very_old_date = datetime(2024, 1, 1)  # 9 days before audit_date
+
+        df = pl.DataFrame({
+            "asset_id": ["BTC"] * 10,
+            "venue": ["binance"] * 10,
+            "event_ts": [very_old_date] * 10,
+            "ingested_ts": [very_old_date] * 10,
+            "close": [42000.0] * 10,
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", audit_date)
+
+        assert len(results) == 1
+        assert results[0].check_name == "data_presence"
+        assert not results[0].passed
+
+    def test_per_dataset_freshness_threshold(self, temp_store):
+        """ohlcv_hourly has a tighter freshness bar than the 24h default."""
+        assert AUDIT_CONFIG.freshness_threshold_for("ohlcv_hourly") == 2.0
+        assert AUDIT_CONFIG.freshness_threshold_for("ohlcv_daily") == 24.0
+        assert AUDIT_CONFIG.freshness_threshold_for("some_unlisted_dataset") == (
+            AUDIT_CONFIG.freshness_threshold_hours
+        )
+
     def test_halt_trading_on_error(self, temp_store):
         """Test halt trading flag on critical failures."""
         audit = DataAudit(temp_store)
