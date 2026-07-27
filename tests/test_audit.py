@@ -92,6 +92,33 @@ class TestDataAudit:
         coverage_results = [r for r in results if r.check_name == "coverage"]
         assert len(coverage_results) > 0
 
+    def test_coverage_threshold_is_percentage_not_raw_multiplier(
+        self, temp_store, sample_ohlcv_schema
+    ):
+        """coverage_threshold_pct=90.0 means 90%, i.e. int(150 * 0.90) = 135,
+        not int(150 * 90.0) = 13500 -- the latter can never pass for any
+        realistic universe size."""
+        base_date = datetime(2024, 1, 1)
+        now = base_date.replace(microsecond=0)
+
+        assets = [f"ASSET{i}" for i in range(140)]  # above 135, below 150
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [now] * len(assets),
+            "ingested_ts": [now] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage_results = [r for r in results if r.check_name == "coverage"]
+        assert len(coverage_results) == 1
+        assert coverage_results[0].passed
+        assert "threshold: 135" in coverage_results[0].message
+
     def test_null_rate_check(self, temp_store, sample_ohlcv_schema):
         """Test null rate detection."""
         base_date = datetime(2024, 1, 1)
@@ -156,6 +183,61 @@ class TestDataAudit:
 
         outlier_results = [r for r in results if r.check_name == "price_outliers"]
         assert len(outlier_results) > 0
+
+    def test_price_outliers_ignores_cross_asset_price_differences(
+        self, temp_store, sample_ohlcv_schema
+    ):
+        """Interleaved rows for different assets at wildly different price
+        levels (e.g. BTC ~$100k next to a $0.10 altcoin) must not be read as
+        a price jump -- each asset's series should be checked independently.
+        A genuine large jump within one asset's own series should still be
+        caught."""
+        t0 = datetime(2024, 1, 1, 0)
+        t1 = datetime(2024, 1, 1, 1)
+
+        df = pl.DataFrame({
+            "asset_id": ["BTC", "DOGE", "BTC", "DOGE"],
+            "venue": ["binance"] * 4,
+            "event_ts": [t0, t0, t1, t1],
+            "ingested_ts": [t0, t0, t1, t1],
+            # BTC: 100000 -> 101000 (1% move, not an outlier)
+            # DOGE: 0.10 -> 0.10 (no move)
+            "close": [100000.0, 0.10, 101000.0, 0.10],
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", t1)
+
+        outlier_results = [r for r in results if r.check_name == "price_outliers"]
+        assert len(outlier_results) == 1
+        assert outlier_results[0].passed
+
+    def test_price_outliers_catches_genuine_within_asset_jump(
+        self, temp_store, sample_ohlcv_schema
+    ):
+        """A real jump within a single asset's series should still be flagged,
+        even interleaved with another asset's unrelated price level."""
+        t0 = datetime(2024, 1, 1, 0)
+        t1 = datetime(2024, 1, 1, 1)
+
+        df = pl.DataFrame({
+            "asset_id": ["BTC", "DOGE", "BTC", "DOGE"],
+            "venue": ["binance"] * 4,
+            "event_ts": [t0, t0, t1, t1],
+            "ingested_ts": [t0, t0, t1, t1],
+            # BTC: 100000 -> 150000 (50% move, a genuine outlier)
+            "close": [100000.0, 0.10, 150000.0, 0.10],
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", t1)
+
+        outlier_results = [r for r in results if r.check_name == "price_outliers"]
+        assert len(outlier_results) == 1
+        assert not outlier_results[0].passed
+        assert "1 price jumps" in outlier_results[0].message
 
     def test_freshness_check_flags_stale_data_within_lookback(self, temp_store, sample_ohlcv_schema):
         """Data ingested 2 days ago, audited today, is stale under the 24h default
