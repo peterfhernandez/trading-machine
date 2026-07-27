@@ -1,7 +1,7 @@
 """Funding rate loader for perpetual swaps (Binance, Deribit)."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import ccxt
@@ -48,7 +48,7 @@ class FundingRateLoader(BaseLoader):
         logger.info(f"Fetching funding rates for {self.venue}")
 
         rows = []
-        since = int((datetime.utcnow() - timedelta(days=self.lookback_days)).timestamp() * 1000)
+        since = int((datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp() * 1000)
 
         for symbol in self.exchange.symbols[:50]:
             if not symbol.endswith(':USDT') and not symbol.endswith('USDT'):
@@ -58,7 +58,11 @@ class FundingRateLoader(BaseLoader):
                 if hasattr(self.exchange, 'fetch_funding_rate'):
                     fr_data = self.exchange.fetch_funding_rate(symbol)
                     if fr_data:
-                        ts = datetime.utcfromtimestamp(fr_data.get('timestamp', 0) / 1000) if fr_data.get('timestamp') else datetime.utcnow()
+                        ts = (
+                            datetime.fromtimestamp(fr_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
+                            if fr_data.get('timestamp')
+                            else datetime.now(timezone.utc).replace(tzinfo=None)
+                        )
                         rows.append({
                             "symbol": symbol,
                             "event_ts": ts,
@@ -70,7 +74,11 @@ class FundingRateLoader(BaseLoader):
                     all_rates = self.exchange.fetch_funding_rates()
                     if symbol in all_rates:
                         fr_data = all_rates[symbol]
-                        ts = datetime.utcfromtimestamp(fr_data.get('timestamp', 0) / 1000) if fr_data.get('timestamp') else datetime.utcnow()
+                        ts = (
+                            datetime.fromtimestamp(fr_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
+                            if fr_data.get('timestamp')
+                            else datetime.now(timezone.utc).replace(tzinfo=None)
+                        )
                         rows.append({
                             "symbol": symbol,
                             "event_ts": ts,

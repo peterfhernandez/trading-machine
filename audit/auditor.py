@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import polars as pl
@@ -42,7 +42,7 @@ class DataAudit:
             List of AuditResult objects
         """
         if date is None:
-            date = datetime.utcnow()
+            date = datetime.now(timezone.utc).replace(tzinfo=None)
 
         self.results = []
         logger.info(f"Auditing {dataset} for {date.date()}")

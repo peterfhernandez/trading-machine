@@ -53,8 +53,11 @@ def mock_ccxt_binance():
 class TestOpenInterestLoader:
     """Tests for OpenInterestLoader."""
 
-    def test_init(self, mock_asset_master, temp_store):
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_init(self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance):
         """Test loader initialization."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
         loader = OpenInterestLoader("binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master)
         assert loader.venue == "binance"
         assert loader.lookback_days == 7

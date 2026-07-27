@@ -12,7 +12,7 @@ The asset master stores:
 - validity_start, validity_end: when the mapping was/is active (point-in-time)
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
@@ -119,7 +119,7 @@ class AssetMaster:
             Canonical asset_id, or None if not found
         """
         if asof is None:
-            asof = datetime.utcnow()
+            asof = datetime.now(timezone.utc).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("symbol") == symbol)
@@ -157,7 +157,7 @@ class AssetMaster:
             or None if the mapping doesn't exist
         """
         if asof is None:
-            asof = datetime.utcnow()
+            asof = datetime.now(timezone.utc).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("asset_id") == asset_id)
@@ -192,7 +192,7 @@ class AssetMaster:
             Dict mapping venue -> primary symbol at asof date
         """
         if asof is None:
-            asof = datetime.utcnow()
+            asof = datetime.now(timezone.utc).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("asset_id") == asset_id)
