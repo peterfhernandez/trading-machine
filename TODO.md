@@ -52,7 +52,10 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 5 — Signals → alphas (M6)
 
-- [ ] Signal interface + registry; METHODOLOGY.md template
+- [x] Signal interface + registry; METHODOLOGY.md template
+      (registry refuses to register a signal whose methodology doc is missing)
+- [x] Markov mean reversion (reversal family) — implemented + tested; backtest
+      evidence still to be collected via the walk-forward parameter grid
 - [ ] Cross-sectional momentum (with skip-window)
 - [ ] Time-series momentum
 - [ ] Carry (funding rate)
@@ -60,7 +63,11 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [ ] Low-volatility
 - [ ] Alpha refinement: z-scoring, winsorizing, IC estimation from backtests,
       shrinkage; alpha = vol × IC × z
+      (cross-sectional winsorize + z-score done in `signals/transforms.py`;
+      IC estimation and shrinkage still to do)
 - [ ] Signal correlation matrix report (breadth check: are these independent?)
+- [ ] Run `scratch/scratch_markov_param_grid.py` against the real backfill and
+      fill in Sections 4-5 of the markov methodology doc with the OOS numbers
 
 ## Phase 6 — Risk model (M7)
 
@@ -129,6 +136,27 @@ Legend: [ ] todo · [~] in progress · [x] done
   3-asset fixture reproduced exactly; buy-and-hold BTC matches the raw
   open-to-open series to 2e-16), scratch demo runs three strategies end to
   end. Ready for Phase 5 (signals → alphas).
+- 2026-07-30: Phase 5 started — signal interface + registry (registration
+  requires a methodology doc), shared cross-sectional transforms (winsorize then
+  z-score, `None` preserved as "no view"), and the first signal:
+  `markov_mean_reversion`. Built against the real `RebalanceContext` (one
+  universe-wide read per rebalance, not one per asset). Three methodology
+  decisions recorded in the doc: `return_horizon_days` split out of
+  `state_window_days` (one parameter for both left 20 heavily-overlapping
+  observations to estimate a mean, a variance and k-1 cutoffs), state midpoints
+  moved onto the transition matrix's window so probabilities and the values they
+  weight describe one period, and the estimation window fixed at
+  `min_history_bars` (244 at defaults) so a score is independent of how much
+  history an asset has. Guards added for gaps in the bar series and for
+  duplicate ingestions of the same bar. 68 tests (golden 10-bar fixture with
+  every z-score, cutoff, state, transition row, midpoint and the final score
+  derived by hand; point-in-time tests through a real store in both pit modes;
+  every reject path returns `None`, never `0.0`). Walk-forward parameter grid
+  script written (`scratch/scratch_markov_param_grid.py`) — selects parameters on
+  prior folds only and reports the overfitting tax, parameter sensitivity and
+  cost sensitivity. Backtest evidence not yet collected: the grid has been run
+  only on synthetic data as a smoke test, and Section 5 of the methodology doc
+  is deliberately still empty.
 - 2026-07-30: Fixed three nightly-pipeline faults that surfaced as
   "TRADING HALTED: critical audit failure" on `funding_rate`/`open_interest`
   with only 15 assets covered. (1) The audit's coverage check divided by a
@@ -148,5 +176,5 @@ Legend: [ ] todo · [~] in progress · [x] done
   The nightly pipeline registers both spot and perp symbol namespaces in the
   asset master (skipping already-mapped symbols instead of appending duplicates
   every run) and logs warning-severity checks so an unevaluated check is never
-  silent. 194 tests passing; `scratch/scratch_perp_symbols.py` demos symbol
+  silent. 263 tests passing; `scratch/scratch_perp_symbols.py` demos symbol
   selection and market types against a live venue.
