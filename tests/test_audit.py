@@ -8,12 +8,49 @@ import pytest
 from config import AUDIT_CONFIG
 from datastore import ParquetStore, DatasetSchema
 from audit.auditor import DataAudit, AuditResult
+from universe import UNIVERSE_SCHEMA
 
 
 @pytest.fixture
 def temp_store(tmp_path):
     """Create a temporary ParquetStore."""
     return ParquetStore(tmp_path)
+
+
+def write_universe_snapshot(
+    store: ParquetStore,
+    event_ts: datetime,
+    n_members: int,
+    venue: str = "binance",
+    n_excluded: int = 0,
+    ingested_ts: datetime | None = None,
+) -> None:
+    """Append a point-in-time universe snapshot with `n_members` members.
+
+    Mirrors what UniverseBuilder writes: one row per asset considered, with
+    non-members carrying an exclusion_reason.
+    """
+    ingested_ts = ingested_ts or event_ts
+    members = [f"MEM{i:03d}" for i in range(n_members)]
+    excluded = [f"EXC{i:03d}" for i in range(n_excluded)]
+    assets = members + excluded
+
+    df = pl.DataFrame(
+        {
+            "asset_id": assets,
+            "venue": [venue] * len(assets),
+            "event_ts": [event_ts] * len(assets),
+            "ingested_ts": [ingested_ts] * len(assets),
+            "in_universe": [True] * n_members + [False] * n_excluded,
+            "dollar_volume_median": [1e7] * len(assets),
+            "listing_age_days": [365] * len(assets),
+            "rank": list(range(1, n_members + 1)) + [None] * n_excluded,
+            "exclusion_reason": [None] * n_members + ["low_volume"] * n_excluded,
+        },
+        schema=UNIVERSE_SCHEMA.to_polars_schema(),
+    )
+
+    store.append("universe", df, UNIVERSE_SCHEMA)
 
 
 @pytest.fixture
@@ -101,7 +138,9 @@ class TestDataAudit:
         base_date = datetime(2024, 1, 1)
         now = base_date.replace(microsecond=0)
 
-        assets = [f"ASSET{i}" for i in range(140)]  # above 135, below 150
+        write_universe_snapshot(temp_store, base_date, n_members=150)
+
+        assets = [f"MEM{i:03d}" for i in range(140)]  # above 135, below 150
         df = pl.DataFrame({
             "asset_id": assets,
             "venue": ["binance"] * len(assets),
@@ -118,6 +157,209 @@ class TestDataAudit:
         assert len(coverage_results) == 1
         assert coverage_results[0].passed
         assert "threshold: 135" in coverage_results[0].message
+
+
+class TestCoverageDenominator:
+    """The coverage check's denominator is the point-in-time universe, not a
+    hardcoded target size."""
+
+    def test_denominator_comes_from_universe_snapshot(self, temp_store, sample_ohlcv_schema):
+        """20 of 20 universe members present -> coverage passes with a
+        threshold of 18 (90% of 20), not of some hardcoded 150."""
+        base_date = datetime(2024, 1, 1)
+
+        write_universe_snapshot(temp_store, base_date, n_members=20, n_excluded=30)
+
+        assets = [f"MEM{i:03d}" for i in range(20)]
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [base_date] * len(assets),
+            "ingested_ts": [base_date] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage = [r for r in results if r.check_name == "coverage"][0]
+        assert coverage.passed
+        assert "20/20 universe assets" in coverage.message
+        assert "threshold: 18" in coverage.message
+        assert not audit.should_halt_trading()
+
+    def test_short_coverage_against_known_universe_halts(self, temp_store, sample_ohlcv_schema):
+        """A real shortfall against a known universe is still a halting error."""
+        base_date = datetime(2024, 1, 1)
+
+        write_universe_snapshot(temp_store, base_date, n_members=100)
+
+        assets = [f"MEM{i:03d}" for i in range(15)]
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [base_date] * len(assets),
+            "ingested_ts": [base_date] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage = [r for r in results if r.check_name == "coverage"][0]
+        assert not coverage.passed
+        assert coverage.severity == "error"
+        assert "15/100 universe assets" in coverage.message
+        assert "threshold: 90" in coverage.message
+        assert audit.should_halt_trading()
+
+    def test_no_universe_snapshot_is_not_evaluated_and_does_not_halt(
+        self, temp_store, sample_ohlcv_schema
+    ):
+        """With no universe dataset there is no honest denominator: report the
+        observed asset count as a warning rather than halting trading on a
+        fabricated threshold."""
+        base_date = datetime(2024, 1, 1)
+
+        assets = [f"ASSET{i}" for i in range(15)]
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [base_date] * len(assets),
+            "ingested_ts": [base_date] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage = [r for r in results if r.check_name == "coverage"][0]
+        assert coverage.passed
+        assert coverage.severity == "warning"
+        assert "not evaluated" in coverage.message
+        assert "15 assets" in coverage.message
+        assert not audit.should_halt_trading()
+
+    def test_non_members_do_not_count_toward_coverage(self, temp_store, sample_ohlcv_schema):
+        """A dataset full of assets that are not in the universe covers none of
+        it -- coverage counts members present, not distinct asset_ids."""
+        base_date = datetime(2024, 1, 1)
+
+        write_universe_snapshot(temp_store, base_date, n_members=10)
+
+        assets = ["MEM000", "MEM001"] + [f"OTHER{i}" for i in range(50)]
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [base_date] * len(assets),
+            "ingested_ts": [base_date] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage = [r for r in results if r.check_name == "coverage"][0]
+        assert not coverage.passed
+        assert "2/10 universe assets" in coverage.message
+
+    def test_uses_latest_snapshot_at_or_before_audit_date(self, temp_store, sample_ohlcv_schema):
+        """Point-in-time: a later snapshot must not set today's denominator."""
+        audit_date = datetime(2024, 1, 5)
+
+        write_universe_snapshot(temp_store, datetime(2024, 1, 1), n_members=10)
+        write_universe_snapshot(temp_store, datetime(2024, 1, 4), n_members=20)
+        write_universe_snapshot(temp_store, datetime(2024, 1, 6), n_members=200)
+
+        audit = DataAudit(temp_store)
+        size, source = audit.resolve_universe_size(audit_date)
+
+        assert size == 20
+        assert "2024-01-04" in source
+
+    def test_ignores_snapshot_ingested_after_audit_date(self, temp_store):
+        """A snapshot whose ingested_ts is later than the audit date was not
+        knowable then, so it cannot define the denominator."""
+        audit_date = datetime(2024, 1, 5)
+
+        write_universe_snapshot(
+            temp_store,
+            datetime(2024, 1, 4),
+            n_members=20,
+            ingested_ts=datetime(2024, 1, 9),
+        )
+
+        audit = DataAudit(temp_store)
+        size, source = audit.resolve_universe_size(audit_date)
+
+        assert size is None
+        assert "no universe snapshot" in source
+
+    def test_ignores_other_venues(self, temp_store):
+        """Only the audited venue's universe counts."""
+        audit_date = datetime(2024, 1, 5)
+
+        write_universe_snapshot(temp_store, datetime(2024, 1, 4), n_members=30, venue="deribit")
+
+        audit = DataAudit(temp_store, venue="binance")
+        size, source = audit.resolve_universe_size(audit_date)
+        assert size is None
+
+        audit_deribit = DataAudit(temp_store, venue="deribit")
+        size, source = audit_deribit.resolve_universe_size(audit_date)
+        assert size == 30
+
+    def test_excluded_assets_do_not_count_as_universe_members(self, temp_store):
+        """Rows are written for every asset considered; only in_universe counts."""
+        audit_date = datetime(2024, 1, 5)
+
+        write_universe_snapshot(
+            temp_store, datetime(2024, 1, 4), n_members=12, n_excluded=88
+        )
+
+        audit = DataAudit(temp_store)
+        size, _ = audit.resolve_universe_size(audit_date)
+
+        assert size == 12
+
+    def test_explicit_universe_size_override(self, temp_store, sample_ohlcv_schema):
+        """A caller with a known expected asset count can set the denominator."""
+        base_date = datetime(2024, 1, 1)
+
+        assets = ["BTC", "ETH", "SOL", "ADA"]
+        df = pl.DataFrame({
+            "asset_id": assets,
+            "venue": ["binance"] * len(assets),
+            "event_ts": [base_date] * len(assets),
+            "ingested_ts": [base_date] * len(assets),
+            "close": [100.0] * len(assets),
+        })
+        temp_store.append("test_ohlcv", df, sample_ohlcv_schema)
+
+        audit = DataAudit(temp_store, universe_size=4)
+        results = audit.audit_dataset("test_ohlcv", base_date)
+
+        coverage = [r for r in results if r.check_name == "coverage"][0]
+        assert coverage.passed
+        assert "4/4 universe assets" in coverage.message
+        assert "explicit universe_size" in coverage.message
+
+    def test_empty_universe_snapshot_is_not_a_denominator(self, temp_store):
+        """A snapshot with no members (e.g. built before any data existed)
+        cannot be divided by."""
+        audit_date = datetime(2024, 1, 5)
+
+        write_universe_snapshot(temp_store, datetime(2024, 1, 4), n_members=0, n_excluded=5)
+
+        audit = DataAudit(temp_store)
+        size, source = audit.resolve_universe_size(audit_date)
+
+        assert size is None
+        assert "no members" in source
 
     def test_null_rate_check(self, temp_store, sample_ohlcv_schema):
         """Test null rate detection."""

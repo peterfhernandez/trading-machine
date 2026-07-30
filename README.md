@@ -170,6 +170,18 @@ oi_loader = OpenInterestLoader("binance", lookback_days=30)
 oi_loader.run()
 ```
 
+**Market types.** Funding rate and open interest exist only on derivatives, so
+those two loaders open the venue with `defaultType=LOADER_CONFIG.perp_market_type`
+(`"future"`) and select perpetual symbols (`BTC/USDT:USDT`, excluding dated
+futures). The OHLCV loader stays on the venue's default (spot) markets. Both
+symbol namespaces are registered in the asset master by the nightly pipeline, so
+either notation resolves to the same canonical `asset_id`.
+
+**Symbol budget.** Each loader fetches up to `LOADER_CONFIG.max_symbols_per_run`
+(200) USDT-quoted symbols. The USDT filter is applied *before* the cap — a
+venue's symbol list interleaves every quote currency alphabetically, so capping
+first and filtering after silently starves the budget.
+
 **Backfill runner** orchestrates all loaders with resumable checkpoint tracking:
 
 ```python
@@ -182,18 +194,38 @@ runner.run(days_back=30)  # Fetches 30 days; resumes from checkpoint on retry
 ### Audit
 
 Data quality audit with 5 checks: coverage (% of universe), null rates per column,
-price outliers, freshness (data age), and row count. Sends Telegram alerts on breaches.
+price outliers, freshness (data age), and data presence. Sends Telegram alerts on
+breaches.
 
 ```python
 from audit import DataAudit
 
-audit = DataAudit()
+audit = DataAudit(venue="binance")
 results = audit.audit_dataset("ohlcv_daily")
 audit.send_alerts()
 
 if audit.should_halt_trading():
     print("Critical failure; trading halted")
 ```
+
+**Coverage denominator.** "% of universe" needs a universe. The denominator is
+the number of members in the latest point-in-time `universe` snapshot with
+`event_ts <= asof`, read through `ingested_ts <= asof` — never a hardcoded
+target size, which makes the check either vacuous or permanently red depending
+on how many assets the loaders happen to cover. With no snapshot available the
+check reports itself **not evaluated** (a warning carrying the observed asset
+count) instead of halting trading on a fabricated threshold:
+
+```python
+DataAudit(store, venue="binance").resolve_universe_size(asof)
+# (150, "universe snapshot 2026-07-29")   -> threshold = 90% of 150
+# (None, "no universe dataset in the store") -> coverage not evaluated
+```
+
+The numerator is universe **members** present in the dataset, so rows for assets
+outside the universe cannot inflate coverage. Pass
+`DataAudit(store, universe_size=N)` to set the denominator explicitly when the
+expected asset count is known from elsewhere.
 
 ### Universe
 

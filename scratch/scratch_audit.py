@@ -11,6 +11,7 @@ import polars as pl
 from config import PAPER
 from datastore import ParquetStore, DatasetSchema
 from audit.auditor import DataAudit
+from universe import UNIVERSE_SCHEMA
 
 
 logging.basicConfig(
@@ -63,20 +64,48 @@ def main():
         store.append("ohlcv_demo", df, schema)
         logger.info("Created test dataset with 100 rows")
 
-        try:
-            logger.info("Running audit on ohlcv_demo...")
-            audit = DataAudit(store)
+        def run_audit(label: str) -> None:
+            print(f"\n--- {label} ---")
+            audit = DataAudit(store, venue="binance")
+            size, source = audit.resolve_universe_size(base_date)
+            print(f"Coverage denominator: {size if size is not None else 'n/a'} ({source})")
+
             results = audit.audit_dataset("ohlcv_demo", base_date)
 
-            print("\nAudit Results:")
+            print("Audit Results:")
             for result in results:
                 status = "✓ PASS" if result.passed else "✗ FAIL"
-                print(f"  {status} | {result.check_name}")
+                print(f"  {status} | {result.check_name} [{result.severity}]")
                 print(f"      └─ {result.message}")
 
-            print()
-            halt = audit.should_halt_trading()
-            print(f"Should halt trading: {'YES' if halt else 'NO'}")
+            print(f"Should halt trading: {'YES' if audit.should_halt_trading() else 'NO'}")
+
+        try:
+            # 1. No universe snapshot: coverage has no honest denominator, so it
+            #    reports itself unevaluated instead of halting on a made-up one.
+            run_audit("no universe snapshot in the store")
+
+            # 2. With a point-in-time universe snapshot the check becomes real:
+            #    5 of 8 members present is below the 90% threshold.
+            members = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOT", "LINK"]
+            universe_df = pl.DataFrame(
+                {
+                    "asset_id": members,
+                    "venue": ["binance"] * len(members),
+                    "event_ts": [base_date] * len(members),
+                    "ingested_ts": [base_date] * len(members),
+                    "in_universe": [True] * len(members),
+                    "dollar_volume_median": [1e7] * len(members),
+                    "listing_age_days": [365] * len(members),
+                    "rank": list(range(1, len(members) + 1)),
+                    "exclusion_reason": [None] * len(members),
+                },
+                schema=UNIVERSE_SCHEMA.to_polars_schema(),
+            )
+            store.append("universe", universe_df, UNIVERSE_SCHEMA)
+            logger.info(f"Wrote universe snapshot with {len(members)} members")
+
+            run_audit("universe snapshot present (8 members, 5 with data)")
             print()
 
         except Exception as e:

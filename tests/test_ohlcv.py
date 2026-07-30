@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 
-from config import DATASTORE_PATH
+from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster, DatasetSchema
 from loaders.ohlcv import OHLCVLoader
 from loaders.schemas import OHLCV_SCHEMA
@@ -63,6 +63,39 @@ class TestOHLCVLoader:
         loader = OHLCVLoader("binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master)
         assert loader.venue == "binance"
         assert loader.lookback_days == 7
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_symbol_budget_is_configurable_and_usdt_only(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """The symbol cap is a config value, applied to USDT pairs only, so the
+        loaders can cover enough assets for the universe and coverage check."""
+        symbols = []
+        for i in range(120):
+            base = f"A{i:03d}"
+            symbols.extend([f"{base}/BTC", f"{base}/USDC", f"{base}/USDT"])
+        mock_ccxt_binance.symbols = sorted(symbols)
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OHLCVLoader(
+            "binance", lookback_days=7, store=temp_store,
+            asset_master=mock_asset_master, max_symbols=100,
+        )
+        loader.fetch(timeframe="1d")
+
+        queried = [c.args[0] for c in mock_ccxt_binance.fetch_ohlcv.call_args_list]
+        assert len(queried) == 100
+        assert all(s.endswith("/USDT") for s in queried)
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_default_symbol_cap_comes_from_config(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OHLCVLoader("binance", store=temp_store, asset_master=mock_asset_master)
+
+        assert loader.max_symbols == LOADER_CONFIG.max_symbols_per_run
 
     @patch("loaders.ohlcv.ccxt.binance")
     def test_fetch_daily(self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance):

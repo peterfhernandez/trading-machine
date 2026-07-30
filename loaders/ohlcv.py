@@ -7,9 +7,9 @@ from typing import Optional
 import ccxt
 import polars as pl
 
-from config import DATASTORE_PATH
+from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
-from loaders.base import BaseLoader
+from loaders.base import BaseLoader, select_usdt_symbols
 from loaders.schemas import OHLCV_SCHEMA
 
 
@@ -25,9 +25,13 @@ class OHLCVLoader(BaseLoader):
         lookback_days: int = 365,
         store: Optional[ParquetStore] = None,
         asset_master: Optional[AssetMaster] = None,
+        max_symbols: Optional[int] = None,
     ):
         super().__init__(venue, store, asset_master)
         self.lookback_days = lookback_days
+        self.max_symbols = (
+            LOADER_CONFIG.max_symbols_per_run if max_symbols is None else max_symbols
+        )
         self.exchange = self._init_exchange(venue)
 
     def _init_exchange(self, venue: str):
@@ -53,12 +57,12 @@ class OHLCVLoader(BaseLoader):
         rows = []
         since = int((datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp() * 1000)
 
-        usdt_symbols = [
-            s for s in self.exchange.symbols
-            if s.endswith(":USDT") or s.endswith("USDT")
-        ]
+        usdt_symbols = select_usdt_symbols(
+            self.exchange.symbols, max_symbols=self.max_symbols
+        )
+        logger.info(f"Selected {len(usdt_symbols)} USDT symbols (cap: {self.max_symbols})")
 
-        for symbol in usdt_symbols[:50]:
+        for symbol in usdt_symbols:
             try:
                 candles = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
                 if not candles:

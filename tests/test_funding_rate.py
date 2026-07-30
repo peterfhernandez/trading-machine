@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 
+from config import LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.funding_rate import FundingRateLoader
 from loaders.schemas import FUNDING_RATE_SCHEMA
@@ -101,6 +102,71 @@ class TestFundingRateLoader:
         required = ["asset_id", "venue", "event_ts", "ingested_ts", "funding_rate", "mark_price", "index_price"]
         for col in required:
             assert col in df.columns, f"Missing required column: {col}"
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_opens_exchange_against_perp_markets(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """Funding rates only exist for derivatives; the ccxt default (spot)
+        would raise for every symbol and produce an empty dataset."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+
+        mock_binance_class.assert_called_once_with(
+            {"options": {"defaultType": LOADER_CONFIG.perp_market_type}}
+        )
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_falls_back_when_venue_rejects_market_type(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """A venue that rejects the options dict still gets initialized."""
+        mock_binance_class.side_effect = [TypeError("unsupported option"), mock_ccxt_binance]
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+
+        assert loader.exchange is mock_ccxt_binance
+        assert mock_binance_class.call_count == 2
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_filters_usdt_symbols_before_applying_the_cap(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """Regression: the loader used to slice exchange.symbols[:50] and filter
+        afterwards, so an alphabetically-interleaved symbol list yielded ~15
+        assets out of a 50-symbol budget."""
+        symbols = []
+        for i in range(60):
+            base = f"A{i:03d}"
+            symbols.extend([
+                f"{base}/BNB:BNB", f"{base}/BTC:BTC", f"{base}/USDC:USDC", f"{base}/USDT:USDT"
+            ])
+        mock_ccxt_binance.symbols = sorted(symbols)
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = FundingRateLoader(
+            "binance", store=temp_store, asset_master=mock_asset_master, max_symbols=50
+        )
+        loader.fetch()
+
+        queried = [c.args[0] for c in mock_ccxt_binance.fetch_funding_rate.call_args_list]
+        assert len(queried) == 50
+        assert all(s.endswith(":USDT") for s in queried)
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_prefers_perp_symbols_over_spot(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """With perps available, spot duplicates are not queried for funding."""
+        mock_ccxt_binance.symbols = ["BTC/USDT", "BTC/USDT:USDT", "ETH/USDT", "ETH/USDT:USDT"]
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        loader.fetch()
+
+        queried = [c.args[0] for c in mock_ccxt_binance.fetch_funding_rate.call_args_list]
+        assert queried == ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
     @patch("loaders.funding_rate.ccxt.binance")
     def test_symbol_resolution(self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance):

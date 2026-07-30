@@ -179,6 +179,18 @@ class LoaderConfig:
     # Backfill window: how many days of history to pull on first run
     initial_backfill_days: int = 1825  # ~5 years
 
+    # Maximum symbols a single loader run will fetch. Sits above
+    # UNIVERSE_CONFIG.target_size on purpose: the universe builder ranks by
+    # liquidity and cuts at target_size, so it needs more candidates than it
+    # keeps, and the audit's coverage check compares loaded assets against
+    # universe members.
+    max_symbols_per_run: int = 200
+
+    # ccxt market type for perpetual-only datasets (funding rate, open
+    # interest). Spot markets have neither, so these loaders must not run
+    # against the ccxt default ("spot").
+    perp_market_type: str = "future"
+
 
 @dataclass
 class AuditConfig:
