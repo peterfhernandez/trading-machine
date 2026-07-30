@@ -428,3 +428,111 @@ The engine already accepts named signal functions and produces a per-signal
 rank IC series, which is exactly the input Phase 5 needs for IC estimation and
 shrinkage (`alpha = vol × IC × z`). Phase 5 adds the signal interface/registry
 and the first five signals; no engine changes are expected.
+
+---
+
+## Phase 5 Implementation Notes (Signals → alphas)
+
+### The signal contract
+
+A signal is `RebalanceContext -> {asset_id: score | None}`. Higher = more
+attractive long, and `None` means **no view**, never `0.0` — a score of zero
+asserts the asset is exactly average, which is a real position, so an asset the
+signal cannot evaluate has to be absent from the cross-section instead. The
+engine and `long_short_from_scores` already skip `None`, so this costs nothing
+downstream and prevents a whole class of quiet bias.
+
+No engine changes were needed, as Phase 4 predicted.
+
+### Registration enforces the methodology doc
+
+`signals.register` raises if `signals/methodology/<signal_id>.md` does not exist.
+The project rule was already "the doc is the spec"; this makes it mechanical, so a
+signal cannot be wired into a backtest or the pipeline before its spec exists. The
+doc's `Deviations from this doc` and `Review log` sections are where design
+changes are recorded, and they are expected to be filled in — a doc that never
+changes while the code does is a stale doc.
+
+### Signals do not import the backtester
+
+Signals are consumed *by* the backtester, so nothing in `signals/` imports
+`backtest/`. `score_universe` duck-types its `ctx`, and `signals/panel.py`
+restates the two `pit_mode` strings rather than importing them, with a test
+asserting they stay identical to the engine's. That keeps the dependency arrow
+pointing one way for Phase 9, when the pipeline imports both.
+
+### Shared cross-sectional transforms
+
+`signals/transforms.py` owns winsorize + z-score for every signal, in that fixed
+order: clipping before computing the mean and standard deviation stops one
+blown-up score from dragging the location and scale of the whole cross-section.
+`None` is preserved through both and excluded from the statistics.
+
+### Two read paths, one of them cached
+
+Production reads closes through `RebalanceContext`, which reopens every date
+partition of `ohlcv_daily` per rebalance. A parameter grid walks the same window
+hundreds of times, and that read is essentially all of its run time, so
+`signals/panel.py` provides `CachedClosePanel`: one store read, then the same
+per-`asof` filtering (`event_ts <= asof`, `ingested_ts < asof_date + 1 day` under
+strict mode, latest ingestion per bar, gap-free tail) applied in memory.
+
+The filtering is per-`asof`, so the cache cannot leak a later bar into an earlier
+decision — but the guarantee rests on a test, not on the argument: the suite
+asserts the cached path and the context path produce identical scores in both pit
+modes, including with late-ingested bars. That test is what makes the cache an
+optimization rather than a second implementation. `with_params` rebinds
+parameters over the same loaded bars so a sweep reads the store once in total.
+
+### markov_mean_reversion: three decisions worth recording
+
+The signal was drafted before the real context API existed, and three things
+changed on contact with it. All three are in the methodology doc; the summary is:
+
+1. **`return_horizon_days` split from `state_window_days`.** One parameter for
+   both meant standardizing a 20-day return against 20 observations of itself,
+   consecutive ones sharing 19 of 20 days — not enough independent information to
+   estimate a mean, a variance and `k-1` quantile cutoffs. A signal built on that
+   would be a strong candidate for working at exactly one setting.
+2. **State midpoints moved onto the transition matrix's window.** They were
+   estimated over the full trailing history while transitions were counted over
+   the lookback, so the probabilities and the values they weighted described two
+   different periods.
+3. **The estimation window is fixed** at `min_history_bars` (244 bars at the
+   defaults). A score is therefore independent of how long an asset has been
+   listed, and every asset's estimate spans an identically sized window.
+
+Guards the draft did not have: a gap in the recent bars scores `None` (state
+classification silently assumes evenly spaced bars, so a hole turns a 5-day return
+into something else), and duplicate ingestions of the same bar are collapsed to
+the latest, matching what the engine's price panel does.
+
+`np.nanquantile` was replaced with an equivalent sort-based rolling quantile
+(`_row_quantiles`); it is ~17x faster on the whole score and dominated sweep run
+time, and a test asserts it matches numpy over random cases — the golden cutoffs
+depend on that interpolation being identical.
+
+### Walk-forward parameter grid
+
+`scratch/scratch_markov_param_grid.py` is the tool that fills in Sections 4-5 of a
+methodology doc. It selects parameters on prior folds only, evaluates on the next
+fold, stitches the fold results into one out-of-sample series, and reports the gap
+against the best full-sample cell — the overfitting tax — plus each parameter's
+marginal effect and performance at 2x costs. It prints what it is *not*: full
+sample numbers are labelled as not-evidence, and synthetic-mode results carry a
+reminder that reversion was baked in by construction.
+
+### Testing Coverage (Phase 5)
+
+- `tests/test_signal_markov_mean_reversion.py`: 68 tests — a golden 10-bar
+  fixture with every return, z-score, quantile cutoff, state, transition row,
+  midpoint and the final score derived by hand in the test docstring;
+  point-in-time tests against a real store in both pit modes (including that a
+  later bar cannot change an earlier state, matrix, or score); every reject path
+  returning `None` rather than `0.0`; the transforms; the registry's doc rule;
+  cached-vs-context equivalence; and end-to-end runs through the engine
+
+Most tests run in well under 100ms. A handful of store-backed ones take 100-200ms
+because a signal needs at least ten bars of history and each date partition is a
+separate parquet file; the one that runs two full backtests to compare read paths
+is marked `integration`.

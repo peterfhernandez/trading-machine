@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 4 (Backtester) — Complete**
+**Status: Phase 5 (Signals → alphas) — In progress**
 
 ## Quick Start
 
@@ -83,14 +83,22 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - [x] Daily universe membership written point-in-time to the store
 - [x] Sanity scratch: universe size and turnover over history
 
-### Current Phase: Phase 4 (Backtester)
+### Completed: Phase 4 (Backtester)
 
 - [x] Walk-forward engine: rebalance calendar, point-in-time data exposure, next-bar execution
 - [x] Cost model: half-spread + linear impact stub, charged on traded notional
 - [x] Metrics: returns, vol, IR, drawdown, turnover, per-signal rank IC series
 - [x] Golden tests: hand-computed 3-asset fixture reproduced exactly
 - [x] Validated: buy-and-hold BTC through the engine matches the raw price series
-- [ ] Ready for Phase 5 (Signals → alphas)
+
+### Current Phase: Phase 5 (Signals → alphas)
+
+- [x] Signal interface + registry (registration requires a methodology doc)
+- [x] Cross-sectional transforms: winsorize then z-score, `None` preserved
+- [x] `markov_mean_reversion` signal + walk-forward parameter grid script
+- [ ] Backtest evidence for `markov_mean_reversion` against a real backfill
+- [ ] Momentum, carry, short-term reversal, low-volatility signals
+- [ ] Alpha refinement (IC estimation + shrinkage) and the breadth report
 
 ## Testing
 
@@ -121,7 +129,7 @@ ruff check .
 ruff format .
 
 # Type checking (mypy)
-mypy datastore/ loaders/ audit/ universe/
+mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 ```
 
 ## Development
@@ -273,16 +281,86 @@ Engine semantics (fully documented in `backtest/engine.py`):
 PAPER=true python scratch/scratch_backtest.py   # demo: buy & hold, equal weight, L/S momentum
 ```
 
-### Methodology & Signals
+### Signals
 
-Every signal gets a `METHODOLOGY.md` documenting:
+A signal is a function `RebalanceContext -> {asset_id: score | None}`, where a
+higher score means "more attractive long" and `None` means **no view** — never
+`0.0`, which would assert the asset is exactly average.
 
-- Hypothesis
-- Construction rules
-- Parameters
-- Known failure modes
+```python
+from backtest import Backtester, long_short_from_scores
+from signals import markov_mean_reversion as mmr
+from signals import signal_functions
 
-The doc is the spec; code follows the doc.
+signal = mmr.make_signal()                    # ctx -> standardized scores
+result = Backtester(store).run(
+    long_short_from_scores(signal, n_per_side=5),
+    signals=signal_functions(),               # every registered signal's IC series
+)
+print(result.ic_summary())
+```
+
+Per-asset internals are inspectable, which is what the golden tests assert
+against:
+
+```python
+diag = mmr.diagnose_series(closes)            # numpy in, no I/O
+diag.states, diag.matrix, diag.midpoints      # the construction, step by step
+diag.score, diag.reject_reason                # None + why, when unscorable
+```
+
+Shared pieces: `signals/transforms.py` (winsorize then z-score a cross-section,
+preserving `None`) and `signals/panel.py` (`CachedClosePanel` — a point-in-time
+close panel that reads the store once, for parameter sweeps).
+
+**Registered signals**
+
+| Signal | Family | Status |
+| --- | --- | --- |
+| `markov_mean_reversion` | reversal | implemented; backtest evidence pending |
+
+`markov_mean_reversion` discretizes each asset's standardized rolling return into
+`n_states` quantile states, estimates a rolling transition matrix, and scores the
+gap between the current state and the probability-weighted expected next state.
+It needs 244 bars per score at the default parameters and returns `None` for any
+asset with less, with a gap in its recent bars, or with too few observed
+transitions out of its current state.
+
+**Every signal gets a methodology doc** in `signals/methodology/` (hypothesis,
+data inputs and their point-in-time contract, construction, parameters, backtest
+evidence, breadth check, failure modes) — copy `TEMPLATE.md`. The doc is the spec
+and comes first: `signals.register` raises if a signal's doc does not exist.
+
+```bash
+PAPER=true python scratch/scratch_signal_markov_mean_reversion.py   # demo
+```
+
+### Parameter sweeps
+
+`scratch/scratch_markov_param_grid.py` walks a parameter grid forward through the
+sample: for each fold it selects parameters using only the folds before it, then
+evaluates on the fold itself, and stitches the fold results into one
+out-of-sample series. It reports the gap against the best full-sample cell (the
+overfitting tax), the marginal effect of each parameter (a signal that works at
+exactly one setting is an overfit), and performance at 2x assumed costs.
+
+```bash
+# Runs against generated data if you have no backfill yet
+PAPER=true python scratch/scratch_markov_param_grid.py --synthetic
+
+# Against the store: quick grid (9 cells), weekly rebalance, 4 folds
+PAPER=true python scratch/scratch_markov_param_grid.py --grid quick --folds 4
+
+# Full grid (243 cells) on backfilled history — see the pit_mode note below
+PAPER=true python scratch/scratch_markov_param_grid.py \
+    --grid full --pit-mode event --out scratch/output/markov_grid.csv
+```
+
+A backfill stamps every row with one `ingested_ts`, so strict
+`--pit-mode ingestion` sees nothing until that date and every book comes back
+empty. The script's preflight detects this and says so. Event-mode numbers are
+research indications, not live-fidelity results, and the methodology doc requires
+them to be labelled that way.
 
 ## Important Principles
 
@@ -307,4 +385,4 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: Phase 5 — Signals → alphas
+**Next Phase**: finish Phase 5 — the remaining signals, then alpha refinement
