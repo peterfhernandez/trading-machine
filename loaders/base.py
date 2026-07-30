@@ -7,11 +7,57 @@ from typing import Optional
 
 import polars as pl
 
-from config import DATASTORE_PATH
+from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster, DatasetSchema
 
 
 logger = logging.getLogger(__name__)
+
+# Perpetual swaps are quoted with a settle suffix in ccxt's unified notation
+# ("BTC/USDT:USDT"); dated futures carry an expiry after it
+# ("BTC/USDT:USDT-260327") and are deliberately excluded.
+_PERP_SUFFIX = ":USDT"
+
+
+def select_usdt_symbols(
+    symbols: Optional[list[str]],
+    max_symbols: Optional[int] = None,
+    prefer_perps: bool = False,
+) -> list[str]:
+    """Pick up to `max_symbols` USDT-quoted symbols from a venue symbol list.
+
+    The USDT filter must be applied *before* the cap. A venue's symbol list
+    interleaves every quote currency in alphabetical order, so slicing first
+    (`symbols[:50]`) and filtering after yields only the handful of USDT pairs
+    that happen to sort early — the reason the funding-rate and open-interest
+    loaders covered ~15 assets out of a 50-symbol budget.
+
+    Args:
+        symbols: Venue symbol list (typically `exchange.symbols`)
+        max_symbols: Cap on returned symbols (default: LOADER_CONFIG.max_symbols_per_run)
+        prefer_perps: If True, return perpetual symbols only ("BTC/USDT:USDT"),
+            falling back to plain USDT-quoted symbols when the venue exposes no
+            perps (e.g. a spot-only venue)
+
+    Returns:
+        Sorted list of symbols, capped at `max_symbols`
+    """
+    if max_symbols is None:
+        max_symbols = LOADER_CONFIG.max_symbols_per_run
+
+    if not symbols:
+        return []
+
+    perps = [s for s in symbols if s.endswith(_PERP_SUFFIX)]
+    if prefer_perps and perps:
+        selected = perps
+    else:
+        selected = [s for s in symbols if s.endswith("USDT")]
+
+    selected = sorted(set(selected))
+    if max_symbols is not None and max_symbols > 0:
+        selected = selected[:max_symbols]
+    return selected
 
 
 class BaseLoader(ABC):

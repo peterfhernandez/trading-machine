@@ -27,8 +27,24 @@ class AuditResult:
 class DataAudit:
     """Audit data quality in the datastore."""
 
-    def __init__(self, store: Optional[ParquetStore] = None):
+    def __init__(
+        self,
+        store: Optional[ParquetStore] = None,
+        venue: str = "binance",
+        universe_size: Optional[int] = None,
+    ):
+        """
+        Args:
+            store: Datastore to audit (default: the configured store)
+            venue: Venue whose universe snapshots define the coverage denominator
+            universe_size: Explicit universe size for the coverage check,
+                overriding the point-in-time universe snapshot. Use only when
+                there is a known expected asset count; leaving it None keeps
+                the check honest about not having a reference.
+        """
         self.store = store or ParquetStore(DATASTORE_PATH)
+        self.venue = venue
+        self.universe_size_override = universe_size
         self.results: list[AuditResult] = []
 
     def audit_dataset(self, dataset: str, date: Optional[datetime] = None) -> list[AuditResult]:
@@ -70,7 +86,8 @@ class DataAudit:
                 ))
                 return self.results
 
-            self._check_coverage(df)
+            members, universe_size, universe_source = self.resolve_universe(date)
+            self._check_coverage(df, members, universe_size, universe_source)
             self._check_null_rates(df)
             self._check_freshness(df, date, AUDIT_CONFIG.freshness_threshold_for(dataset))
             if "close" in df.columns:
@@ -87,13 +104,110 @@ class DataAudit:
 
         return self.results
 
-    def _check_coverage(self, df: pl.DataFrame) -> None:
-        """Check coverage: % of assets with data."""
+    def resolve_universe_size(self, date: datetime) -> tuple[Optional[int], str]:
+        """Coverage denominator as of `date`, and where it came from.
+
+        Convenience wrapper over `resolve_universe` for callers that only need
+        the size.
+        """
+        _, size, source = self.resolve_universe(date)
+        return size, source
+
+    def resolve_universe(
+        self, date: datetime
+    ) -> tuple[Optional[set[str]], Optional[int], str]:
+        """Universe membership as of `date`: (members, size, source).
+
+        The coverage check needs a denominator — "% of *what*". The only
+        defensible answer is the point-in-time universe: the latest `universe`
+        snapshot with `event_ts <= date`, read through `ingested_ts <= date`, so
+        the audit measures itself against the membership that was actually
+        known on the audit date.
+
+        Returns (None, None, reason) when no such snapshot exists. A fabricated
+        denominator — e.g. a hardcoded target size — makes the check either
+        vacuous or permanently red depending on how many assets the loaders
+        happen to cover, so the check reports itself unevaluated instead.
+        `members` is None when only a size is known (an explicit override).
+        """
+        if self.universe_size_override is not None:
+            return None, self.universe_size_override, "explicit universe_size"
+
+        try:
+            df = self.store.read(
+                "universe",
+                asof=date.date().isoformat(),
+                columns=["asset_id", "venue", "event_ts", "ingested_ts", "in_universe"],
+            )
+        except FileNotFoundError:
+            return None, None, "no universe dataset in the store"
+        except Exception as e:
+            # A malformed/legacy universe partition must not turn into an audit
+            # execution failure for an unrelated dataset.
+            logger.warning(f"Could not read universe snapshots: {e}")
+            return None, None, f"universe dataset unreadable ({e})"
+
+        if len(df) == 0:
+            # Either nothing was ever written, or every snapshot was ingested
+            # after the audit date and so was not knowable then.
+            return None, None, f"no universe snapshot ingested on or before {date.date()}"
+
+        if "venue" in df.columns:
+            df = df.filter(pl.col("venue") == self.venue)
+        df = df.filter(pl.col("event_ts") <= date)
+
+        if len(df) == 0:
+            return (
+                None,
+                None,
+                f"no universe snapshot for {self.venue} at or before {date.date()}",
+            )
+
+        latest = df["event_ts"].max()
+        member_rows = df.filter((pl.col("event_ts") == latest) & pl.col("in_universe"))
+        members = set(member_rows["asset_id"].to_list())
+
+        if not members:
+            return None, None, f"universe snapshot {latest.date()} has no members"
+
+        return members, len(members), f"universe snapshot {latest.date()}"
+
+    def _check_coverage(
+        self,
+        df: pl.DataFrame,
+        members: Optional[set[str]],
+        universe_size: Optional[int],
+        universe_source: str,
+    ) -> None:
+        """Check coverage: how much of the point-in-time universe has data.
+
+        Counts *universe members* present in the dataset, not distinct asset_ids:
+        a dataset full of assets that are not in the universe covers none of it.
+        """
         if "asset_id" not in df.columns:
             return
 
-        asset_count = df["asset_id"].n_unique()
-        threshold = int(150 * AUDIT_CONFIG.coverage_threshold_pct / 100.0)
+        observed = set(df["asset_id"].drop_nulls().to_list())
+        asset_count = len(observed & members) if members is not None else len(observed)
+
+        if universe_size is None:
+            # Not a pass in the "data looks good" sense — a pass in the "this
+            # check has no reference to judge against" sense. Surfaced as a
+            # warning so it shows up in logs and alerts without halting
+            # trading on a number we made up.
+            self.results.append(AuditResult(
+                check_name="coverage",
+                passed=True,
+                message=(
+                    f"Coverage: {asset_count} assets; not evaluated "
+                    f"({universe_source})"
+                ),
+                severity="warning",
+            ))
+            return
+
+        threshold = max(1, int(universe_size * AUDIT_CONFIG.coverage_threshold_pct / 100.0))
+        pct = 100.0 * asset_count / universe_size
 
         passed = asset_count >= threshold
         severity = "error" if not passed else "info"
@@ -101,7 +215,10 @@ class DataAudit:
         self.results.append(AuditResult(
             check_name="coverage",
             passed=passed,
-            message=f"Coverage: {asset_count} assets (threshold: {threshold})",
+            message=(
+                f"Coverage: {asset_count}/{universe_size} universe assets "
+                f"({pct:.1f}%) (threshold: {threshold}, from {universe_source})"
+            ),
             severity=severity,
         ))
 

@@ -116,8 +116,94 @@ class TestNightlyPipeline:
         pipeline = NightlyPipeline("binance", dry_run=True)
         pipeline._report_stage()
 
+    @patch("pipeline.nightly.BackfillRunner")
+    @patch("pipeline.nightly.DataAudit")
+    def test_audit_is_given_the_pipeline_venue(
+        self, mock_audit_class, mock_backfill_class
+    ):
+        """The coverage check resolves its denominator from the venue's universe
+        snapshots, so the audit must know which venue is running."""
+        mock_backfill_class.return_value = MagicMock()
+
+        mock_audit = MagicMock()
+        mock_audit.audit_dataset.return_value = []
+        mock_audit.should_halt_trading.return_value = False
+        mock_audit_class.return_value = mock_audit
+
+        pipeline = NightlyPipeline("binance", dry_run=False)
+        pipeline._audit_stage()
+
+        for call in mock_audit_class.call_args_list:
+            assert call.kwargs["venue"] == "binance"
+
     def test_pipeline_with_dry_run_disabled_trading_halt(self):
         """Test that trading halt is not allowed on dry-run."""
         pipeline = NightlyPipeline("binance", dry_run=True)
         pipeline._audit_stage()
         assert not pipeline.trading_halted
+
+
+def _mock_exchange(symbols: list[str]) -> MagicMock:
+    """A ccxt-like exchange exposing `symbols` and a real markets dict."""
+    exchange = MagicMock()
+    exchange.symbols = symbols
+    exchange.markets = {s: {"base": s.split("/")[0], "quote": "USDT"} for s in symbols}
+    exchange.load_markets = MagicMock()
+    return exchange
+
+
+class TestAssetMasterPopulation:
+    """The asset master must cover every symbol namespace the loaders use."""
+
+    @patch("ccxt.binance")
+    def test_populates_both_spot_and_perp_symbols(self, mock_binance_class, tmp_path):
+        """OHLCV runs against spot symbols ("BTC/USDT") while funding/OI run
+        against perps ("BTC/USDT:USDT"). resolve_symbol matches literal strings,
+        so both forms must be mapped or the perp loaders resolve everything to
+        None and write nothing."""
+        spot = _mock_exchange(["BTC/USDT", "ETH/USDT", "ETH/BTC"])
+        perp = _mock_exchange(["BTC/USDT:USDT", "ETH/USDT:USDT"])
+        mock_binance_class.side_effect = [spot, perp]
+
+        with patch("pipeline.nightly.DATASTORE_PATH", tmp_path):
+            pipeline = NightlyPipeline("binance", dry_run=False)
+            am = pipeline._populate_asset_master("binance")
+
+        assert am.resolve_symbol("BTC/USDT", "binance") == "BTC"
+        assert am.resolve_symbol("ETH/USDT", "binance") == "ETH"
+        assert am.resolve_symbol("BTC/USDT:USDT", "binance") == "BTC"
+        assert am.resolve_symbol("ETH/USDT:USDT", "binance") == "ETH"
+        # Non-USDT pairs are not mapped
+        assert am.resolve_symbol("ETH/BTC", "binance") is None
+
+    @patch("ccxt.binance")
+    def test_existing_mappings_are_not_duplicated(self, mock_binance_class, tmp_path):
+        """add_mapping appends unconditionally, so a nightly re-run must skip
+        symbols that are already mapped rather than growing the master."""
+        spot = _mock_exchange(["BTC/USDT"])
+        perp = _mock_exchange(["BTC/USDT:USDT"])
+        mock_binance_class.side_effect = [spot, perp, _mock_exchange(["BTC/USDT"]),
+                                          _mock_exchange(["BTC/USDT:USDT"])]
+
+        with patch("pipeline.nightly.DATASTORE_PATH", tmp_path):
+            pipeline = NightlyPipeline("binance", dry_run=False)
+            pipeline._populate_asset_master("binance")
+            am = pipeline._populate_asset_master("binance")
+
+        mappings = pl.read_parquet(tmp_path / "asset_master.parquet")
+        assert len(mappings) == 2
+        assert am.resolve_symbol("BTC/USDT:USDT", "binance") == "BTC"
+
+    @patch("ccxt.binance")
+    def test_perp_market_load_failure_does_not_lose_spot_symbols(
+        self, mock_binance_class, tmp_path
+    ):
+        """A venue with no derivatives markets still gets its spot mappings."""
+        spot = _mock_exchange(["BTC/USDT"])
+        mock_binance_class.side_effect = [spot, RuntimeError("no futures API")]
+
+        with patch("pipeline.nightly.DATASTORE_PATH", tmp_path):
+            pipeline = NightlyPipeline("binance", dry_run=False)
+            am = pipeline._populate_asset_master("binance")
+
+        assert am.resolve_symbol("BTC/USDT", "binance") == "BTC"

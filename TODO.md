@@ -157,3 +157,24 @@ Legend: [ ] todo · [~] in progress · [x] done
   cost sensitivity. Backtest evidence not yet collected: the grid has been run
   only on synthetic data as a smoke test, and Section 5 of the methodology doc
   is deliberately still empty.
+- 2026-07-30: Fixed three nightly-pipeline faults that surfaced as
+  "TRADING HALTED: critical audit failure" on `funding_rate`/`open_interest`
+  with only 15 assets covered. (1) The audit's coverage check divided by a
+  hardcoded 150 regardless of dataset or actual universe; the denominator is now
+  the latest point-in-time `universe` snapshot (`event_ts <= asof`,
+  `ingested_ts <= asof`), with the check reporting itself *not evaluated* (a
+  warning, not a halt) when no snapshot exists, and `universe_size=` available
+  as an explicit override. (2) The funding-rate and open-interest loaders sliced
+  `exchange.symbols[:50]` *before* filtering to USDT pairs, so an alphabetically
+  interleaved symbol list yielded ~15 of a 50-symbol budget; symbol selection
+  moved to `loaders.base.select_usdt_symbols` (filter, then cap at
+  `LOADER_CONFIG.max_symbols_per_run = 200`), shared by all three loaders.
+  (3) Those two loaders ran against ccxt's default spot markets, which have
+  neither funding nor open interest, and swallowed the resulting per-symbol
+  errors; they now open the venue with
+  `defaultType=LOADER_CONFIG.perp_market_type` and prefer perpetual symbols.
+  The nightly pipeline registers both spot and perp symbol namespaces in the
+  asset master (skipping already-mapped symbols instead of appending duplicates
+  every run) and logs warning-severity checks so an unevaluated check is never
+  silent. 263 tests passing; `scratch/scratch_perp_symbols.py` demos symbol
+  selection and market types against a live venue.

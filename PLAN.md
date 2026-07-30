@@ -237,6 +237,27 @@ All three loaders (OHLCV, funding rate, open interest) inherit from
 This eliminates code duplication and enforces the point-in-time pattern
 consistently across all three loaders.
 
+### Market Types & Symbol Budget
+
+Two venue-facing details the loaders got wrong at first, both of which surfaced
+as audit coverage failures rather than as errors:
+
+- **Market type.** ccxt defaults to spot markets, which have no funding rate and
+  no open interest — those loaders raised per symbol and wrote nothing. Both perp
+  loaders now open the venue with
+  `defaultType=LOADER_CONFIG.perp_market_type` and select perpetual symbols
+  (`BTC/USDT:USDT`; dated futures excluded). OHLCV stays on spot.
+  Because the perp and spot namespaces use different symbol strings for the same
+  asset, the nightly pipeline registers **both** in the asset master; canonical
+  `asset_id` is the base asset either way, so datasets still join.
+- **Filter before capping.** A venue's symbol list interleaves every quote
+  currency alphabetically, so `exchange.symbols[:N]` followed by a USDT filter
+  keeps only the USDT pairs that happen to sort early. `loaders.base.
+  select_usdt_symbols` filters first, then caps at
+  `LOADER_CONFIG.max_symbols_per_run` (200 — deliberately above
+  `UNIVERSE_CONFIG.target_size` so the universe builder has more candidates than
+  it keeps).
+
 ### Backfill Runner & Checkpoint Tracking
 
 The `BackfillRunner` orchestrates all three loaders in sequence (OHLCV →
@@ -255,7 +276,11 @@ The `DataAudit` class runs five checks on each dataset:
 
 1. **data_presence:** Fails if no data exists anywhere in the lookback window
    (`AUDIT_CONFIG.audit_lookback_days`, default 7 days back from the audit date)
-2. **coverage:** % of assets present (threshold: 80% of universe)
+2. **coverage:** assets present vs. the point-in-time universe
+   (`AUDIT_CONFIG.coverage_threshold_pct`, default 90%). The denominator is the
+   latest `universe` snapshot with `event_ts <= asof`, read through
+   `ingested_ts <= asof`; with no snapshot the check reports itself *not
+   evaluated* rather than judging against a fabricated size
 3. **null_rate_*:** Per-column null % (threshold: 1%)
 4. **freshness:** Data age check against a per-dataset threshold
    (`AUDIT_CONFIG.freshness_threshold_hours_by_dataset`, falling back to

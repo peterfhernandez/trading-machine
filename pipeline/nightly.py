@@ -5,7 +5,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
-from config import DATASTORE_PATH
+from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
 from audit.auditor import DataAudit
@@ -51,46 +51,76 @@ class NightlyPipeline:
             logger.error(f"Pipeline failed: {e}", exc_info=True)
             return False
 
+    def _venue_markets(self, venue: str) -> dict[str, dict]:
+        """Collect USDT markets across every market type the loaders use.
+
+        The OHLCV loader runs against the venue's default (spot) markets while
+        the funding-rate and open-interest loaders run against derivatives
+        (`LOADER_CONFIG.perp_market_type`). Both symbol namespaces must be in
+        the asset master, or the perp loaders resolve every symbol to None and
+        write nothing.
+        """
+        import ccxt
+
+        exchange_class = getattr(ccxt, venue)
+        markets: dict[str, dict] = {}
+
+        for options in ({}, {"options": {"defaultType": LOADER_CONFIG.perp_market_type}}):
+            try:
+                exchange = exchange_class(options) if options else exchange_class()
+                exchange.load_markets()
+            except Exception as e:
+                logger.warning(f"Could not load {venue} markets with {options or 'defaults'}: {e}")
+                continue
+
+            for symbol in exchange.symbols or []:
+                if "/USDT" not in symbol:
+                    continue
+                # Map every exact symbol string to its base asset. Loaders
+                # iterate exchange.symbols directly and may see spot
+                # ("BTC/USDT"), perpetual ("BTC/USDT:USDT"), or quarterly
+                # ("BTC/USDT:USDT-260327") notation; resolve_symbol() matches on
+                # the literal string, so the mapping must preserve whatever
+                # exact form each market uses rather than reconstructing a
+                # synthetic "{asset}/USDT" symbol.
+                markets.setdefault(symbol, exchange.markets.get(symbol) or {})
+
+        return markets
+
     def _populate_asset_master(self, venue: str) -> AssetMaster:
-        """Populate asset master with venue symbols."""
+        """Populate asset master with venue symbols (spot + perp namespaces)."""
         asset_master_path = DATASTORE_PATH / "asset_master.parquet"
         am = AssetMaster(asset_master_path)
 
         try:
-            import ccxt
-            exchange_class = getattr(ccxt, venue)
-            exchange = exchange_class()
-            exchange.load_markets()
-            symbols = exchange.symbols
+            markets = self._venue_markets(venue)
 
-            if not symbols:
-                logger.warning(f"No symbols returned from {venue}")
-                return am
-
-            # Map every exact USDT-quoted symbol string to its base asset. Loaders
-            # iterate exchange.symbols directly and may see spot ("BTC/USDT"),
-            # perpetual ("BTC/USDT:USDT"), or quarterly ("BTC/USDT:USDT-260327")
-            # notation; resolve_symbol() matches on the literal string, so the
-            # mapping must preserve whatever exact form each market uses rather
-            # than reconstructing a synthetic "{asset}/USDT" symbol.
-            usdt_symbols = [s for s in symbols if "/USDT" in s]
-
-            if not usdt_symbols:
-                logger.warning(f"No USDT pairs found in {venue}")
+            if not markets:
+                logger.warning(f"No USDT symbols returned from {venue}")
                 return am
 
             base_date = datetime.now(timezone.utc).replace(tzinfo=None)
-            count = 0
-            for symbol in usdt_symbols:
-                market = exchange.markets.get(symbol, {})
+            added = 0
+            skipped = 0
+            for symbol, market in sorted(markets.items()):
+                # add_mapping appends unconditionally, so re-adding a symbol on
+                # every nightly run would grow the master without bound and make
+                # resolve_symbol ambiguous.
+                if am.resolve_symbol(symbol, venue, asof=base_date) is not None:
+                    skipped += 1
+                    continue
+
                 base = market.get("base") or symbol.split("/")[0]
                 try:
                     am.add_mapping(base, venue, symbol, base_date)
-                    count += 1
+                    added += 1
                 except Exception as e:
                     logger.warning(f"Failed to add mapping for {symbol}: {e}")
 
-            logger.info(f"✓ Populated asset master with {count} {venue} symbols")
+            logger.info(
+                f"✓ Asset master: {added} new {venue} symbols added, "
+                f"{skipped} already mapped ({len(markets)} USDT symbols seen)"
+            )
         except Exception as e:
             logger.warning(f"Failed to auto-populate asset master: {e}", exc_info=True)
 
@@ -129,7 +159,7 @@ class NightlyPipeline:
                 continue
 
             try:
-                audit = DataAudit(self.store)
+                audit = DataAudit(self.store, venue=self.venue)
                 results = audit.audit_dataset(dataset, today)
 
                 passed = all(r.passed for r in results)
@@ -138,10 +168,12 @@ class NightlyPipeline:
                 status = "✓ PASS" if passed else "✗ FAIL"
                 logger.info(f"{status} | {dataset}")
 
-                if not passed:
-                    for r in results:
-                        if not r.passed:
-                            logger.warning(f"    └─ {r.check_name}: {r.message}")
+                # Log failures and any check that passed only with a warning
+                # (e.g. coverage with no universe snapshot to measure against),
+                # so a check that could not be evaluated is never silent.
+                for r in results:
+                    if not r.passed or r.severity == "warning":
+                        logger.warning(f"    └─ {r.check_name}: {r.message}")
 
                 audit.send_alerts()
 

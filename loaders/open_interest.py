@@ -7,9 +7,9 @@ from typing import Optional
 import ccxt
 import polars as pl
 
-from config import DATASTORE_PATH
+from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
-from loaders.base import BaseLoader
+from loaders.base import BaseLoader, select_usdt_symbols
 from loaders.schemas import OPEN_INTEREST_SCHEMA
 
 
@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class OpenInterestLoader(BaseLoader):
-    """Load open interest data from ccxt exchanges."""
+    """Load open interest data from ccxt exchanges.
+
+    Open interest only exists for derivatives, so the exchange is opened
+    against the venue's derivatives markets (`LOADER_CONFIG.perp_market_type`)
+    rather than ccxt's default spot markets.
+    """
 
     def __init__(
         self,
@@ -25,17 +30,32 @@ class OpenInterestLoader(BaseLoader):
         lookback_days: int = 30,
         store: Optional[ParquetStore] = None,
         asset_master: Optional[AssetMaster] = None,
+        max_symbols: Optional[int] = None,
     ):
         super().__init__(venue, store, asset_master)
         self.lookback_days = lookback_days
+        self.max_symbols = (
+            LOADER_CONFIG.max_symbols_per_run if max_symbols is None else max_symbols
+        )
         self.exchange = self._init_exchange(venue)
 
     def _init_exchange(self, venue: str):
-        """Initialize ccxt exchange instance."""
+        """Initialize ccxt exchange instance against the perp market type."""
         exchange_class = getattr(ccxt, venue.lower())
-        exchange = exchange_class()
+        market_type = LOADER_CONFIG.perp_market_type
+        try:
+            exchange = exchange_class({"options": {"defaultType": market_type}})
+        except Exception as e:
+            logger.warning(
+                f"{venue} rejected defaultType={market_type} ({e}); "
+                f"falling back to venue default markets"
+            )
+            exchange = exchange_class()
         exchange.load_markets()
-        logger.info(f"Initialized {venue} exchange; {len(exchange.symbols)} symbols loaded")
+        logger.info(
+            f"Initialized {venue} exchange (market type: {market_type}); "
+            f"{len(exchange.symbols)} symbols loaded"
+        )
         return exchange
 
     def fetch(self) -> pl.DataFrame:
@@ -49,10 +69,12 @@ class OpenInterestLoader(BaseLoader):
 
         rows = []
 
-        for symbol in self.exchange.symbols[:50]:
-            if not symbol.endswith(':USDT') and not symbol.endswith('USDT'):
-                continue
+        symbols = select_usdt_symbols(
+            self.exchange.symbols, max_symbols=self.max_symbols, prefer_perps=True
+        )
+        logger.info(f"Selected {len(symbols)} USDT symbols (cap: {self.max_symbols})")
 
+        for symbol in symbols:
             try:
                 if hasattr(self.exchange, 'fetch_open_interest'):
                     oi_data = self.exchange.fetch_open_interest(symbol)
