@@ -12,10 +12,10 @@ defaults:
 jobs:
   run-on-merge:
     if: github.event.pull_request.merged == true   # ensures it's a merge
-    runs-on: self-hosted   # your laptop runner
+    runs-on: trading-machine   # your laptop runner
     steps:
       - name: Fix git safe directory
-        run: git config --global --add safe.directory C:/Users/Peter/coderepo/trading-machine
+        run: git config --global --add safe.directory C:\Users\Peter\coderepo\trading-machine
 
       - name: Pull latest
         run: |
