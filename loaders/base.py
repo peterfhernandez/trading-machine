@@ -2,13 +2,15 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import polars as pl
 
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster, DatasetSchema
+from loaders.window import FetchWindow
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,94 @@ def select_usdt_symbols(
     if max_symbols is not None and max_symbols > 0:
         selected = selected[:max_symbols]
     return selected
+
+
+def venue_supports(exchange: Any, capability: str) -> bool:
+    """Whether a ccxt exchange advertises `capability` (e.g. "fetchOHLCV").
+
+    Deliberately conservative: anything that is not a real capability mapping
+    (a test double, an exchange that predates the flag) reads as unsupported,
+    so callers fall back to the endpoint that is known to work rather than
+    calling a method that may not exist.
+    """
+    has = getattr(exchange, "has", None)
+    if not isinstance(has, Mapping):
+        return False
+    return bool(has.get(capability))
+
+
+def paginate_time_series(
+    fetch_page: Callable[[int], Optional[Sequence[Any]]],
+    window: FetchWindow,
+    timestamp_of: Callable[[Any], Optional[int]],
+    max_pages: Optional[int] = None,
+) -> list[Any]:
+    """Walk `fetch_page(since_ms)` forward until `window` is covered.
+
+    Venues cap a single response (ccxt's `limit`, 1000 bars on Binance), so a
+    window longer than one page silently truncates unless the caller pages
+    through it: a five-year daily backfill asked for in one call comes back as
+    the first 1000 days, with the rest missing and nothing to say so.
+
+    Stops when a page is empty, when a page adds nothing new (a venue that
+    keeps returning the same entries would otherwise loop forever), when the
+    window's end is passed, or at `max_pages`.
+
+    Args:
+        fetch_page: Called with a millisecond `since`; returns venue entries
+        window: Event-time interval to cover
+        timestamp_of: Extracts an entry's millisecond timestamp (None to skip it)
+        max_pages: Page budget per call (default: LOADER_CONFIG.max_pages_per_symbol)
+
+    Returns:
+        Entries inside the window, in the order the venue returned them, with
+        each timestamp kept once.
+    """
+    if max_pages is None:
+        max_pages = LOADER_CONFIG.max_pages_per_symbol
+
+    start_ms, end_ms = window.start_ms, window.end_ms
+    cursor = start_ms
+    collected: list[Any] = []
+    seen: set[int] = set()
+
+    for page_num in range(1, max_pages + 1):
+        page = fetch_page(cursor)
+        if not page:
+            break
+
+        newest = cursor
+        added = 0
+        for entry in page:
+            ts = timestamp_of(entry)
+            if ts is None or ts < start_ms or ts > end_ms:
+                continue
+            newest = max(newest, ts)
+            if ts in seen:
+                continue
+            seen.add(ts)
+            collected.append(entry)
+            added += 1
+
+        # Progress is measured in *new* entries, not in timestamps: a venue
+        # that serves one entry per page still advances, while one that keeps
+        # replaying the same page stops here.
+        if added == 0:
+            break
+
+        cursor = newest + 1
+        if cursor > end_ms:
+            break
+
+        if page_num == max_pages:
+            logger.warning(
+                f"Stopped paginating at the {max_pages}-page budget with "
+                f"{datetime.fromtimestamp(cursor / 1000, timezone.utc).date()} "
+                f"of {window.end.date()} reached; raise "
+                f"LOADER_CONFIG.max_pages_per_symbol to fetch the rest"
+            )
+
+    return collected
 
 
 class BaseLoader(ABC):

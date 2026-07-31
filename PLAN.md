@@ -291,16 +291,44 @@ to JSON files. Checkpoints are venue-specific:
 meant to enable resumable, incremental backfills without re-fetching history
 already in the store.
 
-**Status — not there yet.** The checkpoint is *written* but never *read*: the
-fetch window is `days_back` counted back from now on every run, so a re-run
-re-fetches the whole window and the overlap is stored as duplicate bars (see
-above; readers collapse them). Closing that loop means threading real
-`start`/`end` dates through the loaders rather than a day count, and for funding
-rate and open interest it also means switching to ccxt's `*_history` calls —
-`fetch_funding_rate`/`fetch_open_interest` return only the current snapshot, so
-there is no window for them to honour today. Until then the runner does one
-fetch per dataset per run (it used to do two: `fetch()` to test for emptiness,
-then `run()`, which fetched again — the row count now comes back from the run).
+**The checkpoint is now read back.** Each dataset records the event-time
+*interval* it has covered (`covered_start`/`covered_end`); a run asks for a
+window, `loaders.window.resume_window` trims it to what is missing, and the
+loader is handed that window rather than a day count. Four decisions are worth
+recording:
+
+- **Coverage is an interval, not a high-water mark.** A single "last date"
+  cannot answer "do we already have March 2024?", so a request reaching back
+  before the covered start is fetched in full rather than skipped. Merging a
+  disjoint window would claim the gap between them, so it does not: the later
+  interval wins and the fragmentation is logged.
+- **The overlap is re-fetched on purpose.** Resuming starts
+  `refetch_overlap_days` before the covered end. The trailing bar of a run is
+  usually incomplete (a daily candle fetched at 00:10 UTC covers ten minutes of
+  the current day) and venues revise recent bars, so the last covered day has to
+  be pulled again. Append-only storage plus `latest_per_bar` makes that cost API
+  calls and disk, not correctness — which is why the two changes belong
+  together.
+- **Windows are paged.** A venue caps one response at ~1000 rows, so a window
+  longer than a page truncated silently: a five-year daily request returned the
+  first 1000 days and nothing said the rest was missing.
+  `loaders.base.paginate_time_series` walks the window forward, stopping on an
+  empty page, on a page that adds nothing new (a venue replaying the same page
+  would otherwise loop forever), or at a page budget.
+- **Perp datasets moved to the history endpoints.**
+  `fetch_funding_rate`/`fetch_open_interest` return only the current value, so
+  they could never honour a window; the loaders now prefer
+  `fetch_funding_rate_history`/`fetch_open_interest_history` where the venue
+  advertises them, and fall back to the snapshot otherwise. Under the fallback a
+  historical window returns *nothing* rather than stamping today's value with a
+  past timestamp. Binance's funding history carries the rate alone, so
+  `mark_price`/`index_price` are null on historical rows — recorded in
+  `AUDIT_CONFIG.nullable_columns_by_dataset` so the null-rate check warns
+  instead of halting, while staying strict on `funding_rate` itself.
+
+The runner also does one fetch per dataset per run (it used to do two:
+`fetch()` to test for emptiness, then `run()`, which fetched again — the row
+count now comes back from the run).
 
 ### Audit Module: Six Checks
 
@@ -370,14 +398,21 @@ never overwrite history.
 ### Testing Coverage (Phase 2)
 
 - `tests/test_ohlcv.py`: 11 tests (fetch, append, symbol resolution and budget,
-  rows-appended return, golden fixture)
-- `tests/test_funding_rate.py`: 11 tests (incl. perp market type and fallback)
-- `tests/test_open_interest.py`: 11 tests (incl. perp market type and fallback)
-- `tests/test_backfill.py`: 8 tests (checkpoint save/load, one fetch per dataset)
-- `tests/test_audit.py`: 30 tests (all six checks, coverage denominator
-  resolution, duplicate handling, halt logic)
-- `tests/test_nightly.py`: 12 tests (orchestration, dry-run, trading halt,
-  asset master population across market types)
+  rows-appended return, windowed fetch, golden fixture)
+- `tests/test_funding_rate.py`: 15 tests (incl. perp market type, history
+  endpoint vs. snapshot fallback, null mark/index on historical rows)
+- `tests/test_open_interest.py`: 15 tests (incl. perp market type, history
+  endpoint and its ccxt field names, window bounds)
+- `tests/test_backfill.py`: 16 tests (checkpoint round-trip, one fetch per
+  dataset, resume/extend/older-history/ignore-checkpoint windows)
+- `tests/test_fetch_window.py`: 24 tests (window bounds, coverage merge rules,
+  resume arithmetic incl. the legacy checkpoint format)
+- `tests/test_pagination.py`: 12 tests (multi-page walks, the truncation the
+  single call would have produced, loop guards, capability detection)
+- `tests/test_audit.py`: 33 tests (all six checks, coverage denominator
+  resolution, duplicate handling, expected-null columns, halt logic)
+- `tests/test_nightly.py`: 18 tests (orchestration, dry-run, trading halt,
+  asset master population across market types, --start/--end parsing)
 - `tests/test_symbol_selection.py`: 10 tests (filter-before-cap, perp preference)
 - `tests/test_dedupe.py`: 16 tests (latest-per-bar collapse, duplicate counting,
   universe metrics read through the collapse)

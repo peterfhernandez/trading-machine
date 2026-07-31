@@ -30,6 +30,8 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [x] OHLCV loader (daily + hourly) for top ~150 USDT/USD perps via ccxt
 - [x] Funding-rate loader; open-interest loader
 - [x] Backfill runner (resumable, rate-limit aware) — pull 3–5 years history
+      (windowed `[start, end]` fetching, checkpoint-driven resumption, paged
+      venue responses)
 - [x] Audit module: coverage %, null rates, outlier price jumps vs. second
       venue, freshness checks; Telegram alert on threshold breach
 - [x] Nightly loader+audit job runnable end-to-end from one command
@@ -201,3 +203,27 @@ Legend: [ ] todo · [~] in progress · [x] done
   so the fetch window is still `days_back` from now on every run — real windowed
   fetching needs `start`/`end` threaded through the loaders and, for funding rate
   and open interest, ccxt's `*_history` calls.
+- 2026-07-31: Windowed, resumable fetching — the loaders take a `[start, end]`
+  interval instead of "days back from now", and the checkpoint is finally read
+  back. `loaders/window.py` adds `FetchWindow`, `Coverage` and `resume_window`;
+  each dataset records the interval it has covered, and a re-run fetches only
+  what is missing plus `LOADER_CONFIG.refetch_overlap_days` (1) of deliberate
+  overlap — the trailing bar of a run is usually incomplete and venues revise
+  recent bars, and the duplicates that creates are collapsed on read. Coverage is
+  an interval rather than a high-water mark, so asking for history older than the
+  covered start fetches it in full instead of skipping it, and a disjoint window
+  never claims the gap between the two. `paginate_time_series` walks windows
+  longer than one venue page (1000 rows): a five-year daily request previously
+  came back as the first 1000 days with nothing to say the rest was missing.
+  Funding rate and open interest moved onto ccxt's `*_history` endpoints where
+  the venue advertises them (`fetch_funding_rate`/`fetch_open_interest` return
+  only the current value and could never honour a window); under the snapshot
+  fallback a historical window now returns nothing rather than stamping today's
+  value with a past timestamp. Binance's funding history carries the rate alone,
+  so `mark_price`/`index_price` are null on historical rows —
+  `AUDIT_CONFIG.nullable_columns_by_dataset` records that so the null-rate check
+  warns instead of halting, while staying strict on `funding_rate` itself.
+  `python -m pipeline.nightly` gained `--start`, `--end` and
+  `--ignore-checkpoint`. 353 tests passing;
+  `scratch/scratch_windowed_fetch.py` demos pagination, resumption and the
+  checkpoint end to end.

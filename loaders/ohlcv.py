@@ -9,8 +9,9 @@ import polars as pl
 
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
-from loaders.base import BaseLoader, select_usdt_symbols
+from loaders.base import BaseLoader, paginate_time_series, select_usdt_symbols
 from loaders.schemas import OHLCV_SCHEMA
+from loaders.window import FetchWindow
 
 
 logger = logging.getLogger(__name__)
@@ -42,20 +43,24 @@ class OHLCVLoader(BaseLoader):
         logger.info(f"Initialized {venue} exchange; {len(exchange.symbols)} symbols loaded")
         return exchange
 
-    def fetch(self, timeframe: str = "1d") -> pl.DataFrame:
+    def fetch(
+        self, timeframe: str = "1d", window: Optional[FetchWindow] = None
+    ) -> pl.DataFrame:
         """Fetch OHLCV data for top assets.
 
         Args:
             timeframe: "1d" for daily, "1h" for hourly
+            window: Event-time interval to fetch (default: the last
+                `lookback_days` days, ending now)
 
         Returns:
             DataFrame with columns: asset_id, venue, timeframe, event_ts, ingested_ts,
                                    open, high, low, close, volume
         """
-        logger.info(f"Fetching {timeframe} OHLCV for {self.venue}")
+        window = window or FetchWindow.from_lookback(self.lookback_days)
+        logger.info(f"Fetching {timeframe} OHLCV for {self.venue} over {window}")
 
         rows = []
-        since = int((datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp() * 1000)
 
         usdt_symbols = select_usdt_symbols(
             self.exchange.symbols, max_symbols=self.max_symbols
@@ -64,7 +69,15 @@ class OHLCVLoader(BaseLoader):
 
         for symbol in usdt_symbols:
             try:
-                candles = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                # Paged: one call returns at most LOADER_CONFIG.page_limit bars,
+                # so a multi-year window needs to be walked forward.
+                candles = paginate_time_series(
+                    lambda since, s=symbol: self.exchange.fetch_ohlcv(
+                        s, timeframe, since=since, limit=LOADER_CONFIG.page_limit
+                    ),
+                    window,
+                    timestamp_of=lambda candle: candle[0] if candle else None,
+                )
                 if not candles:
                     logger.debug(f"No data for {symbol}")
                     continue
@@ -127,17 +140,17 @@ class OHLCVLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} rows; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run_daily(self) -> int:
+    def run_daily(self, window: Optional[FetchWindow] = None) -> int:
         """Fetch and append daily OHLCV. Returns the number of rows appended."""
-        df = self.fetch(timeframe="1d")
+        df = self.fetch(timeframe="1d", window=window)
         if len(df) == 0:
             return 0
         self.append("ohlcv_daily", df, OHLCV_SCHEMA)
         return len(df)
 
-    def run_hourly(self) -> int:
+    def run_hourly(self, window: Optional[FetchWindow] = None) -> int:
         """Fetch and append hourly OHLCV. Returns the number of rows appended."""
-        df = self.fetch(timeframe="1h")
+        df = self.fetch(timeframe="1h", window=window)
         if len(df) == 0:
             return 0
         self.append("ohlcv_hourly", df, OHLCV_SCHEMA)

@@ -2,12 +2,13 @@
 
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
+from loaders.window import utc_now
 from audit.auditor import DataAudit
 
 
@@ -17,28 +18,46 @@ logger = logging.getLogger(__name__)
 class NightlyPipeline:
     """End-to-end nightly data pipeline."""
 
-    def __init__(self, venue: str = "binance", dry_run: bool = False):
+    def __init__(
+        self,
+        venue: str = "binance",
+        dry_run: bool = False,
+        ignore_checkpoint: bool = False,
+    ):
         self.venue = venue
         self.dry_run = dry_run
+        self.ignore_checkpoint = ignore_checkpoint
         self.store = ParquetStore(DATASTORE_PATH)
         self.trading_halted = False
 
-    def run(self, days: int = 1) -> bool:
+    def run(
+        self,
+        days: int = 1,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> bool:
         """Run the nightly pipeline.
 
         Args:
-            days: How many days of data to fetch (default: 1 = daily)
+            days: Window length in days when `start` is not given (default: 1)
+            start: Explicit start of the fetch window (event time, UTC)
+            end: Explicit end of the fetch window (default: now)
 
         Returns:
             True if successful, False if halted due to audit failures
         """
+        window_desc = (
+            f"{(start or (end or utc_now()) - timedelta(days=days)).date()}"
+            f"..{(end or utc_now()).date()}"
+        )
+
         logger.info("=" * 70)
         logger.info(f"Starting Nightly Pipeline {'(DRY RUN)' if self.dry_run else ''}")
-        logger.info(f"Venue: {self.venue}, Days: {days}")
+        logger.info(f"Venue: {self.venue}, Window: {window_desc}")
         logger.info("=" * 70)
 
         try:
-            self._load_stage(days)
+            self._load_stage(days, start=start, end=end)
             self._audit_stage()
             self._report_stage()
 
@@ -126,7 +145,12 @@ class NightlyPipeline:
 
         return am
 
-    def _load_stage(self, days: int) -> None:
+    def _load_stage(
+        self,
+        days: int,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> None:
         """Load data via backfill runner."""
         logger.info("\n[LOAD STAGE] Fetching latest data...")
 
@@ -138,8 +162,12 @@ class NightlyPipeline:
             # Populate asset master with venue symbols
             asset_master = self._populate_asset_master(self.venue)
 
-            runner = BackfillRunner(self.venue, asset_master=asset_master)
-            runner.run(days_back=days)
+            runner = BackfillRunner(
+                self.venue,
+                asset_master=asset_master,
+                ignore_checkpoint=self.ignore_checkpoint,
+            )
+            runner.run(start_date=start, end_date=end, days_back=days)
             logger.info("✓ Load stage complete")
         except Exception as e:
             logger.warning(f"Load stage failed: {e} (will continue to audit)")
@@ -214,16 +242,37 @@ class NightlyPipeline:
         print()
 
 
-def run_nightly(venue: str = "binance", dry_run: bool = False, days: int = 1) -> None:
+def parse_window_arg(value: Optional[str], label: str) -> Optional[datetime]:
+    """Parse a --start/--end CLI value (YYYY-MM-DD or full ISO 8601)."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as e:
+        raise SystemExit(f"--{label} must be YYYY-MM-DD or ISO 8601, got {value!r}: {e}")
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def run_nightly(
+    venue: str = "binance",
+    dry_run: bool = False,
+    days: int = 1,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    ignore_checkpoint: bool = False,
+) -> None:
     """Run the nightly pipeline end-to-end.
 
     Args:
         venue: Exchange name (default: "binance")
         dry_run: If True, simulate without writing (default: False)
-        days: How many days of history to fetch (default: 1 = daily update)
+        days: Window length in days when `start` is not given (default: 1)
+        start: Explicit start of the fetch window (event time, UTC)
+        end: Explicit end of the fetch window (default: now)
+        ignore_checkpoint: Re-fetch the window even where it is already covered
     """
-    pipeline = NightlyPipeline(venue, dry_run)
-    success = pipeline.run(days)
+    pipeline = NightlyPipeline(venue, dry_run, ignore_checkpoint=ignore_checkpoint)
+    success = pipeline.run(days, start=start, end=end)
 
     if not success and not dry_run:
         sys.exit(1)
@@ -237,11 +286,35 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Run nightly data pipeline")
+    parser = argparse.ArgumentParser(
+        description="Run nightly data pipeline",
+        epilog=(
+            "The fetch window is resumable: each dataset records what it has "
+            "covered and only the missing part is fetched, minus a re-fetch "
+            "overlap for the incomplete trailing bar. Use --ignore-checkpoint "
+            "to force a full re-fetch."
+        ),
+    )
     parser.add_argument("--venue", default="binance", help="Exchange name")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
-    parser.add_argument("--days", type=int, default=1, help="Days of history to fetch")
+    parser.add_argument(
+        "--days", type=int, default=1, help="Window length in days (ignored if --start is given)"
+    )
+    parser.add_argument("--start", help="Window start, YYYY-MM-DD or ISO 8601 (UTC)")
+    parser.add_argument("--end", help="Window end, YYYY-MM-DD or ISO 8601 (UTC); default now")
+    parser.add_argument(
+        "--ignore-checkpoint",
+        action="store_true",
+        help="Re-fetch the whole window even where the checkpoint says it is covered",
+    )
 
     args = parser.parse_args()
 
-    run_nightly(venue=args.venue, dry_run=args.dry_run, days=args.days)
+    run_nightly(
+        venue=args.venue,
+        dry_run=args.dry_run,
+        days=args.days,
+        start=parse_window_arg(args.start, "start"),
+        end=parse_window_arg(args.end, "end"),
+        ignore_checkpoint=args.ignore_checkpoint,
+    )

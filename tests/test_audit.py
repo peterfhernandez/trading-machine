@@ -671,3 +671,109 @@ class TestDuplicateBars:
         freshness = [r for r in results if r.check_name == "freshness"][0]
         assert freshness.passed
         assert "6.0h old" in freshness.message
+
+
+class TestExpectedNullColumns:
+    """Columns a venue cannot fill for historical rows are warnings, not halts."""
+
+    @pytest.fixture
+    def funding_schema(self):
+        return DatasetSchema(
+            name="funding_rate",
+            fields={
+                "asset_id": pl.Utf8,
+                "venue": pl.Utf8,
+                "event_ts": pl.Datetime("us"),
+                "ingested_ts": pl.Datetime("us"),
+                "funding_rate": pl.Float64,
+                "mark_price": pl.Float64,
+                "index_price": pl.Float64,
+            },
+        )
+
+    def _write_history_rows(self, store, schema):
+        """Rows as the funding-rate *history* endpoint provides them: the rate
+        only, with no mark or index price."""
+        base = datetime(2024, 1, 1)
+        bars = [base + timedelta(hours=8 * i) for i in range(3)]
+        store.append(
+            "funding_rate",
+            pl.DataFrame(
+                {
+                    "asset_id": ["BTC"] * 3,
+                    "venue": ["binance"] * 3,
+                    "event_ts": bars,
+                    "ingested_ts": [base + timedelta(days=1)] * 3,
+                    "funding_rate": [0.0001, 0.0002, 0.0003],
+                    "mark_price": [None, None, None],
+                    "index_price": [None, None, None],
+                },
+                schema=schema.to_polars_schema(),
+            ),
+            schema,
+        )
+
+    def test_expected_nulls_warn_instead_of_halting(self, temp_store, funding_schema):
+        self._write_history_rows(temp_store, funding_schema)
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("funding_rate", datetime(2024, 1, 2))
+
+        mark = [r for r in results if r.check_name == "null_rate_mark_price"][0]
+        assert mark.passed
+        assert mark.severity == "warning"
+        assert "not provided by the venue's history endpoint" in mark.message
+        assert not audit.should_halt_trading()
+
+    def test_the_column_that_matters_stays_strict(self, temp_store, funding_schema):
+        """funding_rate itself is not optional: nulls there halt trading."""
+        base = datetime(2024, 1, 1)
+        temp_store.append(
+            "funding_rate",
+            pl.DataFrame(
+                {
+                    "asset_id": ["BTC", "ETH"],
+                    "venue": ["binance"] * 2,
+                    "event_ts": [base, base],
+                    "ingested_ts": [base + timedelta(days=1)] * 2,
+                    "funding_rate": [None, None],
+                    "mark_price": [1.0, 2.0],
+                    "index_price": [1.0, 2.0],
+                },
+                schema=funding_schema.to_polars_schema(),
+            ),
+            funding_schema,
+        )
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("funding_rate", datetime(2024, 1, 2))
+
+        rate = [r for r in results if r.check_name == "null_rate_funding_rate"][0]
+        assert not rate.passed
+        assert rate.severity == "error"
+        assert audit.should_halt_trading()
+
+    def test_other_datasets_are_unaffected(self, temp_store, sample_ohlcv_schema):
+        """The exemption is per dataset, not global."""
+        base = datetime(2024, 1, 1)
+        temp_store.append(
+            "test_ohlcv",
+            pl.DataFrame(
+                {
+                    "asset_id": ["BTC", "ETH"],
+                    "venue": ["binance"] * 2,
+                    "event_ts": [base, base],
+                    "ingested_ts": [base] * 2,
+                    "close": [None, None],
+                },
+                schema=sample_ohlcv_schema.to_polars_schema(),
+            ),
+            sample_ohlcv_schema,
+        )
+
+        audit = DataAudit(temp_store)
+        results = audit.audit_dataset("test_ohlcv", base)
+
+        close = [r for r in results if r.check_name == "null_rate_close"][0]
+        assert not close.passed
+        assert close.severity == "error"

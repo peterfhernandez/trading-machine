@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 
 from datastore import ParquetStore, DatasetSchema, AssetMaster
-from pipeline.nightly import NightlyPipeline
+from pipeline.nightly import NightlyPipeline, parse_window_arg
 
 
 @pytest.fixture
@@ -207,3 +207,71 @@ class TestAssetMasterPopulation:
             am = pipeline._populate_asset_master("binance")
 
         assert am.resolve_symbol("BTC/USDT", "binance") == "BTC"
+
+
+class TestWindowArguments:
+    """--start/--end/--ignore-checkpoint reach the backfill runner."""
+
+    def test_parses_date_and_iso_timestamps(self):
+        assert parse_window_arg("2024-03-01", "start") == datetime(2024, 3, 1)
+        assert parse_window_arg("2024-03-01T06:30:00", "start") == datetime(2024, 3, 1, 6, 30)
+        assert parse_window_arg(None, "start") is None
+
+    def test_strips_timezone_to_naive_utc(self):
+        """The datastore stores naive UTC throughout."""
+        parsed = parse_window_arg("2024-03-01T00:00:00+00:00", "start")
+        assert parsed == datetime(2024, 3, 1)
+        assert parsed.tzinfo is None
+
+    def test_rejects_nonsense(self):
+        with pytest.raises(SystemExit, match="--start must be"):
+            parse_window_arg("last tuesday", "start")
+
+    @patch("pipeline.nightly.BackfillRunner")
+    @patch("pipeline.nightly.DataAudit")
+    def test_explicit_window_is_passed_through(self, mock_audit_class, mock_backfill_class):
+        mock_backfill = MagicMock()
+        mock_backfill_class.return_value = mock_backfill
+        mock_audit = MagicMock()
+        mock_audit.audit_dataset.return_value = []
+        mock_audit.should_halt_trading.return_value = False
+        mock_audit_class.return_value = mock_audit
+
+        with patch.object(NightlyPipeline, "_populate_asset_master", return_value=MagicMock()):
+            pipeline = NightlyPipeline("binance", dry_run=False)
+            pipeline.run(days=1, start=datetime(2024, 3, 1), end=datetime(2024, 3, 8))
+
+        kwargs = mock_backfill.run.call_args.kwargs
+        assert kwargs["start_date"] == datetime(2024, 3, 1)
+        assert kwargs["end_date"] == datetime(2024, 3, 8)
+
+    @patch("pipeline.nightly.BackfillRunner")
+    @patch("pipeline.nightly.DataAudit")
+    def test_ignore_checkpoint_reaches_the_runner(self, mock_audit_class, mock_backfill_class):
+        mock_backfill_class.return_value = MagicMock()
+        mock_audit = MagicMock()
+        mock_audit.audit_dataset.return_value = []
+        mock_audit.should_halt_trading.return_value = False
+        mock_audit_class.return_value = mock_audit
+
+        with patch.object(NightlyPipeline, "_populate_asset_master", return_value=MagicMock()):
+            NightlyPipeline("binance", dry_run=False, ignore_checkpoint=True).run(days=1)
+
+        assert mock_backfill_class.call_args.kwargs["ignore_checkpoint"] is True
+
+    @patch("pipeline.nightly.BackfillRunner")
+    @patch("pipeline.nightly.DataAudit")
+    def test_days_still_works_without_a_window(self, mock_audit_class, mock_backfill_class):
+        mock_backfill = MagicMock()
+        mock_backfill_class.return_value = mock_backfill
+        mock_audit = MagicMock()
+        mock_audit.audit_dataset.return_value = []
+        mock_audit.should_halt_trading.return_value = False
+        mock_audit_class.return_value = mock_audit
+
+        with patch.object(NightlyPipeline, "_populate_asset_master", return_value=MagicMock()):
+            NightlyPipeline("binance", dry_run=False).run(days=3)
+
+        kwargs = mock_backfill.run.call_args.kwargs
+        assert kwargs["days_back"] == 3
+        assert kwargs["start_date"] is None
