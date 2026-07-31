@@ -178,15 +178,19 @@ class BaseLoader(ABC):
             logger.error(f"Failed to append to {dataset}: {e}")
             raise
 
-    def run(self, schema: DatasetSchema, dataset: str) -> None:
+    def run(self, schema: DatasetSchema, dataset: str) -> int:
         """Main entry point: fetch, validate, append.
 
         Args:
             schema: DatasetSchema for validation
             dataset: Dataset name to append to
+
+        Returns:
+            Number of rows appended
         """
         logger.info(f"Starting {self.__class__.__name__} for {self.venue}")
         df = self.fetch()
         logger.info(f"Fetched {len(df)} rows")
         self.append(dataset, df, schema)
         logger.info(f"Completed {self.__class__.__name__}")
+        return len(df)

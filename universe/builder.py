@@ -17,7 +17,7 @@ from typing import Optional
 import polars as pl
 
 from config import DATASTORE_PATH, UNIVERSE_CONFIG, UniverseConfig
-from datastore import ParquetStore
+from datastore import ParquetStore, latest_per_bar
 from universe.schema import UNIVERSE_SCHEMA
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,14 @@ class UniverseBuilder:
         if "venue" in df.columns:
             df = df.filter(pl.col("venue") == self.venue)
 
-        return df.filter(pl.col("event_ts") <= asof)
+        df = df.filter(pl.col("event_ts") <= asof)
+
+        # Overlapping loader windows store the same bar more than once. Both
+        # metrics below aggregate rows -- a median dollar volume and a first-seen
+        # date -- so a bar counted twice would weight the duplicated stretch of
+        # history (always the most recent days) more heavily than the rest.
+        # Collapse after the asof filter, never before: see datastore.dedupe.
+        return latest_per_bar(df)
 
     def _dollar_volume(self, asof: datetime) -> pl.DataFrame:
         """Median dollar volume per asset over the lookback window, as of `asof`."""

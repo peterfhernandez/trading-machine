@@ -8,7 +8,12 @@ from typing import Optional
 import polars as pl
 
 from config import AUDIT_CONFIG, ALERT_CONFIG, DATASTORE_PATH
-from datastore import ParquetStore
+from datastore import (
+    DEFAULT_BAR_KEYS,
+    ParquetStore,
+    count_duplicate_bars,
+    latest_per_bar,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +90,13 @@ class DataAudit:
                     severity="error",
                 ))
                 return self.results
+
+            # Report duplicates against the raw read, then run every other check
+            # against one row per bar. Null rates, price jumps and freshness all
+            # aggregate rows, so a bar stored twice would otherwise be counted
+            # twice; the duplicate is a fact about ingestion, not about the data.
+            self._check_duplicate_bars(df)
+            df = latest_per_bar(df)
 
             members, universe_size, universe_source = self.resolve_universe(date)
             self._check_coverage(df, members, universe_size, universe_source)
@@ -220,6 +232,41 @@ class DataAudit:
                 f"({pct:.1f}%) (threshold: {threshold}, from {universe_source})"
             ),
             severity=severity,
+        ))
+
+    def _check_duplicate_bars(self, df: pl.DataFrame) -> None:
+        """Report bars stored more than once in the lookback window.
+
+        Not an error: the store is append-only, so re-fetching an already-stored
+        bar (overlapping loader windows, a retried run, a vendor revision) is
+        expected and the older copy is kept on purpose. Readers collapse to the
+        latest ingestion. It is worth surfacing because a duplicate rate that
+        climbs run over run means the loaders are re-fetching history they
+        already have, which costs API budget and disk for nothing.
+        """
+        if any(k not in df.columns for k in DEFAULT_BAR_KEYS):
+            return
+
+        duplicates = count_duplicate_bars(df)
+        if duplicates == 0:
+            self.results.append(AuditResult(
+                check_name="duplicate_bars",
+                passed=True,
+                message="No duplicate bars in the lookback window",
+                severity="info",
+            ))
+            return
+
+        unique_bars = len(df) - duplicates
+        pct = 100.0 * duplicates / len(df)
+        self.results.append(AuditResult(
+            check_name="duplicate_bars",
+            passed=True,
+            message=(
+                f"{duplicates} of {len(df)} rows ({pct:.1f}%) are repeat ingestions "
+                f"of {unique_bars} unique bars; readers use the latest ingestion"
+            ),
+            severity="warning",
         ))
 
     def _check_null_rates(self, df: pl.DataFrame) -> None:

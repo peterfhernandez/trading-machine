@@ -199,6 +199,37 @@ store.append("ohlcv", df, schema=my_schema)
 df = store.read("ohlcv", date_range=("2024-01-01", "2024-12-31"), asof="2024-12-31")
 ```
 
+### Duplicate bars
+
+The store is append-only, so a bar fetched twice is **stored** twice: overlapping
+loader windows, a retried run, and genuine vendor revisions all look the same on
+disk. That is deliberate — keeping the older copy is what lets a backtest ask
+what a bar looked like before it was revised — so duplicates are a *read-side*
+concern, not something the writer should prevent.
+
+Every reader that aggregates rows collapses each bar to its latest ingestion via
+`datastore.latest_per_bar`:
+
+```python
+from datastore import latest_per_bar, count_duplicate_bars
+
+df = store.read("ohlcv_daily", asof="2026-07-30")   # point-in-time filter first
+count_duplicate_bars(df)                             # 12 -> rows that repeat a bar
+df = latest_per_bar(df)                              # one row per (asset_id, event_ts)
+```
+
+Order matters: collapse **after** any `ingested_ts <= asof` filter. Collapsing
+first would let a later revision win the bar and then be filtered away, hiding a
+bar that was knowable at `asof`.
+
+The nightly audit reports the duplicate rate as a `duplicate_bars` warning (never
+a halt — re-ingestion is expected); a rate that climbs run over run means the
+loaders are re-fetching history the store already has.
+
+```bash
+PAPER=true python scratch/scratch_duplicate_bars.py   # demo
+```
+
 ### Loaders
 
 Three data loaders fetch from Binance/Deribit via ccxt and ingest to the datastore:
@@ -208,7 +239,7 @@ from loaders import OHLCVLoader, FundingRateLoader, OpenInterestLoader
 
 # Fetch last 7 days of daily and hourly OHLCV
 loader = OHLCVLoader("binance", lookback_days=7)
-loader.run_daily()
+rows = loader.run_daily()      # fetches, appends, returns rows appended
 loader.run_hourly()
 
 # Fetch funding rates and open interest
@@ -218,6 +249,10 @@ fr_loader.run()
 oi_loader = OpenInterestLoader("binance", lookback_days=30)
 oi_loader.run()
 ```
+
+Each `run*()` fetches once and returns the number of rows appended (0 if the
+venue returned nothing). Callers must not call `fetch()` first to test for
+emptiness — that pulls every symbol from the venue a second time.
 
 **Market types.** Funding rate and open interest exist only on derivatives, so
 those two loaders open the venue with `defaultType=LOADER_CONFIG.perp_market_type`
@@ -231,20 +266,27 @@ either notation resolves to the same canonical `asset_id`.
 venue's symbol list interleaves every quote currency alphabetically, so capping
 first and filtering after silently starves the budget.
 
-**Backfill runner** orchestrates all loaders with resumable checkpoint tracking:
+**Backfill runner** orchestrates all loaders in sequence, one fetch per dataset:
 
 ```python
 from loaders import BackfillRunner
 
 runner = BackfillRunner("binance")
-runner.run(days_back=30)  # Fetches 30 days; resumes from checkpoint on retry
+runner.run(days_back=30)  # Fetches the last 30 days for every dataset
 ```
+
+The window is always `days_back` counted back from *now*, and it is re-fetched
+in full on every run. A checkpoint file (`data/checkpoints/<venue>_backfill.json`)
+records the last date each dataset reached, but nothing reads it back yet — the
+runner does not currently skip windows it already has, so re-running overlaps
+with what is in the store (see duplicate bars above).
 
 ### Audit
 
-Data quality audit with 5 checks: coverage (% of universe), null rates per column,
-price outliers, freshness (data age), and data presence. Sends Telegram alerts on
-breaches.
+Data quality audit with 6 checks: coverage (% of universe), null rates per column,
+price outliers, freshness (data age), data presence, and duplicate bars. Sends
+Telegram alerts on breaches. Every check except `duplicate_bars` runs against one
+row per bar, so a re-ingested bar is never counted twice.
 
 ```python
 from audit import DataAudit

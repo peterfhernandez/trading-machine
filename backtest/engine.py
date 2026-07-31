@@ -57,7 +57,7 @@ from datetime import datetime, timedelta
 import polars as pl
 
 from config import BACKTEST_CONFIG, DATASTORE_PATH, BacktestConfig
-from datastore import ParquetStore
+from datastore import ParquetStore, latest_per_bar
 
 from .calendar import build_rebalance_calendar
 from .costs import CostModel
@@ -362,12 +362,7 @@ class Backtester:
         # A bar can be ingested more than once (backfill overlap); keep the
         # latest ingestion for each (asset, bar) -- append-only means we never
         # delete the earlier copy, we just read past it.
-        df = (
-            df.sort("ingested_ts")
-            .group_by(["asset_id", "event_ts"])
-            .last()
-            .sort(["event_ts", "asset_id"])
-        )
+        df = latest_per_bar(df, sort_by=["event_ts", "asset_id"])
 
         opens: dict[datetime, dict[str, float]] = {}
         for asset_id, event_ts, open_px in zip(
