@@ -21,7 +21,6 @@ asserts the cached path and the context path return identical scores; that test
 is what keeps this an optimization rather than a second implementation.
 """
 
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -29,6 +28,7 @@ import numpy as np
 import polars as pl
 
 from datastore import ParquetStore
+from logging_config import get_logger
 
 from .markov_mean_reversion import (
     DEFAULT_PARAMS,
@@ -37,7 +37,7 @@ from .markov_mean_reversion import (
     min_history_bars,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 OHLCV_DATASET = "ohlcv_daily"
 

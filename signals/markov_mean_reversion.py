@@ -41,7 +41,6 @@ bars, or too few observations of the current state all return `None`, which drop
 the asset from the cross-section rather than parking it at average.
 """
 
-import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 
@@ -49,10 +48,11 @@ import numpy as np
 import polars as pl
 
 from datastore import latest_per_bar
+from logging_config import get_logger
 
 from .transforms import cross_sectional_zscore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 SIGNAL_ID = "markov_mean_reversion"
 FAMILY = "reversal"
@@ -562,7 +562,22 @@ def score_universe(
     scores: dict[str, float | None] = {}
     for asset_id in ctx.universe:
         closes = panel.get(asset_id)
-        scores[asset_id] = None if closes is None else score_series(closes, params)
+        if closes is None:
+            scores[asset_id] = None
+            # DEBUG, and per-asset: on a 150-asset universe this fires for every
+            # asset short of 244 bars at every rebalance, so it is deliberately
+            # kept below INFO (LOGGING.md section 6).
+            logger.debug(
+                "%s: no score for %s at %s (no_bars)", SIGNAL_ID, asset_id, ctx.asof.date()
+            )
+            continue
+        diagnostics = diagnose_series(closes, params)
+        scores[asset_id] = diagnostics.score
+        if diagnostics.reject_reason is not None:
+            logger.debug(
+                "%s: no score for %s at %s (%s)",
+                SIGNAL_ID, asset_id, ctx.asof.date(), diagnostics.reject_reason,
+            )
 
     if standardize:
         return cross_sectional_zscore(scores, params.winsorize_pct)

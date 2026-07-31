@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — In progress · Phase 5.5 (Logging retrofit) — designed, not yet applied**
+**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a real backfill · Phase 5.5 (Logging & observability) — applied**
 
 ## Quick Start
 
@@ -70,6 +70,7 @@ tests/         — pytest test suite
 scratch/       — Research notebooks & demo scripts
 config.py      — Central configuration
 logging_config.py — Logging setup (get_logger, run_id, retention pruning); see Logging below
+pipeline/prune_logs.py — Standalone log retention (`python -m pipeline.prune_logs`)
 logs/          — Rotating, retained per-component log files (git-ignored)
 ```
 
@@ -100,17 +101,26 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 ### Current Phase: Phase 5 (Signals → alphas)
 
 - [x] Signal interface + registry (registration requires a methodology doc)
-- [x] Cross-sectional transforms: winsorize then z-score, `None` preserved
-- [x] `markov_mean_reversion` signal + walk-forward parameter grid script
-- [ ] Backtest evidence for `markov_mean_reversion` against a real backfill
-- [ ] Momentum, carry, short-term reversal, low-volatility signals
-- [ ] Alpha refinement (IC estimation + shrinkage) and the breadth report
+- [x] Cross-sectional transforms: winsorize then z-score (and a scale-only
+      variant that keeps the cross-sectional mean), `None` preserved
+- [x] Shared point-in-time series reader and primitives (`signals/bars.py`)
+- [x] Six signals: `markov_mean_reversion`, `short_term_reversal`,
+      `cross_sectional_momentum`, `time_series_momentum`, `carry`,
+      `low_volatility` — each with a methodology doc written first
+- [x] Alpha refinement: IC estimation with shrinkage, `alpha = vol × IC × z`
+- [x] Breadth report: score correlation, IC correlation, effective bet count
+- [ ] **Backtest evidence** — every methodology doc's Section 5 is empty and
+      every signal is `draft`. This needs a multi-year backfill; a synthetic
+      backtest measures the generator, not the signal. See
+      [What is not done](#what-is-not-done).
 
-### Next: Phase 5.5 (Logging & Observability Retrofit)
+### Completed: Phase 5.5 (Logging & Observability)
 
-- [x] Logging architecture designed (`LOGGING.md`) and reference implementation
-      written (`logging_config.py`)
-- [ ] Retrofit into Phases 1-4 and current Phase 5 source (see `TODO.md`)
+- [x] Architecture designed (`LOGGING.md`) and implemented (`logging_config.py`)
+- [x] Retrofitted into Phases 1-5 source — every module logs through
+      `get_logger(__name__)`, a halt always leaves a CRITICAL record before
+      the alert is attempted, and `prune_old_logs()` runs as the nightly
+      pipeline's last step
 
 ## Testing
 
@@ -169,8 +179,27 @@ breaches, execution drift, and the kill switch, and are meant for a human to
 see immediately. A halt or alert always has a matching CRITICAL log line, so
 the durable record doesn't depend on the Telegram send succeeding.
 
+Retention is a separate mechanism from rotation, and runs separately too:
+
+```bash
+python -m pipeline.prune_logs --dry-run   # what would be deleted
+python -m pipeline.prune_logs             # delete expired backups
+```
+
+`NightlyPipeline.run()` already calls it as its final step — in a `finally`, so
+a failed run still prunes. The standalone command is for a research box that
+runs backtests and sweeps (writing to `backtest.log` and `signals.log`) without
+ever running the pipeline.
+
+**A halt always leaves a record.** `DataAudit.should_halt_trading()` logs
+CRITICAL from inside the method — so every route to a halt is covered, not just
+the ones that remembered to log — and it does so before the Telegram send is
+attempted. Telegram being down is exactly the kind of thing that should still
+appear in the log.
+
 Full design rationale — why rotation and retention are decoupled, log levels,
-the per-module retrofit map — is in `LOGGING.md`.
+the per-module map and the two places the retrofit deviated from it — is in
+`LOGGING.md`.
 
 ## Development
 
@@ -477,18 +506,84 @@ Shared pieces: `signals/transforms.py` (winsorize then z-score a cross-section,
 preserving `None`) and `signals/panel.py` (`CachedClosePanel` — a point-in-time
 close panel that reads the store once, for parameter sweeps).
 
-**Registered signals**
+**Registered signals** — all six are implemented and unit-tested; none has
+backtest evidence yet (see [What is not done](#what-is-not-done)).
 
-| Signal | Family | Status |
-| --- | --- | --- |
-| `markov_mean_reversion` | reversal | implemented; backtest evidence pending |
+| Signal | Family | Construction | Min. history |
+| --- | --- | --- | --- |
+| `cross_sectional_momentum` | momentum | 90-day return ending 7 bars back | 98 bars |
+| `time_series_momentum` | momentum | same window ÷ the asset's own volatility | 91 bars |
+| `carry` | carry | negated annualized mean funding rate | 3 settlements |
+| `short_term_reversal` | reversal | negated vol-scaled 5-day return | 31 bars |
+| `markov_mean_reversion` | reversal | expected next-state gap from a rolling transition matrix | 244 bars |
+| `low_volatility` | volatility | negated annualized realized volatility | 41 bars |
 
-`markov_mean_reversion` discretizes each asset's standardized rolling return into
-`n_states` quantile states, estimates a rolling transition matrix, and scores the
-gap between the current state and the probability-weighted expected next state.
-It needs 244 bars per score at the default parameters and returns `None` for any
-asset with less, with a gap in its recent bars, or with too few observed
-transitions out of its current state.
+Two of these are worth a sentence beyond the table:
+
+- **`time_series_momentum` standardizes without demeaning.** Every other signal
+  ends in a cross-sectional z-score. This one uses `cross_sectional_scale`
+  (winsorize, then divide by the cross-sectional standard deviation) because
+  subtracting the mean deletes exactly the market-wide tilt a time-series
+  signal exists to express. A book weighted by its score *levels* is therefore
+  not dollar-neutral, deliberately.
+- **`carry` is the only signal that does not read prices.** It reads
+  `funding_rate`, which exists on perpetuals only — so a universe member with
+  no perp listing scores `None` at every rebalance, and this signal's effective
+  breadth is smaller than the universe size.
+
+`signals/bars.py` is the shared point-in-time reader every price signal uses:
+read through the context, collapse each `(asset, bar)` to its latest ingestion,
+trim to the most recent gap-free stretch. Writing that five times would be five
+chances to get the point-in-time boundary subtly wrong.
+
+### Alphas and breadth
+
+The engine's per-rebalance rank IC series is the input to alpha refinement:
+
+```python
+from signals import alpha, breadth, low_volatility, signal_functions, signal_families
+from signals.breadth import ScoreRecorder
+
+recorder = ScoreRecorder(signal_functions())
+result = Backtester(store).run(strategy, signals=recorder.wrapped())
+
+estimates = alpha.estimate_ics(result.ic)          # shrunk IC per signal
+print(alpha.alpha_summary(sorted(estimates.values(), key=lambda e: e.signal_id)))
+
+vols = low_volatility.annualized_vol_universe(ctx)  # one volatility estimator
+alphas = alpha.alpha_from_scores(scores, estimates["carry"].shrunk_ic, vols)
+combined = alpha.combine_alphas({"carry": alphas, ...})
+
+print(breadth.breadth_report(recorder.frame(), result.ic, signal_families()).to_text())
+```
+
+**IC shrinkage is where the humility goes.** A raw in-sample mean IC is
+optimistic. `estimate_ic` reports it *and* a shrunk value, and every consumer
+uses the shrunk one:
+
+```text
+shrunk = mean_ic × τ² / (τ² + se²)      τ = 0.02, se = ic_std / √n
+```
+
+τ encodes "a genuine crypto signal is small" rather than an expectation of
+skill; the result is capped at ±0.10, and an estimate resting on fewer than two
+observations is shrunk to exactly zero (one period cannot separate skill from
+luck). `combine_alphas` sums across signals, where a `None` view contributes
+nothing rather than dragging the sum toward zero — and returns the per-asset
+**view count**, because an asset one signal likes and an asset all six like are
+different bets.
+
+**The breadth report answers two questions, not one.** *Score correlation* (per
+rebalance, averaged) asks whether two signals pick the same assets; *IC
+correlation* asks whether they work at the same times. Two signals can pick
+entirely different assets and still be one bet if they fail in the same regime.
+`effective_breadth` turns the mean absolute pairwise correlation into
+`n / (1 + (n−1)ρ̄)` independent bets.
+
+```bash
+PAPER=true python scratch/scratch_signals_phase5.py    # the six signals
+PAPER=true python scratch/scratch_signal_breadth.py    # alphas + breadth
+```
 
 **Every signal gets a methodology doc** in `signals/methodology/` (hypothesis,
 data inputs and their point-in-time contract, construction, parameters, backtest
@@ -540,6 +635,37 @@ them to be labelled that way.
    alerts are for a human's immediate attention, logs are the durable record
    an unattended run can be reconstructed from. See `LOGGING.md`.
 
+## What is not done
+
+Worth stating plainly, because the code being finished and the research being
+finished are different things:
+
+**No signal has backtest evidence.** All six are implemented, unit-tested
+against hand-computed golden fixtures, and wired into the engine — and Section
+5 of every methodology doc is empty, with every signal marked `draft`. There is
+no multi-year backfill in this repository, and a backtest on synthetic data
+measures the generator rather than the signal. The breadth demo makes the point
+concretely: on synthetic bars `cross_sectional_momentum` and
+`time_series_momentum` score-correlate at 0.86, which is a plausible finding
+about two signals sharing a formation window and still not evidence of
+anything.
+
+Filling those sections needs, in order:
+
+1. `python -m pipeline.nightly --start <5y ago> --end <today>` (hours,
+   resumable — it checkpoints per dataset).
+2. A walk-forward parameter grid per signal, selecting on prior folds only
+   (`scratch/scratch_markov_param_grid.py` is the pattern to copy).
+3. `--pit-mode event` on backfilled history, labelled as research indications
+   rather than live-fidelity results, since a backfill stamps every row with
+   one `ingested_ts`.
+4. `scratch/scratch_signal_breadth.py` against that store, to fill Section 6
+   with measured correlations rather than expectations.
+
+**Also outstanding:** the 10 MB rotation size and 12-month retention window in
+`LOGGING.md` were specified, not measured — no component's real log volume is
+known until a backfill has actually run.
+
 ## Progress
 
 See `TODO.md` for detailed phase breakdown and progress log.
@@ -553,5 +679,6 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: finish Phase 5 (remaining signals, alpha refinement), then
-Phase 5.5 — retrofit logging into Phases 1-5 (see `TODO.md` and `LOGGING.md`)
+**Next Phase**: collect backtest evidence for the six signals against a real
+backfill (see [What is not done](#what-is-not-done)), then Phase 6 — the factor
+risk model (see `TODO.md`)

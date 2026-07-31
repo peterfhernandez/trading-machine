@@ -16,11 +16,12 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
-import logging
 
 import polars as pl
 
-logger = logging.getLogger(__name__)
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -105,7 +106,11 @@ class AssetMaster:
         )
 
     def resolve_symbol(
-        self, symbol: str, venue: str, asof: Optional[datetime] = None
+        self,
+        symbol: str,
+        venue: str,
+        asof: Optional[datetime] = None,
+        warn_if_unresolved: bool = True,
     ) -> Optional[str]:
         """
         Resolve a venue symbol to a canonical asset_id.
@@ -114,6 +119,11 @@ class AssetMaster:
             symbol: Symbol on the venue (e.g., "BTC/USDT")
             venue: Venue name (e.g., "binance")
             asof: Knowledge date (None = use current time)
+            warn_if_unresolved: Log a WARNING when the symbol has no mapping.
+                Set False when absence is the expected answer rather than a
+                fault — the nightly pipeline calls this to ask "is this symbol
+                already mapped?" before adding it, and on a first run every
+                symbol on the venue would otherwise log a warning.
 
         Returns:
             Canonical asset_id, or None if not found
@@ -132,6 +142,12 @@ class AssetMaster:
         )
 
         if len(matches) == 0:
+            # The loaders resolve every venue symbol before writing, and an
+            # unresolved one silently drops that asset's rows — so the failure
+            # surfaces downstream as an audit coverage miss with no explanation
+            # unless it is recorded here.
+            if warn_if_unresolved:
+                logger.warning(f"Unresolved symbol {venue}:{symbol} at {asof.date()}")
             return None
         if len(matches) > 1:
             logger.warning(

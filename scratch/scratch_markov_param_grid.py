@@ -57,6 +57,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from log_demo import start_demo_run  # noqa: E402
+
 from backtest import (  # noqa: E402
     PIT_EVENT,
     PIT_INGESTION,
@@ -523,6 +525,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    start_demo_run("signals")
     args = parse_args(argv)
 
     if not PAPER:

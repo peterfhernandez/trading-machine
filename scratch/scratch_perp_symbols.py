@@ -19,6 +19,13 @@ import sys
 
 import ccxt
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+# isort: off
+from log_demo import start_demo_run
+
+# isort: on
+
 from config import LOADER_CONFIG, PAPER
 from loaders.base import select_usdt_symbols
 
@@ -44,6 +51,7 @@ def load(market_type: str | None) -> ccxt.Exchange:
 
 
 def main():
+    start_demo_run("loaders")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

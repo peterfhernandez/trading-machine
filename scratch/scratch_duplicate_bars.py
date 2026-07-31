@@ -20,6 +20,13 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+# isort: off
+from log_demo import start_demo_run
+
+# isort: on
+
 from audit.auditor import DataAudit
 from config import PAPER
 from datastore import ParquetStore, count_duplicate_bars, latest_per_bar
@@ -56,6 +63,7 @@ def write_bars(store, event_dates, ingested_ts, volume=1_000.0, close=100.0):
 
 
 def main():
+    start_demo_run("datastore")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

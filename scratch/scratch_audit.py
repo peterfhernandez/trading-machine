@@ -8,10 +8,15 @@ from datetime import datetime
 
 import polars as pl
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+from log_demo import start_demo_run
+
 from config import PAPER
 from datastore import ParquetStore, DatasetSchema
 from audit.auditor import DataAudit
 from universe import UNIVERSE_SCHEMA
+
 
 
 logging.basicConfig(
@@ -23,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     """Demo Audit module on temp data."""
+    start_demo_run("audit")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

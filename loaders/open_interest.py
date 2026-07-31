@@ -1,6 +1,5 @@
 """Open interest loader for perpetual swaps."""
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -17,9 +16,10 @@ from loaders.base import (
 )
 from loaders.schemas import OPEN_INTEREST_SCHEMA
 from loaders.window import FetchWindow, utc_now
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class OpenInterestLoader(BaseLoader):

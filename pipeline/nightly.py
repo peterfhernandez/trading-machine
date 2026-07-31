@@ -2,17 +2,19 @@
 
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from config import DATASTORE_PATH, LOADER_CONFIG
+from config import DATASTORE_PATH, LOADER_CONFIG, LOG_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
 from loaders.window import utc_now
 from audit.auditor import DataAudit
+from logging_config import get_logger, new_run_id, prune_old_logs, set_run_id
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class NightlyPipeline:
@@ -38,6 +40,10 @@ class NightlyPipeline:
     ) -> bool:
         """Run the nightly pipeline.
 
+        Sets the `run_id` every component's log records carry, so one night's
+        activity can be pulled out of all eleven files in `logs/` by grepping a
+        single value. Prunes expired log backups as its last step.
+
         Args:
             days: Window length in days when `start` is not given (default: 1)
             start: Explicit start of the fetch window (event time, UTC)
@@ -46,6 +52,9 @@ class NightlyPipeline:
         Returns:
             True if successful, False if halted due to audit failures
         """
+        run_id = new_run_id()
+        set_run_id(run_id)
+
         window_desc = (
             f"{(start or (end or utc_now()) - timedelta(days=days)).date()}"
             f"..{(end or utc_now()).date()}"
@@ -53,22 +62,74 @@ class NightlyPipeline:
 
         logger.info("=" * 70)
         logger.info(f"Starting Nightly Pipeline {'(DRY RUN)' if self.dry_run else ''}")
-        logger.info(f"Venue: {self.venue}, Window: {window_desc}")
+        logger.info(f"run_id={run_id}, venue={self.venue}, window={window_desc}")
         logger.info("=" * 70)
 
+        started = time.monotonic()
         try:
-            self._load_stage(days, start=start, end=end)
-            self._audit_stage()
-            self._report_stage()
+            self._stage("load", self._load_stage, days, start=start, end=end)
+            self._stage("audit", self._audit_stage)
+            self._stage("report", self._report_stage)
 
             logger.info("=" * 70)
-            logger.info("✓ Pipeline complete")
+            logger.info(
+                f"✓ Pipeline complete in {time.monotonic() - started:.1f}s "
+                f"(run_id={run_id}, trading "
+                f"{'HALTED' if self.trading_halted else 'active'})"
+            )
             logger.info("=" * 70)
 
             return not self.trading_halted
         except Exception as e:
-            logger.error(f"Pipeline failed: {e}", exc_info=True)
+            # CRITICAL, not ERROR: an unhandled exception here means the run
+            # produced no data and no audit, which is a halt in everything but
+            # name (LOGGING.md section 3.5).
+            logger.critical(f"Pipeline failed after {time.monotonic() - started:.1f}s: {e}",
+                            exc_info=True)
             return False
+        finally:
+            self._prune_logs()
+
+    def _stage(self, name: str, fn, *args, **kwargs) -> None:
+        """Run one pipeline stage, logging entry, exit and duration.
+
+        An exception is logged CRITICAL here — with the stage that raised it —
+        and re-raised for `run()` to turn into a failed run. The individual
+        stages already swallow their own recoverable failures (a loader that
+        cannot reach the venue is non-fatal by design); anything reaching this
+        handler is not recoverable.
+        """
+        logger.info(f"[{name.upper()} STAGE] starting")
+        started = time.monotonic()
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            logger.critical(
+                f"[{name.upper()} STAGE] failed after {time.monotonic() - started:.1f}s",
+                exc_info=True,
+            )
+            raise
+        logger.info(
+            f"[{name.upper()} STAGE] complete in {time.monotonic() - started:.1f}s"
+        )
+
+    @staticmethod
+    def _prune_logs() -> None:
+        """Delete rotated log backups past the retention window.
+
+        Runs in a `finally`, so retention is enforced even on a failed run —
+        a pipeline that fails every night is exactly the one whose logs grow
+        fastest. Never allowed to fail the run itself.
+        """
+        try:
+            deleted = prune_old_logs()
+            if deleted:
+                logger.info(
+                    f"Pruned {len(deleted)} log backup(s) older than "
+                    f"{LOG_CONFIG.retention_days} days"
+                )
+        except Exception as e:
+            logger.warning(f"Log pruning failed: {e}")
 
     def _venue_markets(self, venue: str) -> dict[str, dict]:
         """Collect USDT markets across every market type the loaders use.
@@ -125,7 +186,12 @@ class NightlyPipeline:
                 # add_mapping appends unconditionally, so re-adding a symbol on
                 # every nightly run would grow the master without bound and make
                 # resolve_symbol ambiguous.
-                if am.resolve_symbol(symbol, venue, asof=base_date) is not None:
+                if (
+                    am.resolve_symbol(
+                        symbol, venue, asof=base_date, warn_if_unresolved=False
+                    )
+                    is not None
+                ):
                     skipped += 1
                     continue
 
@@ -151,9 +217,13 @@ class NightlyPipeline:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ) -> None:
-        """Load data via backfill runner."""
-        logger.info("\n[LOAD STAGE] Fetching latest data...")
+        """Load data via backfill runner.
 
+        Failures here are deliberately non-fatal — an unreachable venue should
+        still let the audit report on what is already in the store — so they are
+        logged ERROR (a caught exception that does not halt the run) rather than
+        re-raised into `_stage`'s CRITICAL handler.
+        """
         if self.dry_run:
             logger.info(f"(DRY RUN) Would run backfill for {days} days")
             return
@@ -168,14 +238,18 @@ class NightlyPipeline:
                 ignore_checkpoint=self.ignore_checkpoint,
             )
             runner.run(start_date=start, end_date=end, days_back=days)
-            logger.info("✓ Load stage complete")
         except Exception as e:
-            logger.warning(f"Load stage failed: {e} (will continue to audit)")
+            logger.error(
+                f"Load stage failed: {e} (continuing to audit)", exc_info=True
+            )
 
     def _audit_stage(self) -> None:
-        """Audit data quality."""
-        logger.info("\n[AUDIT STAGE] Running data quality checks...")
+        """Audit data quality.
 
+        `DataAudit` logs every check's verdict itself, and logs CRITICAL from
+        `should_halt_trading()` before the alert is attempted, so this stage
+        only records the per-dataset roll-up.
+        """
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
         today = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -192,25 +266,17 @@ class NightlyPipeline:
 
                 passed = all(r.passed for r in results)
                 all_passed = all_passed and passed
+                logger.info(f"{'✓ PASS' if passed else '✗ FAIL'} | {dataset}")
 
-                status = "✓ PASS" if passed else "✗ FAIL"
-                logger.info(f"{status} | {dataset}")
-
-                # Log failures and any check that passed only with a warning
-                # (e.g. coverage with no universe snapshot to measure against),
-                # so a check that could not be evaluated is never silent.
-                for r in results:
-                    if not r.passed or r.severity == "warning":
-                        logger.warning(f"    └─ {r.check_name}: {r.message}")
+                # should_halt_trading() logs CRITICAL itself, before this point
+                # and independently of whether the Telegram send below succeeds.
+                if audit.should_halt_trading():
+                    self.trading_halted = True
 
                 audit.send_alerts()
 
-                if audit.should_halt_trading():
-                    self.trading_halted = True
-                    logger.error(f"TRADING HALTED: critical audit failure in {dataset}")
-
             except Exception as e:
-                logger.warning(f"Audit failed for {dataset}: {e}")
+                logger.error(f"Audit failed for {dataset}: {e}", exc_info=True)
                 all_passed = False
 
         if not all_passed and not self.dry_run:
@@ -218,8 +284,6 @@ class NightlyPipeline:
 
     def _report_stage(self) -> None:
         """Generate report."""
-        logger.info("\n[REPORT STAGE] Generating report...")
-
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
 
         print("\nDataset Summary:")

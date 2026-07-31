@@ -653,8 +653,126 @@ marginal effect and performance at 2x costs. It prints what it is *not*: full
 sample numbers are labelled as not-evidence, and synthetic-mode results carry a
 reminder that reversion was baked in by construction.
 
+### The Phase 5 signal set
+
+Five signals joined `markov_mean_reversion`, each with its methodology doc
+written first. What is worth recording is not the formulas — those are in the
+docs — but the three structural decisions they forced:
+
+**One shared point-in-time reader, not five.** `signals/bars.py` owns
+read-through-context → latest-ingestion-per-`(asset, bar)` → gap-free tail,
+plus the numeric primitives (`trailing_return`, `log_returns`,
+`realized_vol`). Five copies of that pipeline would be five chances to get the
+point-in-time boundary or the duplicate collapse subtly wrong, in code where
+being wrong looks like a slightly better backtest rather than like an error.
+`signals/panel.py`'s `CachedClosePanel` stays separate: it is a sweep-time
+optimization over one signal's parameters, not the production read path.
+
+**`time_series_momentum` standardizes without demeaning.** Cross-sectional
+z-scoring subtracts the universe mean, which for a time-series signal is
+precisely the market-wide trend it exists to express: if every asset has
+trended up, a demeaned score says "no view". `signals/transforms.py` therefore
+grew `cross_sectional_scale` (winsorize, then divide by the cross-sectional
+standard deviation, keeping the mean). Two consequences are accepted
+deliberately: a book weighted by these score *levels* is not dollar-neutral,
+and the engine's rank IC is invariant to the whole choice — ranking discards
+both location and scale — so the IC series cannot detect getting this wrong.
+Only a test can, and one does.
+
+**One volatility estimator for the whole project.** `low_volatility` exports
+`annualized_vol_universe`, and `signals/alpha.py` consumes exactly it rather
+than defining its own. A second, subtly different volatility estimate
+elsewhere in the codebase is how two parts of a system come to disagree about
+risk without anyone noticing.
+
+`carry` is the only signal that does not read `ohlcv_daily`, which is both its
+main contribution to breadth (its errors have a different source) and its main
+limitation: funding exists on perpetuals only, so a universe member without a
+perp listing scores `None` at every rebalance rather than occasionally. Its
+sign is pinned by an explicit golden test, because a carry signal negated twice
+looks like a working momentum signal for a while.
+
+### Alpha refinement: where the humility goes
+
+`signals/alpha.py` implements Grinold–Kahn's `alpha = volatility × IC × z`. The
+interesting part is the IC, not the product. A raw in-sample mean IC is
+optimistic — measured on the data the parameters were chosen against, and
+carrying an estimation error that only shrinks as `1/√n` — so `estimate_ic`
+reports the raw mean *and* a shrunk value, and every consumer uses the shrunk
+one.
+
+Shrinkage is normal-normal: with a prior `IC ~ N(0, τ²)` and an observed mean
+whose standard error is `se = ic_std/√n`,
+
+    shrunk = mean_ic × τ² / (τ² + se²)
+
+τ defaults to 0.02, which encodes "a genuine crypto signal is small" (§6
+principle: shrink hard; the methodology template puts a real signal at
+0.02–0.05) rather than an expectation of skill. The result is clipped at
+`max_abs_ic = 0.10` — a guard against a short lucky sample, not part of the
+Bayesian story. An estimate resting on fewer than two observations is shrunk to
+exactly zero: one period cannot separate skill from luck, and its standard
+error is undefined.
+
+`combine_alphas` sums per-signal alphas, and a signal with no view contributes
+nothing rather than pulling the sum toward zero — which is the entire reason
+`None` exists instead of `0.0`. The consequence is that an asset carried by one
+signal keeps that signal's full alpha, so the per-asset **view count** is
+returned alongside: a portfolio that wants corroboration before sizing has the
+information to require it.
+
+### Breadth: two correlations, not one
+
+`signals/breadth.py` answers §6 principle 3 ("five correlated signals are one
+bet") with two different numbers, because they answer different questions:
+
+- **Score correlation** — per rebalance, the rank correlation between two
+  signals' cross-sections, averaged over rebalances. Do they *pick the same
+  assets*? This is what decides whether a new signal is a rotation of an
+  existing one. Computed per date and then averaged, not pooled: pooling lets
+  the level differences between dates dominate a number that is supposed to be
+  about relative ranking.
+- **IC correlation** — the correlation of two signals' IC *time series*. Do
+  they *work at the same times*? Two signals can pick entirely different assets
+  and still be one bet if they both stop working in the same regime, and a
+  portfolio built on score correlation alone would not see that coming.
+
+`effective_breadth` converts the mean **absolute** pairwise correlation into an
+independent-bet count, `n / (1 + (n-1)ρ̄)` — absolute because two signals that
+reliably disagree are as redundant as two that agree, just sign-flipped.
+`ScoreRecorder` wraps the signal functions the engine already calls once per
+rebalance for its IC series, so collecting the scores costs one pass rather
+than two.
+
+`signals/` still imports nothing from `backtest/`, so the rank correlation here
+is a small local implementation rather than a reuse of
+`backtest.metrics.spearman_ic`; a test asserts the two agree over random cases.
+
+### What Phase 5 deliberately did *not* produce
+
+Section 5 (backtest evidence) and Section 6 (measured breadth) of all six
+methodology docs are empty, and every signal's status is `draft`. There is no
+multi-year backfill in the repository, and a backtest on synthetic data
+measures the generator rather than the signal. The scratch demo makes this
+concrete: on synthetic bars `cross_sectional_momentum` and
+`time_series_momentum` score-correlate at 0.86, which is a plausible finding
+about two signals that share a formation window — and still not evidence,
+because the generator produced both series. Filling those sections needs
+`python -m pipeline.nightly --start <5y ago>` against a real venue, and until
+then the honest description of Phase 5 is "implemented and tested", not
+"working".
+
 ### Testing Coverage (Phase 5)
 
+- `tests/test_signals_phase5.py`: 124 tests — a hand-computed golden fixture
+  per signal (formation return, realized volatility, funding average, and the
+  final score, all derived in the test class's docstring), `carry`'s sign
+  asserted explicitly, the property that `cross_sectional_scale` preserves a
+  market-wide tilt where a z-score destroys it, point-in-time through a real
+  store in both pit modes, every reject path returning `None`, the shared
+  series reader's gap and duplicate handling, IC shrinkage behaviour
+  (noisier and shorter series shrink harder; one period shrinks to zero), and
+  the breadth machinery including that its Spearman matches the engine's
 - `tests/test_signal_markov_mean_reversion.py`: 68 tests — a golden 10-bar
   fixture with every return, z-score, quantile cutoff, state, transition row,
   midpoint and the final score derived by hand in the test docstring;
@@ -735,6 +853,26 @@ per-module retrofit map.
   methodology-doc check) at INFO. `markov_mean_reversion`'s reject paths
   (`None` returns) log at DEBUG per asset — high-volume, so kept below INFO.
 
+### Two things the design did not anticipate
+
+Both surfaced on contact with the real source and are recorded in `LOGGING.md`
+§6 as deviations rather than quietly implemented differently:
+
+- **There is no "no-overwrite guard" to log before.** The retrofit map said the
+  guard "logs at WARNING before it raises", but `ParquetStore.append` has no
+  such check — it never overwrites, it writes `data_0001.parquet` beside
+  `data_0000.parquet`. That path is not an error and logs DEBUG (worth seeing:
+  a partition that keeps growing means re-fetched history). The *schema* check,
+  which does raise, logs WARNING first.
+- **`AssetMaster.resolve_symbol` needed an opt-out.** Logging every unresolved
+  symbol at WARNING is right for the loaders — an unresolved symbol silently
+  drops that asset's rows, and otherwise surfaces downstream as an
+  unexplained audit coverage miss. But `NightlyPipeline._populate_asset_master`
+  calls the same method to ask "is this symbol already mapped?", and on a first
+  run every symbol on the venue would log a warning. Hence
+  `warn_if_unresolved: bool = True` — additive, and the one place absence is
+  the expected answer passes `False`.
+
 ### Testing
 
 `caplog`-based tests assert a CRITICAL record is emitted on every halt path and
@@ -744,9 +882,18 @@ only backups older than the retention window and never touches the live file.
 Log message text itself isn't asserted beyond that — brittle and not the
 point.
 
+One test earns its place beyond the spec's list: the rotation namer's output is
+fed to the pruner's glob and asserted to match. Rotation and retention are
+deliberately decoupled mechanisms (§3.2), which means nothing else forces them
+to agree on the backup filename format — and if they ever disagree, retention
+silently never runs, with no symptom until the disk fills.
+
 ### Status
 
-This phase is designed and specified (this document, `LOGGING.md`,
-`logging_config.py`); the actual retrofit into `datastore/`, `loaders/`,
-`audit/`, `universe/`, `backtest/`, and `signals/` source has not been applied
-yet — see `TODO.md` Phase 5.5.
+Applied. `datastore/`, `loaders/`, `audit/`, `universe/`, `backtest/`,
+`signals/` and `pipeline/` all log through `logging_config.get_logger`;
+`prune_old_logs()` runs as the nightly pipeline's final step (in a `finally`,
+so a failed run still prunes) and standalone via
+`python -m pipeline.prune_logs`. `risk/`, `portfolio/`, `execution/` and
+`attribution/` have their log files reserved and build logging in as they are
+written (Phases 6-9).

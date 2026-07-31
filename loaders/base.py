@@ -1,6 +1,6 @@
 """Base loader class and utilities for all data loaders."""
 
-import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -11,9 +11,10 @@ import polars as pl
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster, DatasetSchema
 from loaders.window import FetchWindow
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Perpetual swaps are quoted with a settle suffix in ccxt's unified notation
 # ("BTC/USDT:USDT"); dated futures carry an expiry after it
@@ -209,6 +210,16 @@ class BaseLoader(ABC):
             except Exception as e:
                 logger.warning(f"Failed to resolve {symbol}@{self.venue}: {e}")
                 result[symbol] = None
+
+        unresolved = [s for s, asset_id in result.items() if asset_id is None]
+        if unresolved:
+            # Every unresolved symbol is an asset whose rows will be dropped, so
+            # the count is the difference between what was fetched and what will
+            # be stored — the number that explains an audit coverage miss.
+            logger.warning(
+                f"{len(unresolved)} of {len(symbols)} {self.venue} symbols unresolved; "
+                f"their rows will be dropped (first few: {unresolved[:5]})"
+            )
         return result
 
     def add_timestamps(
@@ -253,19 +264,26 @@ class BaseLoader(ABC):
     ) -> None:
         """Validate and append data to datastore.
 
+        The one place a loader's write can fail, so it is where the failure is
+        recorded: an ERROR here, and the exception re-raised for the caller
+        (`BackfillRunner` treats a per-dataset failure as non-fatal and moves
+        on, which is only safe because the failure is in the log).
+
         Args:
             dataset: Dataset name (e.g., "ohlcv_daily")
             df: DataFrame with data
             schema: DatasetSchema to validate against
         """
+        started = time.monotonic()
         try:
             self.store.append(dataset, df, schema)
             logger.info(
-                f"Appended {len(df)} rows to {dataset}; "
-                f"rows have asset_ids from {df['asset_id'].unique()}"
+                f"Appended {len(df)} rows to {dataset} in "
+                f"{time.monotonic() - started:.2f}s; "
+                f"{df['asset_id'].n_unique()} unique asset_ids"
             )
         except Exception as e:
-            logger.error(f"Failed to append to {dataset}: {e}")
+            logger.error(f"Failed to append {len(df)} rows to {dataset}: {e}", exc_info=True)
             raise
 
     def run(self, schema: DatasetSchema, dataset: str) -> int:
@@ -278,9 +296,16 @@ class BaseLoader(ABC):
         Returns:
             Number of rows appended
         """
-        logger.info(f"Starting {self.__class__.__name__} for {self.venue}")
+        logger.info(f"Starting {self.__class__.__name__} for {self.venue} -> {dataset}")
+        started = time.monotonic()
+
         df = self.fetch()
-        logger.info(f"Fetched {len(df)} rows")
+        fetched_at = time.monotonic()
+        logger.info(f"Fetched {len(df)} rows in {fetched_at - started:.2f}s")
+
         self.append(dataset, df, schema)
-        logger.info(f"Completed {self.__class__.__name__}")
+        logger.info(
+            f"Completed {self.__class__.__name__} for {dataset}: {len(df)} rows in "
+            f"{time.monotonic() - started:.2f}s"
+        )
         return len(df)

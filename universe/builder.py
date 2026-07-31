@@ -10,7 +10,6 @@ asset ever considered (not just members) so downstream code can see why an
 asset was excluded and measure turnover over time.
 """
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -18,9 +17,14 @@ import polars as pl
 
 from config import DATASTORE_PATH, UNIVERSE_CONFIG, UniverseConfig
 from datastore import ParquetStore, latest_per_bar
+from logging_config import get_logger
 from universe.schema import UNIVERSE_SCHEMA
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+_TURNOVER_LOOKBACK_DAYS = 30
+"""How far back `build_and_store` looks for a previous snapshot to log turnover
+against. Bounds a read that happens on every build and feeds only a log line."""
 
 _EMPTY_VOLUME_SCHEMA = {"asset_id": pl.Utf8, "dollar_volume_median": pl.Float64}
 _EMPTY_AGE_SCHEMA = {"asset_id": pl.Utf8, "listing_age_days": pl.Int64}
@@ -208,11 +212,74 @@ class UniverseBuilder:
 
         self.store.append("universe", df, UNIVERSE_SCHEMA)
         n_members = int(df["in_universe"].sum())
+        event_date = df["event_ts"][0].date()
         logger.info(
             f"Universe built: {n_members}/{len(df)} assets in universe "
-            f"as of {df['event_ts'][0].date()}"
+            f"as of {event_date}"
         )
+
+        # The exclusion breakdown is what makes a membership change explicable
+        # after the fact: "150 members" says nothing, "30 fewer because 30 more
+        # fell below min_volume_usdt" says what happened.
+        excluded = (
+            df.filter(pl.col("exclusion_reason").is_not_null())
+            .group_by("exclusion_reason")
+            .len()
+            .sort("exclusion_reason")
+        )
+        if len(excluded):
+            breakdown = ", ".join(
+                f"{row['exclusion_reason']}={row['len']}"
+                for row in excluded.iter_rows(named=True)
+            )
+            logger.info(f"Universe {event_date} exclusions: {breakdown}")
+
+        previous = self._previous_snapshot(event_date)
+        if previous is not None:
+            logger.info(
+                f"Universe {event_date} turnover vs {previous[0]}: "
+                f"{compute_turnover(previous[1], df):.1%}"
+            )
         return df
+
+    def _previous_snapshot(self, event_date) -> Optional[tuple[object, pl.DataFrame]]:
+        """The most recent stored snapshot before `event_date`, for turnover.
+
+        Best-effort and never fatal: turnover is an observability nicety, and a
+        store that cannot answer must not break a universe build.
+
+        Read as of `event_date` (the snapshot's own date), so the comparison is
+        against what was knowable then rather than against a snapshot written
+        later — the same point-in-time rule the build itself follows. One
+        consequence: a research rebuild of history, whose snapshots all share
+        today's `ingested_ts`, finds no prior snapshot and simply logs no
+        turnover line. That is the right answer, not a gap.
+
+        The read is bounded to a month of ingestion partitions, because this
+        runs on every build and exists only to produce a log line; a store with
+        years of daily snapshots should not be scanned in full for it.
+        """
+        lookback_start = event_date - timedelta(days=_TURNOVER_LOOKBACK_DAYS)
+        try:
+            df = self.store.read(
+                "universe",
+                date_range=(lookback_start.isoformat(), event_date.isoformat()),
+                asof=event_date.isoformat(),
+            )
+        except Exception as e:
+            logger.debug(f"No previous universe snapshot for turnover: {e}")
+            return None
+
+        if len(df) == 0:
+            return None
+        if "venue" in df.columns:
+            df = df.filter(pl.col("venue") == self.venue)
+        df = df.filter(pl.col("event_ts").dt.date() < event_date)
+        if len(df) == 0:
+            return None
+
+        latest = df["event_ts"].max()
+        return latest.date(), df.filter(pl.col("event_ts") == latest)
 
 
 def compute_turnover(before: pl.DataFrame, after: pl.DataFrame) -> float:

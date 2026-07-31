@@ -12,14 +12,15 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field, asdict
-import logging
 
 import polars as pl
 from polars import Schema
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-logger = logging.getLogger(__name__)
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -110,6 +111,15 @@ class ParquetStore:
             file_num = len(existing_files)
             file_path = part_path / f"data_{file_num:04d}.parquet"
 
+            if existing_files:
+                # Not an error, and not an overwrite: the partition already holds
+                # data, so this write lands in a new file beside it. Logged so a
+                # partition that keeps growing (re-fetched history) is visible.
+                logger.debug(
+                    f"{dataset}/date={part_date} already has {len(existing_files)} "
+                    f"file(s); appending {file_path.name} beside them"
+                )
+
             # Write without overwriting
             part_df.write_parquet(file_path)
             logger.info(
@@ -140,6 +150,11 @@ class ParquetStore:
         """
         dataset_path = self.root / dataset
         if not dataset_path.exists():
+            # DEBUG, not WARNING: callers routinely probe for a dataset that does
+            # not exist yet (the audit's first-ever run, an optional dataset a
+            # signal does not require) and catch this. The caller decides whether
+            # a missing dataset is a problem; the store does not.
+            logger.debug(f"Dataset {dataset} not found at {dataset_path}")
             raise FileNotFoundError(f"Dataset {dataset} not found at {dataset_path}")
 
         # Normalize date_range endpoints to "YYYY-MM-DD" strings. Callers may pass
@@ -184,7 +199,18 @@ class ParquetStore:
             asof_dt = datetime.strptime(asof, "%Y-%m-%d")
             # Add one day to include all events on that date
             asof_dt_end = asof_dt + timedelta(days=1)
+            before = len(result)
             result = result.filter(pl.col("ingested_ts") < asof_dt_end)
+            logger.debug(
+                f"Read {dataset}: {len(result)} of {before} rows survive "
+                f"ingested_ts <= {asof} across {len(partitions)} partition(s)"
+            )
+        else:
+            # DEBUG because the backtester reads inside a per-rebalance loop; at
+            # INFO a multi-year run would bury every other line in the file.
+            logger.debug(
+                f"Read {dataset}: {len(result)} rows across {len(partitions)} partition(s)"
+            )
 
         return result
 
@@ -237,6 +263,10 @@ class ParquetStore:
         # Check required columns exist
         for col_name, col_type in schema.fields.items():
             if col_name not in df_schema:
+                logger.warning(
+                    f"Rejecting append to {schema.name}: missing required column "
+                    f"'{col_name}' (got {sorted(df_schema.keys())})"
+                )
                 raise ValueError(
                     f"Missing required column '{col_name}' in {schema.name}"
                 )
@@ -247,6 +277,10 @@ class ParquetStore:
                     str(col_type).startswith("Datetime")
                     and str(df_schema[col_name]).startswith("Datetime")
                 ):
+                    logger.warning(
+                        f"Rejecting append to {schema.name}: column '{col_name}' has "
+                        f"type {df_schema[col_name]}, expected {col_type}"
+                    )
                     raise ValueError(
                         f"Column '{col_name}' has type {df_schema[col_name]}, "
                         f"expected {col_type}"

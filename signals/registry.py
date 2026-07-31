@@ -18,6 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import PROJECT_ROOT
+from logging_config import get_logger
+
+log = get_logger(__name__)
 
 SignalScores = Mapping[str, float | None]
 SignalFn = Callable[..., SignalScores]
@@ -81,17 +84,25 @@ def register(
         raise ValueError(f"Unknown signal family {family!r}; expected one of {FAMILIES}")
 
     doc = methodology or methodology_path(signal_id)
+    doc_label = doc.relative_to(PROJECT_ROOT) if doc.is_relative_to(PROJECT_ROOT) else doc
     if not doc.exists():
+        log.warning(
+            "Refusing to register %r: no methodology doc at %s", signal_id, doc_label
+        )
         raise ValueError(
             f"Signal {signal_id!r} has no methodology doc at "
-            f"{doc.relative_to(PROJECT_ROOT) if doc.is_relative_to(PROJECT_ROOT) else doc}; "
-            "write the doc before registering the signal"
+            f"{doc_label}; write the doc before registering the signal"
         )
 
+    replaced = signal_id in _REGISTRY
     signal = Signal(
         signal_id=signal_id, family=family, score_fn=score_fn, methodology=doc, params=params
     )
     _REGISTRY[signal_id] = signal
+    log.info(
+        "Registered signal %s (family=%s, doc=%s)%s",
+        signal_id, family, doc_label, " [replacing existing]" if replaced else "",
+    )
     return signal
 
 

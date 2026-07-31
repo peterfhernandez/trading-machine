@@ -1,16 +1,17 @@
 """
 Central logging configuration for the Poor Man's Trading Machine.
 
-Reference implementation for the design in LOGGING.md. Every module gets a
-logger through `get_logger(__name__)`. One rotating, JSON-structured file per
-pipeline component lives under `LOG_CONFIG.dir` (10 MB rotation); a separate,
+Implements the design in LOGGING.md. Every module gets a logger through
+`get_logger(__name__)`. One rotating, JSON-structured file per pipeline
+component lives under `LOG_CONFIG.dir` (10 MB rotation); a separate,
 time-based mechanism (`prune_old_logs`) enforces 12-month retention on the
 rotated backups, decoupled from the size-triggered rotation itself — see
 LOGGING.md section 3.2 for why those two are not the same knob.
 
-This file has not yet been wired into datastore/, loaders/, audit/,
-universe/, backtest/, or signals/ — see TODO.md Phase 5.5 for the retrofit
-checklist and LOGGING.md section 6 for the per-module map.
+Wired into `datastore/`, `loaders/`, `audit/`, `universe/`, `backtest/`,
+`signals/` and `pipeline/` as of Phase 5.5; `risk/`, `portfolio/`,
+`execution/` and `attribution/` have files reserved and build logging in as
+they are written (Phases 6-9).
 
 Usage:
 
@@ -192,18 +193,34 @@ def get_logger(name: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 
+BACKUP_GLOB = "*.log.*.log"
+"""Rotated backups only. The live `<component>.log` cannot match this pattern,
+which is what keeps pruning from deleting the file a handler is writing to."""
+
+
+def expired_log_backups(cfg=LOG_CONFIG, now: float | None = None) -> list[Path]:
+    """Rotated backups older than `cfg.retention_days`, oldest first.
+
+    Split out from `prune_old_logs` so the standalone entry point
+    (`python -m pipeline.prune_logs --dry-run`) can show what would be deleted
+    without deleting it — and so the two can never disagree about which files
+    are expired.
+    """
+    now = now if now is not None else time.time()
+    cutoff = now - cfg.retention_days * 86400
+    if not cfg.dir.exists():
+        return []
+    expired = [p for p in cfg.dir.glob(BACKUP_GLOB) if p.stat().st_mtime < cutoff]
+    return sorted(expired, key=lambda p: p.stat().st_mtime)
+
+
 def prune_old_logs(cfg=LOG_CONFIG, now: float | None = None) -> list[Path]:
     """Delete rotated log backups older than cfg.retention_days. Only matches
     the timestamped backup pattern (*.log.<stamp>.log), so the live,
     currently-written *.log file is never touched. Returns the deleted paths
     so callers can log the action and tests can assert on it."""
-    now = now if now is not None else time.time()
-    cutoff = now - cfg.retention_days * 86400
     deleted: list[Path] = []
-    if not cfg.dir.exists():
-        return deleted
-    for path in cfg.dir.glob("*.log.*.log"):
-        if path.stat().st_mtime < cutoff:
-            path.unlink()
-            deleted.append(path)
+    for path in expired_log_backups(cfg, now):
+        path.unlink()
+        deleted.append(path)
     return deleted
