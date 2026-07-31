@@ -29,6 +29,7 @@ substitute.
 | Security matching team | CUSIP/SEDOL/Bloomberg mapping | Asset master table mapping exchange symbols → canonical internal ID (still essential — BTC is `XBT` on some venues, tickers get delisted/renamed) |
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
+| Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
 
 ## 3. Architecture (the whiteboard)
 
@@ -70,7 +71,7 @@ substitute.
               │ ATTRIBUTION         │     signal research
               └─────────────────────┘
 
-  Cross-cutting: BACKTESTER (walk-forward, point-in-time), CONFIG, ALERTS
+  Cross-cutting: BACKTESTER (walk-forward, point-in-time), CONFIG, ALERTS, LOGGING
 ```
 
 ## 4. Modules
@@ -79,6 +80,12 @@ Each module is a Python package with a narrow public interface, its own tests,
 and scratch scripts. Nothing imports "sideways" — everything communicates
 through the parquet store and typed dataclasses. That is what makes the build
 order below possible.
+
+Two pieces of infrastructure are cross-cutting rather than sequential:
+`config` (already central to every module) and `logging_config` (every module
+below calls `get_logger(__name__)` to get a per-component rotating logger; the
+full design, rotation/retention mechanism, and per-module retrofit map are in
+[`LOGGING.md`](LOGGING.md)).
 
 ### M1 `datastore` — parquet store + asset master
 
@@ -178,6 +185,8 @@ order below possible.
 - **cvxpy** for the optimizer (v2), **scikit-learn** only for regressions/shrinkage.
 - **ccxt** for exchange data/execution abstraction; Deribit API where richer.
 - **pytest** everywhere; **APScheduler** (or cron) for the pipeline.
+- **Python stdlib `logging`**, rotating per-component JSON files under `logs/`,
+  for observability — see `LOGGING.md`.
 - No cloud, no Spark, no KDB, no Docker until something actually hurts.
   Upgrade triggers are listed in TODO.md Phase 9.
 
@@ -198,6 +207,10 @@ order below possible.
    fiction; the audit module can halt the pipeline.
 7. **Factors decay.** Attribution feeds research; expect to retire and
    refurbish signals.
+8. **Observability by default.** Every module logs to its own rotating file
+   under `logs/`; alerts (Telegram) are for a human's attention right now,
+   logs are the durable record that lets an unattended run be reconstructed
+   afterward. See `LOGGING.md`.
 
 ## 7. What we deliberately skip
 
@@ -236,6 +249,11 @@ All three loaders (OHLCV, funding rate, open interest) inherit from
 
 This eliminates code duplication and enforces the point-in-time pattern
 consistently across all three loaders.
+
+> **Phase 5.5 note:** "error logging" above was, until Phase 5.5, an
+> unspecified phrase — nothing wrote to `LOGS_PATH`. See the Phase 5.5
+> Implementation Notes below and `LOGGING.md` for what the append wrapper now
+> actually logs.
 
 ### Market Types & Symbol Budget
 
@@ -366,6 +384,13 @@ Each check returns an `AuditResult` with severity ("info", "warning", "error").
 Critical errors set `should_halt_trading() = True`, halting the pipeline.
 Telegram alerts are sent for any failed checks (configurable; requires
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` env vars).
+
+> **Phase 5.5 note:** as of Phase 5.5, a halt (`should_halt_trading() ==
+> True`) is also always logged at CRITICAL in `logs/audit.log`, written before
+> the Telegram send is attempted — so the halt has a durable record even if
+> the alert doesn't go out. `AuditResult` severity stays exactly as
+> documented here; it is a data-quality taxonomy, not an application log
+> level. See `LOGGING.md` §2 for the distinction.
 
 ### Nightly Pipeline: Load → Audit → Report
 
@@ -642,3 +667,86 @@ Most tests run in well under 100ms. A handful of store-backed ones take 100-200m
 because a signal needs at least ten bars of history and each date partition is a
 separate parquet file; the one that runs two full backtests to compare read paths
 is marked `integration`.
+
+---
+
+## Phase 5.5 Implementation Notes (Logging & Observability Retrofit)
+
+### Why this phase exists
+
+Phases 1-5 were built and tested without a logging story: `LOGS_PATH` existed
+in `config.py` but nothing wrote to it, and §3's cross-cutting list named
+CONFIG and ALERTS but not logging. Telegram alerts cover audit threshold
+breaches, execution drift, and the kill switch — nothing else. A failure
+inside, say, the backtester or a signal during an unattended nightly run had
+no durable record. Phase 5.5 closes that gap before Phase 6 adds more
+unattended-running modules (risk, portfolio, execution) on top of it. Full
+design in [`LOGGING.md`](LOGGING.md); this section is a summary plus the
+per-module retrofit map.
+
+### Design summary
+
+- One rotating JSON log file per component under `logs/` (`pipeline.log`,
+  `datastore.log`, `loaders.log`, `audit.log`, `universe.log`, `backtest.log`,
+  `signals.log`, plus `risk.log` / `portfolio.log` / `execution.log` /
+  `attribution.log` reserved for Phases 6-9), each capped at 10 MB via
+  `RotatingFileHandler`.
+- Retention (12 months) is handled separately from rotation: rotated backups
+  are named with a UTC timestamp at rotation time, not a bare numeric suffix,
+  and `prune_old_logs()` deletes any backup older than 365 days. Size-triggered
+  rotation and calendar-based retention are different mechanisms and don't
+  compose cleanly through `backupCount` alone.
+- Every log record carries a `run_id`, set once at the top of a pipeline
+  invocation, so one nightly run's activity can be traced across all eleven
+  log files.
+- Logs, Telegram alerts, attribution reports, and `AuditResult` severities are
+  four distinct concerns that were previously conflated: logs are the
+  always-written technical record; alerts are real-time human notification
+  (audit halts, drift, kill switch); reports are the daily business summary;
+  `AuditResult` severity is a data-quality taxonomy internal to the audit
+  module. A halt or alert is now always backed by a CRITICAL log line, so the
+  log doesn't depend on the Telegram send succeeding.
+- Reference implementation: `logging_config.py` (`get_logger`,
+  `configure_logging`, `set_run_id`/`get_run_id`, `prune_old_logs`).
+
+### Retrofit map — Phases 1-4 and current Phase 5 work
+
+- **Datastore (M1):** `ParquetStore.append`/`.read` log row counts, dataset,
+  and partition at INFO/DEBUG; the no-overwrite guard logs at WARNING before
+  raising. `AssetMaster` symbol resolution logs unresolved symbols at WARNING
+  rather than only raising.
+- **Loaders/audit (M2/M3):** `BaseLoader`'s append wrapper — currently
+  described only as "error logging" — becomes a proper INFO (stage timings,
+  record counts) / ERROR (raised exceptions, still non-fatal per the nightly
+  pipeline's stage handling) pair. `BackfillRunner` logs checkpoint save/load
+  at DEBUG and resumption points at INFO. `DataAudit` logs each of the five
+  checks' verdicts (INFO for pass, WARNING/ERROR per severity) and logs
+  CRITICAL immediately before `should_halt_trading()` trips — independent of
+  whether the Telegram send succeeds. `NightlyPipeline` logs stage entry/exit
+  and duration for load/audit/report, and calls `prune_old_logs()` as its
+  final step.
+- **Universe (M4):** `UniverseBuilder.build_and_store` logs snapshot size,
+  exclusion breakdown, and turnover at INFO.
+- **Backtester (M5):** `Backtester.run` logs a per-run summary (date range,
+  universe size, final metrics) at INFO; per-rebalance detail is available at
+  DEBUG for research use, off by default so backtests over long histories
+  don't flood the log.
+- **Signals (M6, in progress):** `signals.register` logs registration (and the
+  methodology-doc check) at INFO. `markov_mean_reversion`'s reject paths
+  (`None` returns) log at DEBUG per asset — high-volume, so kept below INFO.
+
+### Testing
+
+`caplog`-based tests assert a CRITICAL record is emitted on every halt path and
+on any per-stage unhandled exception, and a dedicated test for
+`prune_old_logs()` (fabricated file ages under `tmp_path`) confirms it deletes
+only backups older than the retention window and never touches the live file.
+Log message text itself isn't asserted beyond that — brittle and not the
+point.
+
+### Status
+
+This phase is designed and specified (this document, `LOGGING.md`,
+`logging_config.py`); the actual retrofit into `datastore/`, `loaders/`,
+`audit/`, `universe/`, `backtest/`, and `signals/` source has not been applied
+yet — see `TODO.md` Phase 5.5.
