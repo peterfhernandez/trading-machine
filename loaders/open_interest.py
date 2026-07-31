@@ -132,11 +132,13 @@ class OpenInterestLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} OI snapshots; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run(self) -> None:
-        """Fetch and append open interest."""
+    def run(self) -> int:
+        """Fetch and append open interest. Returns the number of rows appended."""
         df = self.fetch()
-        if len(df) > 0:
-            self.append("open_interest", df, OPEN_INTEREST_SCHEMA)
+        if len(df) == 0:
+            return 0
+        self.append("open_interest", df, OPEN_INTEREST_SCHEMA)
+        return len(df)
 
 
 def load_open_interest(venue: str = "binance", lookback_days: int = 30) -> None:

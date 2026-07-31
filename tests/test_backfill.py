@@ -86,24 +86,16 @@ class TestBackfillRunner:
     ):
         """Test running backfill with mocked loaders."""
         mock_ohlcv = MagicMock()
-        mock_ohlcv.fetch.return_value = MagicMock(
-            __len__=MagicMock(return_value=10),
-            __bool__=MagicMock(return_value=True),
-        )
+        mock_ohlcv.run_daily.return_value = 10
+        mock_ohlcv.run_hourly.return_value = 24
         mock_ohlcv_class.return_value = mock_ohlcv
 
         mock_fr = MagicMock()
-        mock_fr.fetch.return_value = MagicMock(
-            __len__=MagicMock(return_value=5),
-            __bool__=MagicMock(return_value=True),
-        )
+        mock_fr.run.return_value = 5
         mock_fr_class.return_value = mock_fr
 
         mock_oi = MagicMock()
-        mock_oi.fetch.return_value = MagicMock(
-            __len__=MagicMock(return_value=5),
-            __bool__=MagicMock(return_value=True),
-        )
+        mock_oi.run.return_value = 5
         mock_oi_class.return_value = mock_oi
 
         runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
@@ -115,7 +107,85 @@ class TestBackfillRunner:
         with open(checkpoint_file) as f:
             saved_checkpoint = json.load(f)
         assert "ohlcv_daily" in saved_checkpoint
+        assert "ohlcv_hourly" in saved_checkpoint
         assert "funding_rate" in saved_checkpoint
+        assert "open_interest" in saved_checkpoint
+
+    @patch("loaders.backfill.OHLCVLoader")
+    @patch("loaders.backfill.FundingRateLoader")
+    @patch("loaders.backfill.OpenInterestLoader")
+    def test_each_dataset_is_fetched_exactly_once(
+        self,
+        mock_oi_class,
+        mock_fr_class,
+        mock_ohlcv_class,
+        temp_store,
+        mock_asset_master,
+        checkpoint_dir,
+    ):
+        """Regression: the runner used to call fetch() to test for emptiness and
+        then run(), which fetched again -- pulling every symbol from the venue
+        twice per dataset, per run."""
+        mock_ohlcv = MagicMock()
+        mock_ohlcv.run_daily.return_value = 10
+        mock_ohlcv.run_hourly.return_value = 24
+        mock_ohlcv_class.return_value = mock_ohlcv
+
+        mock_fr = MagicMock()
+        mock_fr.run.return_value = 5
+        mock_fr_class.return_value = mock_fr
+
+        mock_oi = MagicMock()
+        mock_oi.run.return_value = 5
+        mock_oi_class.return_value = mock_oi
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(days_back=7)
+
+        assert mock_ohlcv.run_daily.call_count == 1
+        assert mock_ohlcv.run_hourly.call_count == 1
+        assert mock_fr.run.call_count == 1
+        assert mock_oi.run.call_count == 1
+        # No separate probe fetch on any loader
+        assert mock_ohlcv.fetch.call_count == 0
+        assert mock_fr.fetch.call_count == 0
+        assert mock_oi.fetch.call_count == 0
+
+    @patch("loaders.backfill.OHLCVLoader")
+    @patch("loaders.backfill.FundingRateLoader")
+    @patch("loaders.backfill.OpenInterestLoader")
+    def test_empty_run_does_not_checkpoint(
+        self,
+        mock_oi_class,
+        mock_fr_class,
+        mock_ohlcv_class,
+        temp_store,
+        mock_asset_master,
+        checkpoint_dir,
+    ):
+        """A loader that appended nothing must not advance its checkpoint."""
+        mock_ohlcv = MagicMock()
+        mock_ohlcv.run_daily.return_value = 0
+        mock_ohlcv.run_hourly.return_value = 0
+        mock_ohlcv_class.return_value = mock_ohlcv
+
+        mock_fr = MagicMock()
+        mock_fr.run.return_value = 0
+        mock_fr_class.return_value = mock_fr
+
+        mock_oi = MagicMock()
+        mock_oi.run.return_value = 3
+        mock_oi_class.return_value = mock_oi
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(days_back=7)
+
+        with open(checkpoint_dir / "binance_backfill.json") as f:
+            saved_checkpoint = json.load(f)
+
+        assert "ohlcv_daily" not in saved_checkpoint
+        assert "ohlcv_hourly" not in saved_checkpoint
+        assert "funding_rate" not in saved_checkpoint
         assert "open_interest" in saved_checkpoint
 
     def test_backfill_runner_multiple_venues(self, temp_store, mock_asset_master, checkpoint_dir):

@@ -175,3 +175,34 @@ class TestOHLCVLoader:
         assert all(df["open"] == 42000.0)
         assert all(df["high"] == 42100.0)
         assert all(df["low"] == 41900.0)
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_run_daily_and_hourly_return_rows_appended(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """The backfill runner uses these counts instead of a second fetch()."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OHLCVLoader(
+            "binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master
+        )
+        daily = loader.run_daily()
+        hourly = loader.run_hourly()
+
+        assert daily > 0
+        assert hourly > 0
+        assert temp_store.dataset_info("ohlcv_daily")["row_count"] == daily
+        assert temp_store.dataset_info("ohlcv_hourly")["row_count"] == hourly
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_run_returns_zero_when_nothing_fetched(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        mock_ccxt_binance.symbols = []
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OHLCVLoader(
+            "binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master
+        )
+
+        assert loader.run_daily() == 0

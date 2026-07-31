@@ -152,11 +152,13 @@ class FundingRateLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} funding rates; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run(self) -> None:
-        """Fetch and append funding rates."""
+    def run(self) -> int:
+        """Fetch and append funding rates. Returns the number of rows appended."""
         df = self.fetch()
-        if len(df) > 0:
-            self.append("funding_rate", df, FUNDING_RATE_SCHEMA)
+        if len(df) == 0:
+            return 0
+        self.append("funding_rate", df, FUNDING_RATE_SCHEMA)
+        return len(df)
 
 
 def load_funding_rates(venue: str = "binance", lookback_days: int = 30) -> None:

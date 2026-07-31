@@ -178,3 +178,26 @@ Legend: [ ] todo · [~] in progress · [x] done
   every run) and logs warning-severity checks so an unevaluated check is never
   silent. 263 tests passing; `scratch/scratch_perp_symbols.py` demos symbol
   selection and market types against a live venue.
+- 2026-07-31: Stopped the nightly run re-fetching and double-counting data.
+  (1) `BackfillRunner` called `loader.fetch()` to test for emptiness and then
+  `loader.run()`, which fetched again — every dataset was pulled from the venue
+  twice per run. The `run*()` methods now return the number of rows appended, so
+  the runner fetches once and checkpoints on the returned count. (2) The store is
+  append-only, so overlapping fetch windows, retried runs and vendor revisions
+  all store the same bar more than once; the backtester's price panel and the
+  signal panels already collapsed those to the latest ingestion, but the universe
+  builder and the audit did not. `datastore.latest_per_bar` now owns that
+  collapse (one implementation, previously duplicated in `backtest/engine.py` and
+  `signals/markov_mean_reversion.py`) and the universe builder applies it before
+  computing rolling median dollar volume — un-collapsed rows weighted the
+  duplicated stretch of history, always the most recent days, more heavily than
+  the rest, which silently moved universe membership. The audit gained a sixth
+  check, `duplicate_bars` (warning, never a halt), and runs every other check
+  against one row per bar, so a re-ingested bar no longer dilutes a null rate and
+  a revision is no longer read as a price jump. Ordering is the subtlety and is
+  documented: collapse *after* the point-in-time filter, never before. 292 tests
+  passing; `scratch/scratch_duplicate_bars.py` demos an overlapping window
+  end to end. Not addressed: the checkpoint file is still written but never read,
+  so the fetch window is still `days_back` from now on every run — real windowed
+  fetching needs `start`/`end` threaded through the loaders and, for funding rate
+  and open interest, ccxt's `*_history` calls.

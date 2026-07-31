@@ -127,17 +127,21 @@ class OHLCVLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} rows; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run_daily(self) -> None:
-        """Fetch and append daily OHLCV."""
+    def run_daily(self) -> int:
+        """Fetch and append daily OHLCV. Returns the number of rows appended."""
         df = self.fetch(timeframe="1d")
-        if len(df) > 0:
-            self.append("ohlcv_daily", df, OHLCV_SCHEMA)
+        if len(df) == 0:
+            return 0
+        self.append("ohlcv_daily", df, OHLCV_SCHEMA)
+        return len(df)
 
-    def run_hourly(self) -> None:
-        """Fetch and append hourly OHLCV."""
+    def run_hourly(self) -> int:
+        """Fetch and append hourly OHLCV. Returns the number of rows appended."""
         df = self.fetch(timeframe="1h")
-        if len(df) > 0:
-            self.append("ohlcv_hourly", df, OHLCV_SCHEMA)
+        if len(df) == 0:
+            return 0
+        self.append("ohlcv_hourly", df, OHLCV_SCHEMA)
+        return len(df)
 
 
 def load_ohlcv(venue: str = "binance", lookback_days: int = 365) -> None:

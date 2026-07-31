@@ -258,21 +258,53 @@ as audit coverage failures rather than as errors:
   `UNIVERSE_CONFIG.target_size` so the universe builder has more candidates than
   it keeps).
 
+### Duplicates Are a Read-Side Concern
+
+Append-only storage and de-duplication are the same design decision seen from
+two ends. The writer must never drop a row it was handed: a bar re-fetched with
+a different value is a *revision*, and the old value is exactly what a
+point-in-time backtest needs to see. So the store keeps both, and every reader
+that aggregates rows collapses each `(asset_id, event_ts)` to its latest
+ingestion — `datastore.latest_per_bar`, used by the backtester's price panel,
+the signal panels, the universe builder and the audit.
+
+The ordering constraint is the whole subtlety: **collapse after the point-in-time
+filter, never before**. Collapsing first lets a bar's later revision win, and the
+`ingested_ts <= asof` filter then drops it, silently hiding a bar that *was*
+knowable at `asof`. Readers that filter in memory per `asof` (the cached signal
+panel) therefore collapse per `asof` rather than calling the shared helper.
+
+Consequences worth stating: a rolling median over un-collapsed rows weights the
+duplicated stretch of history (always the most recent days, since that is what
+overlapping windows re-fetch) more heavily than the rest, which is how a
+duplicate silently changes universe membership. And a "price jump" between two
+ingestions of one bar is a revision, not a price move.
+
 ### Backfill Runner & Checkpoint Tracking
 
 The `BackfillRunner` orchestrates all three loaders in sequence (OHLCV →
 funding → OI) and persists checkpoint state (last_ingested_date per dataset)
-to JSON files. On retry, each loader resumes from its checkpoint rather than
-re-fetching from scratch. Checkpoints are venue-specific:
+to JSON files. Checkpoints are venue-specific:
 `data/checkpoints/binance_backfill.json`, etc.
 
-**Why:** Multi-year historical pulls can take hours or days. Checkpoints
-enable resumable, incremental backfills without duplicating data or
-wasting API quota.
+**Why:** Multi-year historical pulls can take hours or days. Checkpoints are
+meant to enable resumable, incremental backfills without re-fetching history
+already in the store.
 
-### Audit Module: Five Checks
+**Status — not there yet.** The checkpoint is *written* but never *read*: the
+fetch window is `days_back` counted back from now on every run, so a re-run
+re-fetches the whole window and the overlap is stored as duplicate bars (see
+above; readers collapse them). Closing that loop means threading real
+`start`/`end` dates through the loaders rather than a day count, and for funding
+rate and open interest it also means switching to ccxt's `*_history` calls —
+`fetch_funding_rate`/`fetch_open_interest` return only the current snapshot, so
+there is no window for them to honour today. Until then the runner does one
+fetch per dataset per run (it used to do two: `fetch()` to test for emptiness,
+then `run()`, which fetched again — the row count now comes back from the run).
 
-The `DataAudit` class runs five checks on each dataset:
+### Audit Module: Six Checks
+
+The `DataAudit` class runs six checks on each dataset:
 
 1. **data_presence:** Fails if no data exists anywhere in the lookback window
    (`AUDIT_CONFIG.audit_lookback_days`, default 7 days back from the audit date)
@@ -286,6 +318,14 @@ The `DataAudit` class runs five checks on each dataset:
    (`AUDIT_CONFIG.freshness_threshold_hours_by_dataset`, falling back to
    `freshness_threshold_hours` for any unlisted dataset)
 5. **price_outliers:** Detects suspicious price jumps (threshold: 10%)
+6. **duplicate_bars:** How many rows in the window repeat a bar already stored.
+   Never an error — re-ingestion is expected under append-only storage — but a
+   rate that climbs run over run means the loaders are re-fetching history the
+   store already has
+
+`duplicate_bars` is measured on the raw read; every other check then runs
+against `latest_per_bar(df)`, so a bar stored twice is not counted twice in a
+null rate, and a revision is not read as a price jump between two bars.
 
 `audit_dataset()` reads a bounded lookback window (not just the exact audit
 day) so data ingested late is correctly reported as **stale** (via the
@@ -329,12 +369,18 @@ never overwrite history.
 
 ### Testing Coverage (Phase 2)
 
-- `tests/test_ohlcv.py`: 8 tests (fetch, append, symbol resolution, golden fixture)
-- `tests/test_funding_rate.py`: 5 tests
-- `tests/test_open_interest.py`: 5 tests
-- `tests/test_backfill.py`: 6 tests (checkpoint save/load, resumability)
-- `tests/test_audit.py`: 9 tests (all five audit checks, halt logic)
-- `tests/test_nightly.py`: 8 tests (orchestration, dry-run, trading halt)
+- `tests/test_ohlcv.py`: 11 tests (fetch, append, symbol resolution and budget,
+  rows-appended return, golden fixture)
+- `tests/test_funding_rate.py`: 11 tests (incl. perp market type and fallback)
+- `tests/test_open_interest.py`: 11 tests (incl. perp market type and fallback)
+- `tests/test_backfill.py`: 8 tests (checkpoint save/load, one fetch per dataset)
+- `tests/test_audit.py`: 30 tests (all six checks, coverage denominator
+  resolution, duplicate handling, halt logic)
+- `tests/test_nightly.py`: 12 tests (orchestration, dry-run, trading halt,
+  asset master population across market types)
+- `tests/test_symbol_selection.py`: 10 tests (filter-before-cap, perp preference)
+- `tests/test_dedupe.py`: 16 tests (latest-per-bar collapse, duplicate counting,
+  universe metrics read through the collapse)
 
 All tests use mocked ccxt exchanges and temporary datastores; no real API calls.
 Golden tests verify hand-computed fixtures match exactly.
