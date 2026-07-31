@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — In progress**
+**Status: Phase 5 (Signals → alphas) — In progress · Phase 5.5 (Logging retrofit) — designed, not yet applied**
 
 ## Quick Start
 
@@ -36,6 +36,10 @@ All configuration lives in `config.py`. Key settings:
   - `BINANCE_API_KEY`, `BINANCE_API_SECRET`
   - `DERIBIT_CLIENT_ID`, `DERIBIT_CLIENT_SECRET`
 - **Alerts**: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- **Logging**: `LOG_CONFIG` — the existing `level`/`file` stub in `config.py`,
+  extended with `console_level`, `dir` (replaces the single `file` path),
+  `max_bytes` (10 MB), `retention_days` (365), and `components`. See
+  [Logging](#logging) below and `LOGGING.md`.
 
 Example:
 
@@ -65,6 +69,8 @@ pipeline/      — Daily scheduled job orchestration
 tests/         — pytest test suite
 scratch/       — Research notebooks & demo scripts
 config.py      — Central configuration
+logging_config.py — Logging setup (get_logger, run_id, retention pruning); see Logging below
+logs/          — Rotating, retained per-component log files (git-ignored)
 ```
 
 ## Project Structure
@@ -100,6 +106,12 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
 - [ ] Momentum, carry, short-term reversal, low-volatility signals
 - [ ] Alpha refinement (IC estimation + shrinkage) and the breadth report
 
+### Next: Phase 5.5 (Logging & Observability Retrofit)
+
+- [x] Logging architecture designed (`LOGGING.md`) and reference implementation
+      written (`logging_config.py`)
+- [ ] Retrofit into Phases 1-4 and current Phase 5 source (see `TODO.md`)
+
 ## Testing
 
 ```bash
@@ -132,6 +144,34 @@ ruff format .
 mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 ```
 
+## Logging
+
+Every module gets a logger via `logging_config.get_logger(__name__)`. Each
+pipeline component (`pipeline`, `datastore`, `loaders`, `audit`, `universe`,
+`backtest`, `signals`, and — from Phase 6 on — `risk`, `portfolio`,
+`execution`, `attribution`) writes structured JSON to its own file under
+`logs/`, e.g. `logs/loaders.log`. Files rotate at 10 MB; rotated backups are
+timestamped and pruned once older than 12 months
+(`logging_config.prune_old_logs`, run as the last step of the nightly
+pipeline). A `run_id` is attached to every record so one pipeline run can be
+traced across every component's log file.
+
+```python
+from logging_config import get_logger
+
+log = get_logger(__name__)
+log.info("loaded %d symbols", len(symbols))
+```
+
+Logs are distinct from Telegram alerts: logs are the always-written technical
+record of what happened in every run; alerts fire only on audit threshold
+breaches, execution drift, and the kill switch, and are meant for a human to
+see immediately. A halt or alert always has a matching CRITICAL log line, so
+the durable record doesn't depend on the Telegram send succeeding.
+
+Full design rationale — why rotation and retention are decoupled, log levels,
+the per-module retrofit map — is in `LOGGING.md`.
+
 ## Development
 
 ### Adding a new module
@@ -140,7 +180,8 @@ mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 2. Add public interface (typed dataclasses, main functions)
 3. Write tests in `tests/test_<module>.py`
 4. Create scratch script in `scratch/scratch_<module>.py` (demo only)
-5. Update `README.md` progress
+5. Wire logging via `get_logger(__name__)` (see Logging above and `LOGGING.md`)
+6. Update `README.md` progress
 
 ### Datastore Access
 
@@ -446,6 +487,9 @@ them to be labelled that way.
 4. **Risk model is not optional**: Half the value is understanding volatility costs.
 5. **Breadth over hero bets**: Many independent bets beat big single bets.
 6. **Measure costs pessimistically**: Model spreads, impact, slippage from day one.
+7. **Observability by default**: every module logs to `logs/<component>.log`;
+   alerts are for a human's immediate attention, logs are the durable record
+   an unattended run can be reconstructed from. See `LOGGING.md`.
 
 ## Progress
 
@@ -456,7 +500,9 @@ See `TODO.md` for detailed phase breakdown and progress log.
 - **Source**: "What Nobody Tells You About Being a Quant" (The Quant Insider)
 - **Architecture**: See `PLAN.md` for detailed design rationale
 - **Build Order**: See `TODO.md` for phased implementation plan
+- **Logging**: See `LOGGING.md` for the observability design
 
 ---
 
-**Next Phase**: finish Phase 5 — the remaining signals, then alpha refinement
+**Next Phase**: finish Phase 5 (remaining signals, alpha refinement), then
+Phase 5.5 — retrofit logging into Phases 1-5 (see `TODO.md` and `LOGGING.md`)

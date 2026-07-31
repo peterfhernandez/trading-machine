@@ -262,11 +262,28 @@ ALERT_CONFIG = AlertConfig()
 class LogConfig:
     """Logging configuration."""
 
-    # Log level: DEBUG, INFO, WARNING, ERROR
+    # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
     level: str = "INFO"
 
-    # Log file path
-    file: Path = LOGS_PATH / "trading_machine.log"
+    # Console (stderr) log level — quieter than the file level by default
+    console_level: str = "WARNING"
+
+    # Directory holding one rotating log file per pipeline component
+    # (pipeline.log, datastore.log, loaders.log, audit.log, universe.log,
+    # backtest.log, signals.log, risk.log, portfolio.log, execution.log,
+    # attribution.log)
+    dir: Path = LOGS_PATH
+
+    # Rotate each component's file at this size
+    max_bytes: int = 10 * 1024 * 1024  # 10 MB
+
+    # Delete rotated backups older than this many days
+    retention_days: int = 365  # 12 months
+
+    components: tuple[str, ...] = (
+        "pipeline", "datastore", "loaders", "audit", "universe",
+        "backtest", "signals", "risk", "portfolio", "execution", "attribution",
+    )
 
 
 LOG_CONFIG = LogConfig()

@@ -69,8 +69,55 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [ ] Run `scratch/scratch_markov_param_grid.py` against the real backfill and
       fill in Sections 4-5 of the markov methodology doc with the OOS numbers
 
+## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
+
+Closes the observability gap flagged during a PLAN/README/TODO review:
+`LOGS_PATH` existed but nothing wrote to it, logging wasn't listed as a
+cross-cutting concern, and an unattended-run failure outside the audit module
+had no durable record. Full design in `LOGGING.md`; reference implementation
+in `logging_config.py`. This phase retrofits logging into the already-built
+Phases 1-4 and current Phase 5 work; Phases 6-9 build logging in from the
+start instead (see their checklists below).
+
+- [x] Design the architecture: rotation (10 MB, `RotatingFileHandler`) and
+      retention (12 months, decoupled time-based pruning) — `LOGGING.md`
+- [x] Reference implementation: `logging_config.py` (`get_logger`,
+      `configure_logging`, `set_run_id`/`get_run_id`, `prune_old_logs`) —
+      smoke-tested (JSON output, run_id correlation, exception capture,
+      retention pruning all verified working)
+- [x] Confirmed `config.py` already has a `LogConfig`/`LOG_CONFIG` stub
+      (`level` + `file`) from the Phase 0 scaffold, unused anywhere. Extend it
+      in place — don't add a second config object — with `console_level`,
+      `dir` (replaces the single `file` path), `max_bytes`, `retention_days`,
+      `components`; see `LOGGING.md` §4 for the exact replacement. This keeps
+      it consistent with `LOADER_CONFIG` / `AUDIT_CONFIG` / `UNIVERSE_CONFIG`,
+      which already live in `config.py` the same way.
+- [ ] Apply that `LogConfig` change to the real `config.py`, and confirm
+      nothing already reads the old `LOG_CONFIG.file` field before removing it
+- [ ] Retrofit Phase 1: `ParquetStore.append`/`.read`, the no-overwrite guard,
+      `AssetMaster` symbol resolution
+- [ ] Retrofit Phase 2: `BaseLoader`'s append wrapper (replaces the
+      unspecified "error logging"), `BackfillRunner` checkpoints,
+      `DataAudit`'s five checks + the CRITICAL-before-halt log line,
+      `NightlyPipeline` stage entry/exit/duration
+- [ ] Retrofit Phase 3: `UniverseBuilder.build_and_store`
+- [ ] Retrofit Phase 4: `Backtester.run` (INFO summary; DEBUG per-rebalance,
+      opt-in)
+- [ ] Retrofit Phase 5 (so far): `signals.register`, `markov_mean_reversion`
+      reject paths
+- [ ] Wire `prune_old_logs()` into `NightlyPipeline` as its final step; expose
+      `python -m pipeline.prune_logs` standalone
+- [ ] Tests: `caplog` assertions that a CRITICAL record is emitted on every
+      halt path and on unhandled per-stage exceptions; a `prune_old_logs()`
+      unit test with fabricated file ages under `tmp_path`
+- [ ] Update each existing scratch demo to show a sample log line
+- [ ] Add `logs/` to `.gitignore`
+
 ## Phase 6 — Risk model (M7)
 
+- [ ] Wire logging per `LOGGING.md` as the module is built (`get_logger`,
+      stage timings, error paths at each check/regression) — built in from
+      the start, no retrofit needed
 - [ ] Sector/ecosystem tagging in asset master
 - [ ] Daily cross-sectional factor regressions (beta, size proxy, momentum,
       vol, sectors)
@@ -80,6 +127,8 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 7 — Portfolio construction (M8)
 
+- [ ] Wire logging per `LOGGING.md` as the module is built — built in from
+      the start, no retrofit needed
 - [ ] v1 rank-based long/short with vol targeting, position caps
 - [ ] v2 cvxpy optimizer: max α − λσ² − costs; market-neutral, max-weight,
       turnover, gross-leverage constraints
@@ -88,6 +137,9 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 8 — Execution & shortfall (M9)
 
+- [ ] Wire logging per `LOGGING.md` as the module is built — built in from
+      the start, no retrofit needed; the kill switch follows the same
+      CRITICAL-log-before-alert rule as the audit halt
 - [ ] Paper broker: positions, fills at next bar ± spread, PnL ledger
 - [ ] Exchange testnet adapter (start with one venue)
 - [ ] Zero-cost shadow portfolio + implementation-shortfall report
@@ -95,12 +147,17 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 9 — Pipeline, attribution, ops (M10, M11)
 
+- [ ] Wire logging per `LOGGING.md` as each module is built — built in from
+      the start, no retrofit needed
 - [ ] Daily scheduled run: load → audit → universe → alpha → risk → optimize →
-      execute (paper) → report; audit failure halts trading stages
+      execute (paper) → report; audit failure halts trading stages, not
+      reporting stages; `prune_old_logs()` runs as the final step
 - [ ] Attribution: PnL split into factor / specific / costs; per-signal IC
       decay tracking
 - [ ] Daily Telegram/HTML report
-- [ ] Run unattended ≥ 4 weeks on paper; review attribution weekly
+- [ ] Run unattended ≥ 4 weeks on paper; review attribution weekly — reviewing
+      `logs/pipeline.log` (by `run_id`) is now part of that review, not just
+      the attribution report
 - [ ] Cloud/upgrade triggers documented (only if: backfills > hours, data >
       disk, or 24/7 uptime needed → a $5 VPS before anything fancier)
 
@@ -201,3 +258,27 @@ Legend: [ ] todo · [~] in progress · [x] done
   so the fetch window is still `days_back` from now on every run — real windowed
   fetching needs `start`/`end` threaded through the loaders and, for funding rate
   and open interest, ccxt's `*_history` calls.
+- 2026-07-31: Logging gap identified during a PLAN/README/TODO review:
+  `LOGS_PATH` was declared in `config.py` but nothing wrote to it, the
+  architecture's cross-cutting list named CONFIG and ALERTS but not logging,
+  and an unattended-run failure outside the audit module (e.g. inside the
+  backtester or a signal) had no durable record — only audit threshold
+  breaches, execution drift, and the kill switch reach Telegram. Designed the
+  fix end to end: one rotating JSON log file per pipeline component under
+  `logs/` (10 MB rotation via `RotatingFileHandler`), 12-month retention
+  handled as a separate, time-based pruning step (`prune_old_logs`, timestamped
+  rotated filenames) rather than through `backupCount`, since size-triggered
+  rotation and calendar-based retention don't compose through one knob;
+  `run_id` correlation across every component's log file for a given pipeline
+  run; and an explicit boundary between logs (durable technical record, always
+  written), Telegram alerts (human notification, audit/drift/kill-switch only),
+  attribution reports (daily business summary), and `AuditResult` severities
+  (data-quality taxonomy) — a halt now always has a backing CRITICAL log line
+  before the alert is attempted. Full design in `LOGGING.md`; reference
+  implementation in `logging_config.py`, smoke-tested standalone (JSON output,
+  run_id tagging, exception capture, and retention pruning all confirmed
+  working). Added Phase 5.5 to retrofit this into the completed Phases 1-4 and
+  current Phase 5 source; Phases 6-9 updated to wire logging in from the start
+  instead of retrofitting later. Retrofit into the actual module source is
+  still pending — this session had the three planning docs but not the
+  repository itself.
