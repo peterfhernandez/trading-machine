@@ -48,6 +48,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 import polars as pl
 
+from datastore import latest_per_bar
+
 from .transforms import cross_sectional_zscore
 
 logger = logging.getLogger(__name__)
@@ -522,12 +524,7 @@ def context_close_panel(
     if len(frame) == 0:
         return {}
 
-    frame = (
-        frame.sort("ingested_ts")
-        .group_by(["asset_id", "event_ts"])
-        .last()
-        .sort(["asset_id", "event_ts"])
-    )
+    frame = latest_per_bar(frame, sort_by=["asset_id", "event_ts"])
 
     panel: dict[str, np.ndarray] = {}
     for part in frame.partition_by("asset_id", maintain_order=True):

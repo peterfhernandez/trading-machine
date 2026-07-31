@@ -109,23 +109,24 @@ class BackfillRunner:
         )
 
         try:
+            # run_daily() fetches and appends in one pass. Calling fetch() first
+            # to test for emptiness would pull every symbol from the venue twice
+            # per run, for nothing -- the row count comes back from the run.
             logger.info(f"Fetching daily OHLCV for {self.venue}...")
-            df = loader.fetch(timeframe="1d")
-            if len(df) > 0:
-                loader.run_daily()
+            rows = loader.run_daily()
+            if rows > 0:
                 checkpoint["ohlcv_daily"] = end_date.isoformat()
-                logger.info(f"OHLCV daily backfill completed; {len(df)} rows")
+                logger.info(f"OHLCV daily backfill completed; {rows} rows")
             else:
                 logger.warning("No OHLCV daily data fetched")
 
             time.sleep(1)
 
             logger.info(f"Fetching hourly OHLCV for {self.venue}...")
-            df_hourly = loader.fetch(timeframe="1h")
-            if len(df_hourly) > 0:
-                loader.run_hourly()
+            rows_hourly = loader.run_hourly()
+            if rows_hourly > 0:
                 checkpoint["ohlcv_hourly"] = end_date.isoformat()
-                logger.info(f"OHLCV hourly backfill completed; {len(df_hourly)} rows")
+                logger.info(f"OHLCV hourly backfill completed; {rows_hourly} rows")
             else:
                 logger.warning("No OHLCV hourly data fetched")
         except Exception as e:
@@ -146,11 +147,10 @@ class BackfillRunner:
 
         try:
             logger.info(f"Fetching funding rates for {self.venue}...")
-            df = loader.fetch()
-            if len(df) > 0:
-                loader.run()
+            rows = loader.run()
+            if rows > 0:
                 checkpoint["funding_rate"] = end_date.isoformat()
-                logger.info(f"Funding rate backfill completed; {len(df)} rows")
+                logger.info(f"Funding rate backfill completed; {rows} rows")
             else:
                 logger.warning("No funding rate data fetched")
         except Exception as e:
@@ -171,11 +171,10 @@ class BackfillRunner:
 
         try:
             logger.info(f"Fetching open interest for {self.venue}...")
-            df = loader.fetch()
-            if len(df) > 0:
-                loader.run()
+            rows = loader.run()
+            if rows > 0:
                 checkpoint["open_interest"] = end_date.isoformat()
-                logger.info(f"Open interest backfill completed; {len(df)} rows")
+                logger.info(f"Open interest backfill completed; {rows} rows")
             else:
                 logger.warning("No open interest data fetched")
         except Exception as e:

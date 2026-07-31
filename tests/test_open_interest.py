@@ -175,3 +175,27 @@ class TestOpenInterestLoader:
 
         assert df["open_interest"].null_count() == 0
         assert df["open_interest_usd"].null_count() == 0
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_run_returns_rows_appended(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """The backfill runner uses this count instead of a second fetch()."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        rows = loader.run()
+
+        assert rows == 2
+        assert temp_store.dataset_info("open_interest")["row_count"] == rows
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_run_returns_zero_when_nothing_fetched(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        mock_ccxt_binance.symbols = []
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
+
+        assert loader.run() == 0
