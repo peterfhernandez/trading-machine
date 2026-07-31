@@ -100,7 +100,7 @@ class DataAudit:
 
             members, universe_size, universe_source = self.resolve_universe(date)
             self._check_coverage(df, members, universe_size, universe_source)
-            self._check_null_rates(df)
+            self._check_null_rates(df, dataset)
             self._check_freshness(df, date, AUDIT_CONFIG.freshness_threshold_for(dataset))
             if "close" in df.columns:
                 self._check_price_outliers(df)
@@ -269,9 +269,18 @@ class DataAudit:
             severity="warning",
         ))
 
-    def _check_null_rates(self, df: pl.DataFrame) -> None:
-        """Check null rates per column."""
+    def _check_null_rates(self, df: pl.DataFrame, dataset: str = "") -> None:
+        """Check null rates per column.
+
+        Some columns are empty by construction rather than by fault: a venue's
+        funding-rate *history* carries the rate alone, while mark and index
+        price exist only on the current-snapshot endpoint. Those columns are
+        listed in `AUDIT_CONFIG.nullable_columns_by_dataset` and reported as
+        warnings so they cannot halt trading, while every other column stays
+        strict.
+        """
         threshold = AUDIT_CONFIG.null_rate_threshold_pct / 100.0
+        expected_nullable = AUDIT_CONFIG.nullable_columns_for(dataset)
 
         for col in df.columns:
             if col in ["event_ts", "ingested_ts", "asset_id", "venue", "symbol"]:
@@ -280,14 +289,24 @@ class DataAudit:
             null_count = df[col].null_count()
             null_rate = null_count / len(df) if len(df) > 0 else 0.0
 
-            passed = null_rate <= threshold
-            severity = "error" if not passed else "info"
+            within_threshold = null_rate <= threshold
+            optional = col in expected_nullable
+
+            passed = within_threshold or optional
+            if within_threshold:
+                severity = "info"
+            else:
+                severity = "warning" if optional else "error"
 
             if not passed or null_count > 0:
+                note = " (not provided by the venue's history endpoint)" if optional else ""
                 self.results.append(AuditResult(
                     check_name=f"null_rate_{col}",
                     passed=passed,
-                    message=f"Null rate in {col}: {null_rate*100:.2f}% (threshold: {threshold*100:.2f}%)",
+                    message=(
+                        f"Null rate in {col}: {null_rate*100:.2f}% "
+                        f"(threshold: {threshold*100:.2f}%){note}"
+                    ),
                     severity=severity,
                 ))
 

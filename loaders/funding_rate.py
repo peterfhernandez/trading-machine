@@ -9,8 +9,14 @@ import polars as pl
 
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
-from loaders.base import BaseLoader, select_usdt_symbols
+from loaders.base import (
+    BaseLoader,
+    paginate_time_series,
+    select_usdt_symbols,
+    venue_supports,
+)
 from loaders.schemas import FUNDING_RATE_SCHEMA
+from loaders.window import FetchWindow, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -59,18 +65,84 @@ class FundingRateLoader(BaseLoader):
         )
         return exchange
 
-    def fetch(self) -> pl.DataFrame:
+    def _history_rows(self, symbol: str, window: FetchWindow) -> list[dict]:
+        """Funding rates over `window` from the venue's history endpoint.
+
+        History entries carry the rate and its timestamp only — mark and index
+        price come from the current-snapshot endpoint and are simply not part
+        of the historical record, so they are left null rather than invented.
+        `AUDIT_CONFIG.nullable_columns_by_dataset` records that expectation.
+        """
+        entries = paginate_time_series(
+            lambda since: self.exchange.fetch_funding_rate_history(
+                symbol, since=since, limit=LOADER_CONFIG.page_limit
+            ),
+            window,
+            timestamp_of=lambda entry: entry.get("timestamp"),
+        )
+
+        rows = []
+        for entry in entries:
+            rate = entry.get("fundingRate")
+            if rate is None:
+                continue
+            rows.append({
+                "symbol": symbol,
+                "event_ts": datetime.fromtimestamp(
+                    entry["timestamp"] / 1000, timezone.utc
+                ).replace(tzinfo=None),
+                "funding_rate": float(rate),
+                "mark_price": None,
+                "index_price": None,
+            })
+        return rows
+
+    def _snapshot_row(self, symbol: str, window: FetchWindow) -> list[dict]:
+        """The current funding rate, if `window` extends to now.
+
+        A snapshot can only ever answer for the present, so a request for a
+        past window returns nothing here rather than stamping today's rate with
+        a historical timestamp.
+        """
+        fr_data = self.exchange.fetch_funding_rate(symbol)
+        if not fr_data:
+            return []
+
+        ts = (
+            datetime.fromtimestamp(fr_data["timestamp"] / 1000, timezone.utc).replace(tzinfo=None)
+            if fr_data.get("timestamp")
+            else utc_now()
+        )
+        if not window.contains(ts):
+            return []
+
+        return [{
+            "symbol": symbol,
+            "event_ts": ts,
+            "funding_rate": float(fr_data.get("fundingRate") or 0.0),
+            "mark_price": float(fr_data.get("markPrice") or 0.0),
+            "index_price": float(fr_data.get("indexPrice") or 0.0),
+        }]
+
+    def fetch(self, window: Optional[FetchWindow] = None) -> pl.DataFrame:
         """Fetch funding rates for top assets.
+
+        Args:
+            window: Event-time interval to fetch (default: the last
+                `lookback_days` days, ending now)
 
         Returns:
             DataFrame with columns: asset_id, venue, event_ts, ingested_ts,
                                    funding_rate, mark_price, index_price
         """
-        logger.info(f"Fetching funding rates for {self.venue}")
+        window = window or FetchWindow.from_lookback(self.lookback_days)
+        use_history = venue_supports(self.exchange, "fetchFundingRateHistory")
+        logger.info(
+            f"Fetching funding rates for {self.venue} over {window} "
+            f"({'history' if use_history else 'current snapshot only'})"
+        )
 
         rows = []
-        since = int((datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp() * 1000)
-
         symbols = select_usdt_symbols(
             self.exchange.symbols, max_symbols=self.max_symbols, prefer_perps=True
         )
@@ -78,37 +150,10 @@ class FundingRateLoader(BaseLoader):
 
         for symbol in symbols:
             try:
-                if hasattr(self.exchange, 'fetch_funding_rate'):
-                    fr_data = self.exchange.fetch_funding_rate(symbol)
-                    if fr_data:
-                        ts = (
-                            datetime.fromtimestamp(fr_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
-                            if fr_data.get('timestamp')
-                            else datetime.now(timezone.utc).replace(tzinfo=None)
-                        )
-                        rows.append({
-                            "symbol": symbol,
-                            "event_ts": ts,
-                            "funding_rate": float(fr_data.get('fundingRate', 0.0)),
-                            "mark_price": float(fr_data.get('markPrice', 0.0)),
-                            "index_price": float(fr_data.get('indexPrice', 0.0)),
-                        })
-                elif hasattr(self.exchange, 'fetch_funding_rates'):
-                    all_rates = self.exchange.fetch_funding_rates()
-                    if symbol in all_rates:
-                        fr_data = all_rates[symbol]
-                        ts = (
-                            datetime.fromtimestamp(fr_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
-                            if fr_data.get('timestamp')
-                            else datetime.now(timezone.utc).replace(tzinfo=None)
-                        )
-                        rows.append({
-                            "symbol": symbol,
-                            "event_ts": ts,
-                            "funding_rate": float(fr_data.get('fundingRate', 0.0)),
-                            "mark_price": float(fr_data.get('markPrice', 0.0)),
-                            "index_price": float(fr_data.get('indexPrice', 0.0)),
-                        })
+                if use_history:
+                    rows.extend(self._history_rows(symbol, window))
+                else:
+                    rows.extend(self._snapshot_row(symbol, window))
             except (ccxt.ExchangeError, ccxt.NetworkError, AttributeError) as e:
                 logger.debug(f"Could not fetch funding rate for {symbol}: {e}")
                 continue
@@ -117,7 +162,14 @@ class FundingRateLoader(BaseLoader):
             logger.warning(f"No funding rate data fetched for {self.venue}")
             return pl.DataFrame()
 
-        df = pl.DataFrame(rows)
+        df = pl.DataFrame(
+            rows,
+            schema_overrides={
+                "funding_rate": pl.Float64,
+                "mark_price": pl.Float64,
+                "index_price": pl.Float64,
+            },
+        )
         logger.info(f"Fetched {len(df)} funding rates for {df['symbol'].n_unique()} symbols")
 
         symbols_list = df["symbol"].unique().to_list()
@@ -152,9 +204,9 @@ class FundingRateLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} funding rates; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run(self) -> int:
+    def run(self, window: Optional[FetchWindow] = None) -> int:
         """Fetch and append funding rates. Returns the number of rows appended."""
-        df = self.fetch()
+        df = self.fetch(window=window)
         if len(df) == 0:
             return 0
         self.append("funding_rate", df, FUNDING_RATE_SCHEMA)

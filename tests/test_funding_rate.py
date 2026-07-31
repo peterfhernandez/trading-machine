@@ -1,6 +1,6 @@
 """Tests for Funding Rate loader."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -9,6 +9,7 @@ import pytest
 from config import LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.funding_rate import FundingRateLoader
+from loaders.window import FetchWindow, utc_now
 from loaders.schemas import FUNDING_RATE_SCHEMA
 
 
@@ -38,7 +39,9 @@ def mock_ccxt_binance():
     exchange.symbols = ["BTC/USDT", "ETH/USDT"]
     exchange.load_markets = MagicMock()
 
-    base_time = int(datetime(2024, 1, 1).timestamp() * 1000)
+    # A snapshot endpoint reports the current value, so the mock stamps it
+    # with now -- a timestamp fixed in the past falls outside any window.
+    base_time = int(utc_now().timestamp() * 1000)
     exchange.fetch_funding_rate = MagicMock(
         side_effect=lambda symbol: {
             "symbol": symbol,
@@ -203,3 +206,100 @@ class TestFundingRateLoader:
         loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
 
         assert loader.run() == 0
+
+
+@pytest.fixture
+def mock_binance_with_history():
+    """A venue that advertises and serves funding rate history."""
+    exchange = MagicMock()
+    exchange.symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+    exchange.load_markets = MagicMock()
+    exchange.has = {"fetchFundingRateHistory": True}
+
+    # Three fixed eight-hourly funding stamps on 2024-01-01, served from
+    # `since` forward -- a venue has a finite record, not an endless stream.
+    stamps = [
+        int(datetime(2024, 1, 1, hour, tzinfo=timezone.utc).timestamp() * 1000)
+        for hour in (0, 8, 16)
+    ]
+
+    def history(symbol, since=None, limit=None):
+        return [
+            {"symbol": symbol, "timestamp": ts, "fundingRate": 0.0001 * (i + 1)}
+            for i, ts in enumerate(stamps)
+            if since is None or ts >= since
+        ]
+
+    exchange.fetch_funding_rate_history = MagicMock(side_effect=history)
+    exchange.fetch_funding_rate = MagicMock(return_value={
+        "timestamp": int(utc_now().timestamp() * 1000),
+        "fundingRate": 0.5,
+        "markPrice": 1.0,
+        "indexPrice": 1.0,
+    })
+    return exchange
+
+
+class TestFundingRateHistory:
+    """A window means history, not a snapshot stamped with today's date."""
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_uses_the_history_endpoint_when_available(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+        mock_asset_master.add_mapping("ETH", "binance", "ETH/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        window = FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 2))
+        df = loader.fetch(window=window)
+
+        assert mock_binance_with_history.fetch_funding_rate_history.called
+        assert not mock_binance_with_history.fetch_funding_rate.called
+        assert len(df) == 6  # 3 stamps x 2 symbols
+        assert df["event_ts"].min() >= window.start
+        assert df["event_ts"].max() <= window.end
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_history_rows_leave_mark_and_index_null(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        """The venue's history carries the rate alone; inventing a mark price
+        would be fabricating data."""
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        df = loader.fetch(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 2)))
+
+        assert df["funding_rate"].null_count() == 0
+        assert df["mark_price"].null_count() == len(df)
+        assert df["index_price"].null_count() == len(df)
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_history_rows_append_and_satisfy_the_schema(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        """Null mark/index must still round-trip through the store."""
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        rows = loader.run(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 2)))
+
+        assert rows > 0
+        assert temp_store.dataset_info("funding_rate")["row_count"] == rows
+
+    @patch("loaders.funding_rate.ccxt.binance")
+    def test_snapshot_fallback_ignores_a_historical_window(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """A snapshot can only answer for now, so a past window returns nothing
+        rather than stamping today's rate with a historical timestamp."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = FundingRateLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        df = loader.fetch(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 2)))
+
+        assert len(df) == 0

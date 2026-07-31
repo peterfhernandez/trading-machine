@@ -1,6 +1,6 @@
 """Tests for Open Interest loader."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -9,6 +9,7 @@ import pytest
 from config import LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
 from loaders.open_interest import OpenInterestLoader
+from loaders.window import FetchWindow, utc_now
 from loaders.schemas import OPEN_INTEREST_SCHEMA
 
 
@@ -38,7 +39,9 @@ def mock_ccxt_binance():
     exchange.symbols = ["BTC/USDT", "ETH/USDT"]
     exchange.load_markets = MagicMock()
 
-    base_time = int(datetime(2024, 1, 1).timestamp() * 1000)
+    # A snapshot endpoint reports the current value, so the mock stamps it
+    # with now -- a timestamp fixed in the past falls outside any window.
+    base_time = int(utc_now().timestamp() * 1000)
     exchange.fetch_open_interest = MagicMock(
         side_effect=lambda symbol: {
             "symbol": symbol,
@@ -199,3 +202,97 @@ class TestOpenInterestLoader:
         loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
 
         assert loader.run() == 0
+
+
+@pytest.fixture
+def mock_binance_with_history():
+    """A venue that advertises and serves open interest history."""
+    exchange = MagicMock()
+    exchange.symbols = ["BTC/USDT:USDT"]
+    exchange.load_markets = MagicMock()
+    exchange.has = {"fetchOpenInterestHistory": True}
+
+    stamps = [
+        int(datetime(2024, 1, day, tzinfo=timezone.utc).timestamp() * 1000)
+        for day in (1, 2, 3)
+    ]
+
+    def history(symbol, timeframe="1d", since=None, limit=None):
+        return [
+            {
+                "symbol": symbol,
+                "timestamp": ts,
+                # ccxt's history structure, not the snapshot one
+                "openInterestAmount": 100.0 + i,
+                "openInterestValue": 5000.0 + i,
+            }
+            for i, ts in enumerate(stamps)
+            if since is None or ts >= since
+        ]
+
+    exchange.fetch_open_interest_history = MagicMock(side_effect=history)
+    exchange.fetch_open_interest = MagicMock(return_value={
+        "timestamp": int(utc_now().timestamp() * 1000),
+        "openInterest": 1.0,
+        "openInterestUsd": 2.0,
+    })
+    return exchange
+
+
+class TestOpenInterestHistory:
+    """A window means history, not a snapshot stamped with today's date."""
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_uses_the_history_endpoint_when_available(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        df = loader.fetch(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 3)))
+
+        assert mock_binance_with_history.fetch_open_interest_history.called
+        assert not mock_binance_with_history.fetch_open_interest.called
+        assert len(df) == 3
+        assert df["open_interest"].to_list() == [100.0, 101.0, 102.0]
+        assert df["open_interest_usd"].to_list() == [5000.0, 5001.0, 5002.0]
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_history_timeframe_is_passed_to_the_venue(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = OpenInterestLoader(
+            "binance", store=temp_store, asset_master=mock_asset_master, history_timeframe="4h"
+        )
+        loader.fetch(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 3)))
+
+        assert mock_binance_with_history.fetch_open_interest_history.call_args.args[1] == "4h"
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_window_bounds_the_history(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_binance_with_history
+    ):
+        mock_binance_class.return_value = mock_binance_with_history
+        mock_asset_master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2024, 1, 1))
+
+        loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        df = loader.fetch(window=FetchWindow(datetime(2024, 1, 2), datetime(2024, 1, 2, 12)))
+
+        assert len(df) == 1
+        assert df["event_ts"][0] == datetime(2024, 1, 2)
+
+    @patch("loaders.open_interest.ccxt.binance")
+    def test_snapshot_fallback_ignores_a_historical_window(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """A snapshot can only answer for now."""
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OpenInterestLoader("binance", store=temp_store, asset_master=mock_asset_master)
+        df = loader.fetch(window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 2)))
+
+        assert len(df) == 0
