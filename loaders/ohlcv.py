@@ -1,6 +1,5 @@
 """OHLCV loader for daily and hourly candles via ccxt."""
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -12,9 +11,10 @@ from datastore import ParquetStore, AssetMaster
 from loaders.base import BaseLoader, paginate_time_series, select_usdt_symbols
 from loaders.schemas import OHLCV_SCHEMA
 from loaders.window import FetchWindow
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class OHLCVLoader(BaseLoader):

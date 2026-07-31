@@ -20,12 +20,13 @@ Two deliberate properties:
   history than the checkpoint's start is honoured in full rather than skipped.
 """
 
-import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def utc_now() -> datetime:

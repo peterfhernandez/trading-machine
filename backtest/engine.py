@@ -49,7 +49,7 @@ a strategy — and it is stated here so it is never mistaken for a point-in-time
 read.
 """
 
-import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -58,12 +58,13 @@ import polars as pl
 
 from config import BACKTEST_CONFIG, DATASTORE_PATH, BacktestConfig
 from datastore import ParquetStore, latest_per_bar
+from logging_config import get_logger
 
 from .calendar import build_rebalance_calendar
 from .costs import CostModel
 from .metrics import BacktestMetrics, spearman_ic, summarize
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 OHLCV_DATASET = "ohlcv_daily"
 UNIVERSE_DATASET = "universe"
@@ -404,8 +405,13 @@ class Backtester:
         start_dt = _parse_date(start if start is not None else self.config.backtest_start)
         end_dt = _parse_date(end if end is not None else self.config.backtest_end)
 
+        run_started = time.monotonic()
         panel = self.load_price_panel(start_dt, end_dt)
         if len(panel.dates) < 3:
+            logger.warning(
+                "Backtest aborted: %d bars between %s and %s (need 3)",
+                len(panel.dates), start_dt, end_dt,
+            )
             raise ValueError(
                 f"Need at least 3 bars to backtest (rebalance, fill, exit); "
                 f"got {len(panel.dates)} between {start_dt} and {end_dt}"
@@ -426,6 +432,12 @@ class Backtester:
         weight_rows: list[dict] = []
         ic_rows: list[dict] = []
         bars_per_period: list[int] = []
+
+        logger.info(
+            "Backtest start: %s..%s, %d bars, %d rebalances (%s), pit_mode=%s",
+            panel.dates[0].date(), panel.dates[-1].date(), len(panel.dates),
+            len(fills), self.config.rebalance_freq, self.pit_mode,
+        )
 
         for k, (rebalance_ts, fill_ts) in enumerate(fills):
             universe = self._universe_for(rebalance_ts, panel, fill_ts)
@@ -484,6 +496,16 @@ class Backtester:
                 }
             )
 
+            # Per-rebalance detail is DEBUG-only: a multi-year daily backtest
+            # would otherwise write thousands of INFO lines per run and bury
+            # every other component's output in the shared log.
+            logger.debug(
+                "Rebalance %s: %d in universe, %d positions, turnover %.3f, "
+                "gross %+.4f, cost %.5f, net %+.4f",
+                rebalance_ts.date(), len(universe), len(targets), turnover,
+                gross_return, cost, net_return,
+            )
+
             if signals:
                 ic_rows.extend(
                     self._score_signals(signals, ctx, period_returns, rebalance_ts)
@@ -492,16 +514,26 @@ class Backtester:
             drifted = self._drift(targets, period_returns, gross_return)
 
         returns_df = self._returns_frame(return_rows)
+        metrics = summarize(
+            returns_df["net_return"].to_list() if len(returns_df) else [],
+            turnover=returns_df["turnover"].to_list() if len(returns_df) else [],
+            costs=returns_df["cost"].to_list() if len(returns_df) else [],
+            periods_per_year=self._periods_per_year(bars_per_period),
+        )
+        logger.info(
+            "Backtest complete in %.2fs: %d periods realized, ann. return %+.2f%%, "
+            "ann. vol %.2f%%, IR %.2f, max drawdown %.2f%%, avg turnover %.3f",
+            time.monotonic() - run_started, len(return_rows),
+            100 * metrics.annualized_return, 100 * metrics.annualized_vol,
+            metrics.information_ratio, 100 * metrics.max_drawdown,
+            metrics.avg_turnover,
+        )
+
         return BacktestResult(
             returns=returns_df,
             weights=self._weights_frame(weight_rows),
             ic=self._ic_frame(ic_rows),
-            metrics=summarize(
-                returns_df["net_return"].to_list() if len(returns_df) else [],
-                turnover=returns_df["turnover"].to_list() if len(returns_df) else [],
-                costs=returns_df["cost"].to_list() if len(returns_df) else [],
-                periods_per_year=self._periods_per_year(bars_per_period),
-            ),
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------------

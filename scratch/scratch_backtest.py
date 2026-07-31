@@ -26,6 +26,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from log_demo import start_demo_run  # noqa: E402
+
 from backtest import (  # noqa: E402
     ZERO_COST,
     Backtester,
@@ -127,6 +129,7 @@ def print_metrics(name: str, result) -> None:
 
 
 def main() -> None:
+    start_demo_run("backtest")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

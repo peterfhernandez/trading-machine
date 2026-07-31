@@ -13,10 +13,15 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+from log_demo import start_demo_run
+
 from config import PAPER, UniverseConfig
 from datastore import ParquetStore
 from loaders.schemas import OHLCV_SCHEMA
 from universe import UniverseBuilder, compute_turnover
+
 
 
 logging.basicConfig(
@@ -69,6 +74,7 @@ def make_synthetic_ohlcv(start: datetime, end: datetime) -> pl.DataFrame:
 
 
 def main():
+    start_demo_run("universe")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

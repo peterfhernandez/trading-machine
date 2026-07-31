@@ -1,6 +1,5 @@
 """Funding rate loader for perpetual swaps (Binance, Deribit)."""
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -17,9 +16,10 @@ from loaders.base import (
 )
 from loaders.schemas import FUNDING_RATE_SCHEMA
 from loaders.window import FetchWindow, utc_now
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class FundingRateLoader(BaseLoader):

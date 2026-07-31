@@ -14,19 +14,34 @@ from datastore import (
     count_duplicate_bars,
     latest_per_bar,
 )
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
 class AuditResult:
-    """Result of a single audit check."""
+    """Result of a single audit check.
+
+    `severity` is a **data-quality** taxonomy, not an application log level:
+    "error" means this check can halt trading, not that an exception occurred.
+    The two are deliberately separate concerns (LOGGING.md section 2); the
+    mapping used when a result is written to the log is `_LOG_LEVEL_BY_SEVERITY`
+    below.
+    """
 
     check_name: str
     passed: bool
     message: str
     severity: str  # "info", "warning", "error"
+
+
+_LOG_LEVEL_BY_SEVERITY = {
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 
 
 class DataAudit:
@@ -89,6 +104,7 @@ class DataAudit:
                     message=f"No data found in the last {AUDIT_CONFIG.audit_lookback_days} days (as of {date.date()})",
                     severity="error",
                 ))
+                self._log_results(dataset)
                 return self.results
 
             # Report duplicates against the raw read, then run every other check
@@ -114,7 +130,27 @@ class DataAudit:
                 severity="error",
             ))
 
+        self._log_results(dataset)
         return self.results
+
+    def _log_results(self, dataset: str) -> None:
+        """Write every check's verdict to the log at its severity's level.
+
+        Every check, not only the failures: the durable record of a clean run is
+        what makes an unattended run reconstructable after the fact, and a check
+        that stopped running is only visible by its absence from the log.
+        """
+        passed = sum(1 for r in self.results if r.passed)
+        logger.info(
+            f"Audit {dataset}: {passed}/{len(self.results)} checks passed"
+        )
+        for result in self.results:
+            level = _LOG_LEVEL_BY_SEVERITY.get(result.severity, logging.INFO)
+            logger.log(
+                level,
+                f"  {dataset}.{result.check_name}: "
+                f"{'PASS' if result.passed else 'FAIL'} — {result.message}",
+            )
 
     def resolve_universe_size(self, date: datetime) -> tuple[Optional[int], str]:
         """Coverage denominator as of `date`, and where it came from.
@@ -385,12 +421,24 @@ class DataAudit:
             ))
 
     def send_alerts(self) -> None:
-        """Send alerts for failed checks (Telegram)."""
+        """Send alerts for failed checks (Telegram).
+
+        The log line comes **before** the send and does not depend on it: a
+        Telegram outage is exactly the kind of thing that must still leave a
+        durable record (LOGGING.md section 2).
+        """
+        failed = [r for r in self.results if not r.passed]
+
         if not ALERT_CONFIG.enabled:
-            logger.debug("Alerts disabled; skipping")
+            if failed:
+                logger.warning(
+                    f"Alerts disabled; {len(failed)} failed check(s) will not be "
+                    "notified (they are in this log)"
+                )
+            else:
+                logger.debug("Alerts disabled; skipping")
             return
 
-        failed = [r for r in self.results if not r.passed]
         if not failed:
             return
 
@@ -399,7 +447,10 @@ class DataAudit:
             emoji = "❌" if result.severity == "error" else "⚠️"
             message += f"{emoji} {result.check_name}: {result.message}\n"
 
-        logger.info(f"Sending alert to Telegram: {len(failed)} failed checks")
+        logger.warning(
+            f"Alerting on {len(failed)} failed check(s): "
+            f"{', '.join(r.check_name for r in failed)}"
+        )
 
         try:
             import requests
@@ -417,11 +468,23 @@ class DataAudit:
             logger.error(f"Failed to send Telegram alert: {e}")
 
     def should_halt_trading(self) -> bool:
-        """Determine if trading should halt based on audit results."""
+        """Determine if trading should halt based on audit results.
+
+        Logs CRITICAL whenever this returns True. The log line lives here rather
+        than at the call sites so that *every* path to a halt is recorded —
+        including a caller that halts and never sends an alert, which is the
+        case LOGGING.md section 2 exists to close.
+        """
         critical_failures = [
             r for r in self.results
             if not r.passed and r.severity == "error"
         ]
+        if critical_failures:
+            logger.critical(
+                "TRADING HALT: %d critical audit failure(s) — %s",
+                len(critical_failures),
+                "; ".join(f"{r.check_name}: {r.message}" for r in critical_failures),
+            )
         return len(critical_failures) > 0
 
 
@@ -436,14 +499,9 @@ def run_audit(dataset: str, date: Optional[datetime] = None) -> AuditResult:
         Overall audit result
     """
     audit = DataAudit()
+    # audit_dataset() logs every check's verdict itself, so this wrapper does
+    # not repeat them.
     results = audit.audit_dataset(dataset, date)
-
-    logger.info(f"Audit complete: {len(results)} checks, {len([r for r in results if r.passed])} passed")
-
-    for result in results:
-        level = logging.WARNING if not result.passed else logging.INFO
-        logger.log(level, f"  {result.check_name}: {result.message}")
-
     audit.send_alerts()
 
     overall_passed = all(r.passed for r in results)

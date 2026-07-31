@@ -30,6 +30,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from log_demo import start_demo_run  # noqa: E402
+
 from backtest import (  # noqa: E402
     Backtester,
     CostModel,
@@ -283,6 +285,7 @@ def show_point_in_time(store: ParquetStore, asset_id: str, asof: datetime) -> No
 
 
 def main() -> int:
+    start_demo_run("signals")
     if not PAPER:
         print("PAPER is False; scratch scripts do not run. Set PAPER=true.")
         return 1

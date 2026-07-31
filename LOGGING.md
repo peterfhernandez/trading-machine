@@ -182,11 +182,15 @@ from `config.py` and owns only the logging *mechanism*:
 - `prune_old_logs()` — retention pruning; returns the list of deleted paths so
   it can log its own action and so tests can assert on it.
 
-It is a reference implementation to review and adapt into the real
-repository — it has not been wired into `datastore/`, `loaders/`, `audit/`,
-`universe/`, `backtest/`, or `signals/` yet. That wiring is Phase 5.5 (see
-`TODO.md`) and needs access to the actual module source, which this session
-does not have.
+`expired_log_backups()` was added alongside `prune_old_logs()` so
+`python -m pipeline.prune_logs --dry-run` can list what would be deleted
+without deleting it, and so the two can never disagree about which files are
+expired.
+
+**Status: wired in** (Phase 5.5, 2026-07-31). `datastore/`, `loaders/`,
+`audit/`, `universe/`, `backtest/`, `signals/` and `pipeline/` all take their
+loggers from `get_logger(__name__)`. `risk/`, `portfolio/`, `execution/` and
+`attribution/` have files reserved and build logging in as they are written.
 
 ## 6. Retrofit map — Phases 1-4 and current Phase 5
 
@@ -194,11 +198,28 @@ Additive only: existing public interfaces, tested behaviour, and return values
 are unchanged. Every item below is a new `log.*()` call inside an existing
 function, not a signature change.
 
-- **Datastore (M1).** `ParquetStore.append`/`.read` log dataset, partition,
-  and row count at INFO (DEBUG for reads inside tight loops, e.g. the
-  backtester's per-rebalance reads); the no-overwrite guard logs at WARNING
-  before it raises. `AssetMaster` symbol resolution logs an unresolved symbol
-  at WARNING instead of only raising/returning unresolved.
+- **Datastore (M1).** `ParquetStore.append` logs dataset, partition and row
+  count at INFO; `.read` logs at DEBUG, because the backtester reads inside a
+  per-rebalance loop and INFO there would bury every other component in the
+  shared log. `AssetMaster` symbol resolution logs an unresolved symbol at
+  WARNING instead of only returning `None`.
+
+  > **Deviation (applied).** This section said "the no-overwrite guard logs at
+  > WARNING before it raises". There is no such guard: `append` never
+  > overwrites — it writes `data_0001.parquet` beside `data_0000.parquet` — so
+  > there is nothing to raise. That path logs **DEBUG** instead (a partition
+  > that keeps accumulating files means re-fetched history, which is worth
+  > seeing but is not a fault). The *schema* validation, which does raise, logs
+  > WARNING first, which is what this line was reaching for.
+
+  > **Deviation (applied).** `AssetMaster.resolve_symbol` gained
+  > `warn_if_unresolved: bool = True`. WARNING is right for the loaders, where
+  > an unresolved symbol silently drops an asset's rows and shows up downstream
+  > only as an unexplained audit coverage miss. But
+  > `NightlyPipeline._populate_asset_master` calls the same method to ask "is
+  > this already mapped?" before adding it, and on a first run every symbol on
+  > the venue would log a warning. Additive keyword; the one caller for which
+  > absence is the expected answer passes `False`.
 - **Loaders/audit (M2/M3).** `BaseLoader`'s append wrapper — previously just
   "error logging," unspecified — becomes INFO (stage timings, records
   fetched/validated/appended) plus ERROR (the exception, still non-fatal per
@@ -214,10 +235,12 @@ function, not a signature change.
 - **Backtester (M5).** `Backtester.run` logs a per-run summary (date range,
   universe size, final metrics) at INFO; per-rebalance detail is DEBUG-only so
   a multi-year backtest doesn't flood the log by default.
-- **Signals (M6, in progress).** `signals.register` logs registration (and
-  the methodology-doc check) at INFO. `markov_mean_reversion`'s reject paths
-  (`None` returns) log at DEBUG per asset — this is high-volume by nature, so
-  it's kept below INFO deliberately.
+- **Signals (M6).** `signals.register` logs registration at INFO and logs a
+  WARNING before refusing a signal whose methodology doc is missing. Every
+  signal's reject paths (`None` returns) log at DEBUG per asset — six signals
+  x a 150-asset universe x every rebalance is high-volume by nature, so it is
+  kept below INFO deliberately. `signals.breadth` logs the effective
+  independent-bet count and redundant-pair count at INFO.
 
 ## 7. Built in from the start — Phases 6-9
 
@@ -239,6 +262,10 @@ assert, via `pytest`'s `caplog`:
 - `prune_old_logs()`, given a `tmp_path` with fabricated file ages, deletes
   only backups older than `retention_days`, leaves newer ones and the live
   `*.log` file untouched, and returns exactly the deleted paths.
+- The rotation namer's output matches the pruner's glob. Rotation and
+  retention are deliberately decoupled (§3.2), so nothing else forces them to
+  agree on the backup filename format — and if they ever disagree, retention
+  silently never runs, with no symptom until the disk fills.
 
 ## 9. Open items
 
@@ -251,3 +278,10 @@ assert, via `pytest`'s `caplog`:
 - **Kill-switch delivery beyond log + Telegram** (e.g. a channel that doesn't
   depend on the bot token being valid) is out of scope here; flagged for
   Phase 8 if it turns out to matter.
+
+## 10. Review log
+
+| Date | Reviewer | Change / decision |
+| --- | --- | --- |
+| 2026-07-31 | peter | Created (design only; `logging_config.py` written and smoke-tested, nothing wired in). |
+| 2026-07-31 | peter | Phase 5.5 applied across Phases 1-5 source. Two deviations recorded in §6: the "no-overwrite guard" does not exist as a raising check, and `resolve_symbol` needed a `warn_if_unresolved` opt-out for the pipeline's membership probe. Added `expired_log_backups()` for `--dry-run`, and a test asserting the namer and the pruner agree on the backup filename format. §9's open item — 10 MB / 12 months were specified, not measured — still stands: no real backfill has run, so no component's real rotation frequency is known yet. |

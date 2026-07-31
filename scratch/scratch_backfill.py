@@ -6,9 +6,14 @@ import sys
 import tempfile
 from datetime import datetime
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+from log_demo import start_demo_run
+
 from config import PAPER
 from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
+
 
 
 logging.basicConfig(
@@ -20,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     """Demo Backfill runner on temp data (no production writes)."""
+    start_demo_run("loaders")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)

@@ -1,7 +1,6 @@
 """Backfill runner: orchestrate loaders over explicit, resumable windows."""
 
 import json
-import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,9 +12,10 @@ from loaders.ohlcv import OHLCVLoader
 from loaders.funding_rate import FundingRateLoader
 from loaders.open_interest import OpenInterestLoader
 from loaders.window import Coverage, FetchWindow, resume_window, utc_now
+from logging_config import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DATASETS = ("ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest")
 
@@ -56,7 +56,7 @@ class BackfillRunner:
             try:
                 with open(checkpoint_file, "r") as f:
                     data = json.load(f)
-                logger.info(f"Loaded checkpoint from {checkpoint_file}")
+                logger.debug(f"Loaded checkpoint from {checkpoint_file}: {sorted(data)}")
                 return data
             except Exception as e:
                 logger.warning(f"Failed to load checkpoint: {e}; starting fresh")
@@ -68,7 +68,7 @@ class BackfillRunner:
         try:
             with open(checkpoint_file, "w") as f:
                 json.dump(checkpoint, f, indent=2)
-            logger.info(f"Saved checkpoint to {checkpoint_file}")
+            logger.debug(f"Saved checkpoint to {checkpoint_file}: {sorted(checkpoint)}")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
@@ -176,7 +176,7 @@ class BackfillRunner:
                 else:
                     logger.warning("No OHLCV hourly data fetched")
         except Exception as e:
-            logger.error(f"OHLCV backfill failed: {e}")
+            logger.error(f"OHLCV backfill failed: {e}", exc_info=True)
 
     def _backfill_funding_rates(self, requested: FetchWindow, checkpoint: dict) -> None:
         """Backfill funding rates."""
@@ -203,7 +203,7 @@ class BackfillRunner:
             else:
                 logger.warning("No funding rate data fetched")
         except Exception as e:
-            logger.error(f"Funding rate backfill failed: {e}")
+            logger.error(f"Funding rate backfill failed: {e}", exc_info=True)
 
     def _backfill_open_interest(self, requested: FetchWindow, checkpoint: dict) -> None:
         """Backfill open interest."""
@@ -230,7 +230,7 @@ class BackfillRunner:
             else:
                 logger.warning("No open interest data fetched")
         except Exception as e:
-            logger.error(f"Open interest backfill failed: {e}")
+            logger.error(f"Open interest backfill failed: {e}", exc_info=True)
 
 
 def run_backfill(

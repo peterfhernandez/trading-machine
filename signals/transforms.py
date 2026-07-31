@@ -17,7 +17,7 @@ an asset must not be read as scoring it neutrally.
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 Scores = Mapping[str, float | None]
 
@@ -85,6 +85,30 @@ def zscore(values: Sequence[float]) -> list[float]:
     return [(v - mean) / sd for v in items]
 
 
+def scale_to_unit_dispersion(values: Sequence[float]) -> list[float]:
+    """Divide by the sample standard deviation (ddof=1) **without** demeaning.
+
+    The counterpart to `zscore` for a signal whose cross-sectional mean is a
+    view rather than a nuisance. A time-series signal says "this asset has
+    trended up"; if every asset in the universe has trended up, that is
+    information, and subtracting the mean deletes exactly it, silently turning
+    the signal into a cross-sectional one. Scaling alone makes the scores
+    comparable in size while keeping the market-wide tilt.
+
+    Returns all zeros for a degenerate cross-section (fewer than two values, or
+    zero dispersion), matching `zscore`.
+    """
+    items = [float(v) for v in values]
+    if len(items) < 2:
+        return [0.0] * len(items)
+    mean = sum(items) / len(items)
+    variance = sum((v - mean) ** 2 for v in items) / (len(items) - 1)
+    sd = math.sqrt(variance)
+    if sd <= 1e-12:
+        return [0.0] * len(items)
+    return [v / sd for v in items]
+
+
 def cross_sectional_zscore(scores: Scores, winsorize_pct: float = 0.0) -> dict[str, float | None]:
     """Winsorize then z-score a cross-section of scores, preserving `None`s.
 
@@ -96,12 +120,31 @@ def cross_sectional_zscore(scores: Scores, winsorize_pct: float = 0.0) -> dict[s
         `{asset_id: standardized score or None}`, same keys as the input. Assets
         scored `None` stay `None` and are excluded from the statistics.
     """
+    return _standardize(scores, winsorize_pct, zscore)
+
+
+def cross_sectional_scale(scores: Scores, winsorize_pct: float = 0.0) -> dict[str, float | None]:
+    """Winsorize then scale to unit dispersion, preserving `None`s and the mean.
+
+    Same contract as `cross_sectional_zscore`, but built on
+    `scale_to_unit_dispersion` — for signals whose cross-sectional mean carries
+    a view (see that function). Used by `time_series_momentum`.
+    """
+    return _standardize(scores, winsorize_pct, scale_to_unit_dispersion)
+
+
+def _standardize(
+    scores: Scores,
+    winsorize_pct: float,
+    normalize: Callable[[Sequence[float]], list[float]],
+) -> dict[str, float | None]:
+    """Winsorize the scored subset, apply `normalize`, and put the `None`s back."""
     scored = {a: float(s) for a, s in scores.items() if s is not None}
     if not scored:
         return dict.fromkeys(scores)
 
     assets = list(scored)
-    standardized = zscore(winsorize([scored[a] for a in assets], winsorize_pct))
+    standardized = normalize(winsorize([scored[a] for a in assets], winsorize_pct))
     out: dict[str, float | None] = dict(zip(assets, standardized, strict=True))
     for asset in scores:
         out.setdefault(asset, None)

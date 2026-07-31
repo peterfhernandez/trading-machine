@@ -18,6 +18,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from log_demo import start_demo_run  # noqa: E402
+
 from config import DATASTORE_PATH, PAPER
 from datastore import ParquetStore, DatasetSchema, AssetMaster
 
@@ -197,6 +199,7 @@ def demo_asset_master():
 
 def main():
     """Run all demos."""
+    start_demo_run("datastore")
     print("\n")
     print("╔" + "=" * 68 + "╗")
     print("║" + " " * 68 + "║")

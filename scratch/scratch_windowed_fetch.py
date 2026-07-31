@@ -21,6 +21,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+# Imported first: log_demo puts the repository root on sys.path, so the
+# project imports below resolve when this script is run directly.
+# isort: off
+from log_demo import start_demo_run
+
+# isort: on
+
 from config import LOADER_CONFIG, PAPER
 from datastore import AssetMaster, ParquetStore, count_duplicate_bars, latest_per_bar
 from loaders.backfill import BackfillRunner
@@ -57,6 +64,7 @@ def section(title: str) -> None:
 
 
 def main():
+    start_demo_run("loaders")
     if not PAPER:
         logger.error("PAPER mode is False; scratch scripts must not run in production")
         sys.exit(1)
