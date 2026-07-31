@@ -9,6 +9,7 @@ import pytest
 
 from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
+from loaders.window import FetchWindow
 
 
 @pytest.fixture
@@ -36,6 +37,14 @@ def checkpoint_dir(tmp_path):
     cp_dir = tmp_path / "checkpoints"
     cp_dir.mkdir()
     return cp_dir
+
+
+@pytest.fixture(autouse=True)
+def no_rate_limit_pause():
+    """The runner pauses between datasets to be kind to the venue; tests are
+    talking to mocks and must not pay for it (100ms budget per test)."""
+    with patch("loaders.backfill.time.sleep"):
+        yield
 
 
 class TestBackfillRunner:
@@ -196,3 +205,147 @@ class TestBackfillRunner:
         assert runner_binance._checkpoint_file() != runner_deribit._checkpoint_file()
         assert runner_binance._checkpoint_file().name == "binance_backfill.json"
         assert runner_deribit._checkpoint_file().name == "deribit_backfill.json"
+
+
+class TestResumableWindows:
+    """The checkpoint is read back, so a re-run fetches only what is missing."""
+
+    @pytest.fixture
+    def loaders(self):
+        """Patch all three loader classes; yields the runner-visible mocks."""
+        with patch("loaders.backfill.OHLCVLoader") as ohlcv_class, \
+             patch("loaders.backfill.FundingRateLoader") as fr_class, \
+             patch("loaders.backfill.OpenInterestLoader") as oi_class:
+            ohlcv = MagicMock()
+            ohlcv.run_daily.return_value = 10
+            ohlcv.run_hourly.return_value = 24
+            ohlcv_class.return_value = ohlcv
+
+            fr = MagicMock()
+            fr.run.return_value = 5
+            fr_class.return_value = fr
+
+            oi = MagicMock()
+            oi.run.return_value = 5
+            oi_class.return_value = oi
+
+            yield ohlcv, fr, oi
+
+    def test_loaders_receive_the_requested_window(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        """A day count is no longer what reaches the loader -- explicit dates are."""
+        ohlcv, fr, oi = loaders
+        start, end = datetime(2024, 3, 1), datetime(2024, 3, 8)
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=start, end_date=end)
+
+        window = ohlcv.run_daily.call_args.kwargs["window"]
+        assert (window.start, window.end) == (start, end)
+        assert fr.run.call_args.kwargs["window"].start == start
+        assert oi.run.call_args.kwargs["window"].end == end
+
+    def test_checkpoint_records_the_covered_interval(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 8))
+
+        with open(checkpoint_dir / "binance_backfill.json") as f:
+            saved = json.load(f)
+
+        assert saved["ohlcv_daily"]["covered_start"] == "2024-03-01T00:00:00"
+        assert saved["ohlcv_daily"]["covered_end"] == "2024-03-08T00:00:00"
+
+    def test_rerunning_the_same_window_fetches_only_the_overlap(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        """The overlap is deliberate: the trailing bar of the first run was
+        probably incomplete, and venues revise recent bars."""
+        ohlcv, _, _ = loaders
+        start, end = datetime(2024, 3, 1), datetime(2024, 3, 8)
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=start, end_date=end)
+        first = ohlcv.run_daily.call_args.kwargs["window"]
+
+        runner.run(start_date=start, end_date=end)
+        second = ohlcv.run_daily.call_args.kwargs["window"]
+
+        assert first.days == 7          # the whole window
+        assert second.days == 1         # only the overlap
+        assert second == FetchWindow(datetime(2024, 3, 7), end)
+
+    def test_extending_the_window_fetches_only_the_new_part(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        ohlcv, _, _ = loaders
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 8))
+        runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 15))
+
+        second = ohlcv.run_daily.call_args.kwargs["window"]
+        assert second.start == datetime(2024, 3, 7)  # 8th minus the 1-day overlap
+        assert second.end == datetime(2024, 3, 15)
+
+    def test_older_history_is_still_fetched(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        """A high-water mark cannot prove older history is present."""
+        ohlcv, _, _ = loaders
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 8))
+        runner.run(start_date=datetime(2023, 1, 1), end_date=datetime(2023, 2, 1))
+
+        second = ohlcv.run_daily.call_args.kwargs["window"]
+        assert second.start == datetime(2023, 1, 1)
+        assert second.end == datetime(2023, 2, 1)
+
+    def test_ignore_checkpoint_refetches_everything(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        ohlcv, _, _ = loaders
+        start, end = datetime(2024, 3, 1), datetime(2024, 3, 8)
+
+        BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master).run(
+            start_date=start, end_date=end
+        )
+        BackfillRunner(
+            "binance", checkpoint_dir, temp_store, mock_asset_master, ignore_checkpoint=True
+        ).run(start_date=start, end_date=end)
+
+        assert ohlcv.run_daily.call_count == 2
+        assert ohlcv.run_daily.call_args.kwargs["window"].start == start
+
+    def test_a_failed_dataset_does_not_advance_its_checkpoint(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        """Nothing appended means the window is still missing; the next run
+        must ask for it again."""
+        ohlcv, fr, _ = loaders
+        fr.run.return_value = 0
+        start, end = datetime(2024, 3, 1), datetime(2024, 3, 8)
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=start, end_date=end)
+        runner.run(start_date=start, end_date=end)
+
+        assert fr.run.call_count == 2
+        assert fr.run.call_args.kwargs["window"].start == start
+
+    def test_legacy_checkpoint_is_honoured(
+        self, loaders, temp_store, mock_asset_master, checkpoint_dir
+    ):
+        """Checkpoints written before this change stored a bare end date."""
+        ohlcv, _, _ = loaders
+        with open(checkpoint_dir / "binance_backfill.json", "w") as f:
+            json.dump({"ohlcv_daily": "2024-03-08T00:00:00"}, f)
+
+        runner = BackfillRunner("binance", checkpoint_dir, temp_store, mock_asset_master)
+        runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 15))
+
+        window = ohlcv.run_daily.call_args.kwargs["window"]
+        assert window.start == datetime(2024, 3, 7)

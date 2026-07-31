@@ -266,20 +266,61 @@ either notation resolves to the same canonical `asset_id`.
 venue's symbol list interleaves every quote currency alphabetically, so capping
 first and filtering after silently starves the budget.
 
-**Backfill runner** orchestrates all loaders in sequence, one fetch per dataset:
+**Historical data.** Funding rate and open interest have two endpoints per
+venue: a *snapshot* of the current value, and a *history* over a window. The
+loaders prefer history when the venue advertises it (`fetchFundingRateHistory`,
+`fetchOpenInterestHistory`) and fall back to the snapshot otherwise. A snapshot
+can only answer for now, so with the fallback a request for a past window
+returns nothing rather than stamping today's value with a historical timestamp.
+Binance's funding history carries the rate alone — `mark_price` and
+`index_price` are snapshot-only fields and stay null on historical rows, which
+`AUDIT_CONFIG.nullable_columns_by_dataset` records so the audit warns instead of
+halting.
+
+**Backfill runner** orchestrates all loaders over an explicit, resumable window:
 
 ```python
 from loaders import BackfillRunner
+from datetime import datetime
 
 runner = BackfillRunner("binance")
-runner.run(days_back=30)  # Fetches the last 30 days for every dataset
+runner.run(start_date=datetime(2024, 3, 1), end_date=datetime(2024, 3, 8))
+runner.run(days_back=30)                          # or a lookback from now
 ```
 
-The window is always `days_back` counted back from *now*, and it is re-fetched
-in full on every run. A checkpoint file (`data/checkpoints/<venue>_backfill.json`)
-records the last date each dataset reached, but nothing reads it back yet — the
-runner does not currently skip windows it already has, so re-running overlaps
-with what is in the store (see duplicate bars above).
+Each dataset records the interval it has covered in
+`data/checkpoints/<venue>_backfill.json`, and a later run fetches only what is
+missing:
+
+```text
+run 1  2024-03-01..2024-03-08   -> fetches 7 days
+run 2  2024-03-01..2024-03-08   -> fetches 2024-03-07..2024-03-08 (overlap only)
+run 3  2024-03-01..2024-03-15   -> fetches 2024-03-07..2024-03-15
+run 4  2023-06-01..2023-07-01   -> fetches all of it (older than what is covered)
+```
+
+Three properties worth knowing:
+
+- **The overlap is deliberate.** Resuming re-fetches
+  `LOADER_CONFIG.refetch_overlap_days` (1) before the covered end, because the
+  trailing bar of a run is usually incomplete — a daily candle fetched at 00:10
+  UTC covers ten minutes of the current day — and venues revise recent bars.
+  Those duplicates are collapsed on read (see duplicate bars above).
+- **Coverage is an interval, not a high-water mark.** A request reaching back
+  before the covered range is fetched in full: a single "last date" cannot prove
+  older history is present.
+- **Long windows are paged.** A venue caps one response
+  (`LOADER_CONFIG.page_limit`, 1000 rows); windows longer than that are walked
+  forward, bounded by `LOADER_CONFIG.max_pages_per_symbol`. Without this a
+  five-year daily request came back as the first 1000 days with nothing to say
+  the rest was missing.
+
+Pass `ignore_checkpoint=True` (or `--ignore-checkpoint`) to re-fetch a window
+that is already covered.
+
+```bash
+PAPER=true python scratch/scratch_windowed_fetch.py   # demo
+```
 
 ### Audit
 
@@ -346,11 +387,19 @@ Run the complete data pipeline end-to-end: load → audit → report.
 # Dry-run mode (simulate without writing)
 python -m pipeline.nightly --dry-run --days 1
 
-# Live run
+# Live run: the last day, resuming from the checkpoint
 python -m pipeline.nightly --venue binance --days 1
+
+# A specific stretch of history
+python -m pipeline.nightly --start 2024-03-01 --end 2024-03-08
+
+# Re-fetch a window the checkpoint already covers
+python -m pipeline.nightly --start 2024-03-01 --end 2024-03-08 --ignore-checkpoint
 ```
 
-Datasets produced: `ohlcv_daily`, `ohlcv_hourly`, `funding_rate`, `open_interest`.
+`--start`/`--end` take `YYYY-MM-DD` or full ISO 8601 and are UTC; `--days` is a
+lookback from now and is ignored when `--start` is given. Datasets produced:
+`ohlcv_daily`, `ohlcv_hourly`, `funding_rate`, `open_interest`.
 
 ### Backtester
 

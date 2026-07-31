@@ -9,8 +9,14 @@ import polars as pl
 
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster
-from loaders.base import BaseLoader, select_usdt_symbols
+from loaders.base import (
+    BaseLoader,
+    paginate_time_series,
+    select_usdt_symbols,
+    venue_supports,
+)
 from loaders.schemas import OPEN_INTEREST_SCHEMA
+from loaders.window import FetchWindow, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -31,12 +37,16 @@ class OpenInterestLoader(BaseLoader):
         store: Optional[ParquetStore] = None,
         asset_master: Optional[AssetMaster] = None,
         max_symbols: Optional[int] = None,
+        history_timeframe: str = "1d",
     ):
         super().__init__(venue, store, asset_master)
         self.lookback_days = lookback_days
         self.max_symbols = (
             LOADER_CONFIG.max_symbols_per_run if max_symbols is None else max_symbols
         )
+        # Sampling interval for the OI history endpoint; daily matches the
+        # cadence the rest of the pipeline runs at.
+        self.history_timeframe = history_timeframe
         self.exchange = self._init_exchange(venue)
 
     def _init_exchange(self, venue: str):
@@ -58,17 +68,92 @@ class OpenInterestLoader(BaseLoader):
         )
         return exchange
 
-    def fetch(self) -> pl.DataFrame:
+    @staticmethod
+    def _amounts(entry: dict) -> tuple[float, float]:
+        """(contracts, USD notional) from either OI structure.
+
+        ccxt's history entries use openInterestAmount/openInterestValue while
+        the current-snapshot endpoint uses openInterest/openInterestUsd.
+        """
+        amount = entry.get("openInterestAmount")
+        if amount is None:
+            amount = entry.get("openInterest")
+        value = entry.get("openInterestValue")
+        if value is None:
+            value = entry.get("openInterestUsd")
+        return float(amount or 0.0), float(value or 0.0)
+
+    def _history_rows(self, symbol: str, window: FetchWindow) -> list[dict]:
+        """Open interest over `window` from the venue's history endpoint.
+
+        Venues keep this history short (Binance serves roughly the last 30
+        days), so an older window legitimately comes back empty.
+        """
+        entries = paginate_time_series(
+            lambda since: self.exchange.fetch_open_interest_history(
+                symbol,
+                self.history_timeframe,
+                since=since,
+                limit=LOADER_CONFIG.page_limit,
+            ),
+            window,
+            timestamp_of=lambda entry: entry.get("timestamp"),
+        )
+
+        rows = []
+        for entry in entries:
+            amount, value = self._amounts(entry)
+            rows.append({
+                "symbol": symbol,
+                "event_ts": datetime.fromtimestamp(
+                    entry["timestamp"] / 1000, timezone.utc
+                ).replace(tzinfo=None),
+                "open_interest": amount,
+                "open_interest_usd": value,
+            })
+        return rows
+
+    def _snapshot_row(self, symbol: str, window: FetchWindow) -> list[dict]:
+        """The current open interest, if `window` extends to now."""
+        oi_data = self.exchange.fetch_open_interest(symbol)
+        if not oi_data:
+            return []
+
+        ts = (
+            datetime.fromtimestamp(oi_data["timestamp"] / 1000, timezone.utc).replace(tzinfo=None)
+            if oi_data.get("timestamp")
+            else utc_now()
+        )
+        if not window.contains(ts):
+            return []
+
+        amount, value = self._amounts(oi_data)
+        return [{
+            "symbol": symbol,
+            "event_ts": ts,
+            "open_interest": amount,
+            "open_interest_usd": value,
+        }]
+
+    def fetch(self, window: Optional[FetchWindow] = None) -> pl.DataFrame:
         """Fetch open interest for top assets.
+
+        Args:
+            window: Event-time interval to fetch (default: the last
+                `lookback_days` days, ending now)
 
         Returns:
             DataFrame with columns: asset_id, venue, event_ts, ingested_ts,
                                    open_interest, open_interest_usd
         """
-        logger.info(f"Fetching open interest for {self.venue}")
+        window = window or FetchWindow.from_lookback(self.lookback_days)
+        use_history = venue_supports(self.exchange, "fetchOpenInterestHistory")
+        logger.info(
+            f"Fetching open interest for {self.venue} over {window} "
+            f"({'history' if use_history else 'current snapshot only'})"
+        )
 
         rows = []
-
         symbols = select_usdt_symbols(
             self.exchange.symbols, max_symbols=self.max_symbols, prefer_perps=True
         )
@@ -76,20 +161,10 @@ class OpenInterestLoader(BaseLoader):
 
         for symbol in symbols:
             try:
-                if hasattr(self.exchange, 'fetch_open_interest'):
-                    oi_data = self.exchange.fetch_open_interest(symbol)
-                    if oi_data:
-                        ts = (
-                            datetime.fromtimestamp(oi_data.get('timestamp', 0) / 1000, timezone.utc).replace(tzinfo=None)
-                            if oi_data.get('timestamp')
-                            else datetime.now(timezone.utc).replace(tzinfo=None)
-                        )
-                        rows.append({
-                            "symbol": symbol,
-                            "event_ts": ts,
-                            "open_interest": float(oi_data.get('openInterest', 0.0)),
-                            "open_interest_usd": float(oi_data.get('openInterestUsd', 0.0)),
-                        })
+                if use_history:
+                    rows.extend(self._history_rows(symbol, window))
+                else:
+                    rows.extend(self._snapshot_row(symbol, window))
             except (ccxt.ExchangeError, ccxt.NetworkError, AttributeError) as e:
                 logger.debug(f"Could not fetch open interest for {symbol}: {e}")
                 continue
@@ -132,9 +207,9 @@ class OpenInterestLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} OI snapshots; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run(self) -> int:
+    def run(self, window: Optional[FetchWindow] = None) -> int:
         """Fetch and append open interest. Returns the number of rows appended."""
-        df = self.fetch()
+        df = self.fetch(window=window)
         if len(df) == 0:
             return 0
         self.append("open_interest", df, OPEN_INTEREST_SCHEMA)

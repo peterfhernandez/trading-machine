@@ -191,6 +191,18 @@ class LoaderConfig:
     # against the ccxt default ("spot").
     perp_market_type: str = "future"
 
+    # Rows a venue returns per call. Windows longer than this are paged
+    # through; `max_pages_per_symbol` bounds how far one run will walk.
+    page_limit: int = 1000
+    max_pages_per_symbol: int = 50
+
+    # How much of the already-covered window to re-fetch when resuming. The
+    # trailing bar of a run is usually incomplete (a daily candle fetched at
+    # 00:10 UTC covers ten minutes of the current day) and venues revise recent
+    # bars, so the last day covered must be pulled again. Duplicates are
+    # expected and collapsed on read (datastore.latest_per_bar).
+    refetch_overlap_days: int = 1
+
 
 @dataclass
 class AuditConfig:
@@ -201,6 +213,14 @@ class AuditConfig:
 
     # Alert if null rate above this % per column
     null_rate_threshold_pct: float = 1.0
+
+    # Columns a venue legitimately cannot fill for historical rows: Binance's
+    # funding rate *history* carries the rate only, while the current-snapshot
+    # endpoint also returns mark and index price. Nulls in these are reported
+    # as warnings rather than halting trading; every other column stays strict.
+    nullable_columns_by_dataset: dict[str, set[str]] = field(default_factory=lambda: {
+        "funding_rate": {"mark_price", "index_price"},
+    })
 
     # Alert if price jump > this % vs. second venue (outlier detection)
     price_jump_threshold_pct: float = 10.0
@@ -227,6 +247,10 @@ class AuditConfig:
     def freshness_threshold_for(self, dataset: str) -> float:
         """Freshness threshold (hours) for a dataset, falling back to the default."""
         return self.freshness_threshold_hours_by_dataset.get(dataset, self.freshness_threshold_hours)
+
+    def nullable_columns_for(self, dataset: str) -> set[str]:
+        """Columns whose nulls are expected (not a halting failure) for a dataset."""
+        return self.nullable_columns_by_dataset.get(dataset, set())
 
 
 LOADER_CONFIG = LoaderConfig()

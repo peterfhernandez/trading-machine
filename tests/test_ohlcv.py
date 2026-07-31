@@ -10,6 +10,7 @@ import pytest
 from config import DATASTORE_PATH, LOADER_CONFIG
 from datastore import ParquetStore, AssetMaster, DatasetSchema
 from loaders.ohlcv import OHLCVLoader
+from loaders.window import FetchWindow
 from loaders.schemas import OHLCV_SCHEMA
 
 
@@ -41,10 +42,12 @@ def mock_ccxt_binance():
     exchange.symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
     exchange.load_markets = MagicMock()
 
-    base_time = int(datetime(2024, 1, 1).timestamp() * 1000)
+    # A venue returns bars starting at `since`, so the mock does too -- bars at
+    # a timestamp fixed in the past would fall outside any window the loader
+    # asks for, which is exactly what a real venue would never return.
     exchange.fetch_ohlcv = MagicMock(
         side_effect=lambda symbol, tf, since=None, limit=None: [
-            [base_time + (i * 60 * 60 * 1000), 42000 + i, 42100 + i, 41900 + i, 42050 + i, 100 + i]
+            [since + (i * 60 * 60 * 1000), 42000 + i, 42100 + i, 41900 + i, 42050 + i, 100 + i]
             for i in range(5)
         ]
     )
@@ -83,7 +86,9 @@ class TestOHLCVLoader:
         )
         loader.fetch(timeframe="1d")
 
-        queried = [c.args[0] for c in mock_ccxt_binance.fetch_ohlcv.call_args_list]
+        # Symbols queried, not calls made: a window longer than one page is
+        # walked forward with several calls per symbol.
+        queried = {c.args[0] for c in mock_ccxt_binance.fetch_ohlcv.call_args_list}
         assert len(queried) == 100
         assert all(s.endswith("/USDT") for s in queried)
 
@@ -169,7 +174,11 @@ class TestOHLCVLoader:
         mock_binance_class.return_value = mock_ccxt_binance
 
         loader = OHLCVLoader("binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master)
-        df = loader.fetch(timeframe="1d")
+        # Fixed fixture dates need an explicit window covering them.
+        df = loader.fetch(
+            timeframe="1d",
+            window=FetchWindow(datetime(2024, 1, 1), datetime(2024, 1, 10)),
+        )
 
         assert len(df) >= 3
         assert all(df["open"] == 42000.0)
