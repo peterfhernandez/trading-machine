@@ -188,9 +188,9 @@ different answers. Plus the CI that would have caught some of it.
       parsed enum, so `signal_statuses()` answers "which signals have
       evidence?" instead of a paragraph in the README
 - [x] **Pre-merge CI** (`.github/workflows/ci.yml`): pull requests and pushes
-      to `main`, Python 3.11 and 3.12, ruff + full suite + advisory mypy, and
-      a check that commit messages carry no tool attribution. Make it a
-      required check on `main`
+      to `main`, Python 3.11, 3.12 and 3.14, ruff + full suite + advisory
+      mypy, and a check that commit messages carry no tool attribution. Make it
+      a required check on `main`
 - [x] **Deploy tests before it pulls** (`.github/workflows/deploy.yml`,
       replacing `pr-merge.yml`): fetch (non-destructive) → check the incoming
       commit out into a throwaway worktree → run the suite there → only then
@@ -223,6 +223,20 @@ different answers. Plus the CI that would have caught some of it.
       length is unenforced: `E501` stays in the ignore list, where it used to
       claim the formatter handled it. Re-enabling it means 50 findings ruff
       cannot fix (it will not rewrap code), so that is a separate decision
+- [x] **A green suite exited 1 on Windows.** `python -m pytest tests/` printed
+      every test as PASSED and then died with `PermissionError: [WinError 5]`
+      in pytest's own `cleanup_dead_symlinks`: the stale `pytest-current` link
+      in `%TEMP%\pytest-of-<user>\` cannot be removed with `os.unlink` there
+      (a directory link needs `RemoveDirectoryW`), pytest's removal is
+      unguarded, and session-finish hooks run in a `finally` that catches only
+      `exit.Exception` — so it escapes and the process exits 1. `deploy.yml`
+      keys `git reset --hard` off that exit code, so the trading machine was
+      refusing commits whose tests had all passed. Shimmed in
+      `tests/conftest.py` (rmdir fallback, cannot raise, installed at both call
+      sites since `_pytest.tmpdir` binds the name at import);
+      `tests/test_tmpdir_cleanup.py` runs pytest in a subprocess over a seeded
+      stale link and asserts the exit code, with a negative control that fails
+      if the harness ever stops reproducing the crash
 - [ ] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
@@ -521,8 +535,10 @@ different answers. Plus the CI that would have caught some of it.
   omitted `max_gap_days` and/or `history_buffer_days`, so half the "specs"
   described a different signal from the one being backtested. `Status` became a
   parsed enum, so `signal_statuses()` replaces a paragraph. **CI:** `ci.yml`
-  runs ruff and the full suite on 3.11 and 3.12 for every PR (make it required
-  on `main`); `deploy.yml` replaces `pr-merge.yml` and tests before it pulls —
+  runs ruff and the full suite on 3.11, 3.12 and 3.14 for every PR (3.14 added
+  later, when the exit-code defect showed it was the gap that mattered; make it
+  required on `main`); `deploy.yml` replaces `pr-merge.yml` and tests before it
+  pulls —
   fetch, check the incoming commit out into a throwaway worktree, run the suite
   there, and only then `git reset --hard`, so a failure leaves the trading box
   on the last known-good commit. Three latent faults in the old workflow fixed
@@ -545,3 +561,52 @@ different answers. Plus the CI that would have caught some of it.
   on the machine that runs the pipeline. Worth adding when that happens: a venue
   preflight that logs the HTTP status and response body, so "we are blocked"
   stops looking identical to "the venue is down".
+- 2026-08-01: **A passing suite exited 1 on Windows**, which meant the deploy
+  gate was rejecting good commits. `python -m pytest tests/` printed every test
+  as PASSED and then raised `PermissionError: [WinError 5] Access is denied:
+  '...\Temp\pytest-of-Peter\pytest-current'` out of pytest's own temp-directory
+  housekeeping. Not this project's code, but this project's exit code. The
+  chain, all inside pytest: `make_numbered_dir` keeps a `pytest-current` link
+  beside its numbered temp dirs and re-points it through `_force_symlink`,
+  which starts by unlinking the old one — on Windows a link to a *directory* is
+  removed with `RemoveDirectoryW`, not the `DeleteFileW` behind `os.unlink`, so
+  that fails, and `_force_symlink` swallows every error by design. The link
+  therefore keeps pointing at an older run; that run's directory is eventually
+  cleaned up (`keep=3`); and `cleanup_dead_symlinks` then calls the same failing
+  `unlink()` on the now-dangling link — the one removal in `_pytest/pathlib.py`
+  that is not inside a `try` (the other six are). Session-finish hooks are
+  invoked from `wrap_session`'s `finally`, which catches only `exit.Exception`,
+  so it is not even downgraded to an INTERNAL_ERROR status: it propagates
+  through `_console_main` and the interpreter exits 1. The `1 passed` summary
+  never prints either, because the crash happens below the terminal reporter's
+  own hook — which is why the output jumps straight from the last PASSED line to
+  a traceback. Fixed with a shim in `tests/conftest.py` that keeps pytest's
+  semantics (remove links whose target is gone), falls back to `rmdir`, and
+  cannot raise; installed into `_pytest.pathlib` *and* `_pytest.tmpdir`, since
+  the latter binds the name at import time and is the call site in the
+  traceback, and installed unconditionally rather than under `os.name == "nt"`
+  so CI exercises it. It self-heals: the stale link is removed at the end of the
+  first run after the fix, and the next run creates a live one. 15 new tests
+  (`tests/test_tmpdir_cleanup.py`) — the unit ones simulate Windows by making
+  `unlink` refuse, and two integration ones run pytest in a subprocess over a
+  seeded stale link and assert the **exit code**, because nothing in-process can
+  observe the thing that was broken. The negative control paid for itself
+  immediately: the first harness seeded the link under a `pytest-of-<user>`
+  directory pytest never looked at, so the positive test was green for no
+  reason. 594 tests passing.
+- 2026-08-01: **Python 3.14 added to the CI matrix** (`3.11`, `3.12`, `3.14`),
+  which the exit-code defect above surfaced: it was reported from a local run
+  on 3.14, and CI tested 3.11 and 3.12 only. The gap matters more than a
+  version-support question, because `deploy.yml` installs nothing — it runs the
+  suite in the throwaway worktree with *the trading machine's own* interpreter.
+  So the version with the final say over whether a commit is adopted was the
+  one version nothing verified. Confirmed before adding it rather than after:
+  the full suite installs and passes on 3.14 (594 passed, ~34 s; polars 1.43,
+  pyarrow 25, pandas 3.0, numpy 2.5, ccxt 4.5 all have 3.14 wheels), though the
+  only 3.14 build available in the environment that checked was `3.14.0rc2`, so
+  CI on GitHub's 3.14 release is the first run against a final build. 3.13 was
+  deliberately left out: nothing runs on it, and `requires-python = ">=3.11"`
+  is a floor rather than a promise about every version in between — a matrix
+  entry should name a version somebody actually uses. `ruff` stays on
+  `target-version = "py311"` and mypy on `python_version = "3.11"`: both are
+  about the *floor* of supported syntax, which 3.14 does not move.

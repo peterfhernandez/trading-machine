@@ -30,7 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
-| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 578 hermetic tests on 3.11 and 3.12), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 594 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 
@@ -1015,9 +1015,10 @@ merged into; and two merges in quick succession raced on one directory.
 Split in two, because they answer different questions:
 
 - **`ci.yml`** gates the merge — pull requests and pushes to `main`, on
-  GitHub-hosted runners, Python 3.11 and 3.12. The suite is hermetic (every
-  ccxt call mocked, every store a `tmp_path`), so 578 tests run in ~35 s with
-  no network. Required-check territory.
+  GitHub-hosted runners, Python 3.11, 3.12 and 3.14 (3.14 added later; see
+  below). The suite is hermetic (every ccxt call mocked, every store a
+  `tmp_path`), so 594 tests run in ~35 s with no network. Required-check
+  territory.
 - **`deploy.yml`** gates the *deployment*, which is a stronger claim than a
   status check: `git fetch` is non-destructive, so the incoming commit is
   checked out into a throwaway worktree and the suite is run **on the trading
@@ -1047,3 +1048,55 @@ the durable run record.
   still see the non-propagating `tm` tree
 
 578 passing overall.
+
+### The suite's exit code is part of the suite
+
+A later addition to this phase, and the same lesson a third time. Every test
+passed on the Windows machine and `python -m pytest tests/` still exited **1**,
+on a `PermissionError` raised by pytest's own temp-directory housekeeping after
+the last test had run.
+
+The chain: pytest keeps a `pytest-current` link beside its numbered temp
+directories; `_force_symlink` cannot re-point it on Windows, because unlinking a
+*directory* link there needs `RemoveDirectoryW` rather than `DeleteFileW`, and
+it swallows the failure; the link goes stale, its target is eventually cleaned
+up, and `cleanup_dead_symlinks` then calls the same failing `unlink()` on it —
+this time unguarded. Session-finish hooks run inside `wrap_session`'s `finally`,
+which catches only `exit.Exception`, so it is not even converted into an
+INTERNAL_ERROR status: it escapes as a raw traceback and the process exits 1.
+The `1 passed` summary line never prints, because the crash happens below the
+terminal reporter's own hook.
+
+Three things make this worth a section rather than a line:
+
+- **It gates deployment.** `deploy.yml` runs the suite on the trading machine
+  and throws on `$LASTEXITCODE -ne 0`. A run where nothing failed looked
+  identical to a run where something did, and the box kept its old checkout.
+- **It is the module-level fix again.** The guard belongs in the cleanup, not
+  in a "delete the stale link first" step in this repo's conftest — which would
+  mean re-deriving pytest's temp-root layout (`--basetemp`,
+  `PYTEST_DEBUG_TEMPROOT`, `pytest-of-<user>`) and racing pytest for it.
+- **Only a subprocess can see an exit code.** The unit tests around the shim
+  call the cleanup directly and cannot observe the thing that was broken; the
+  regression test runs pytest for real, over a seeded stale link, with
+  `Path.unlink` refusing on that one name — which is exactly what Windows does.
+  Its negative control earned its place immediately: the first harness seeded
+  the link under the wrong `pytest-of-<user>` directory and the positive test
+  passed for no reason.
+
+The shim keeps pytest's semantics, adds an `rmdir` fallback and cannot raise. It
+is installed unconditionally rather than under `os.name == "nt"`: on POSIX the
+fallback is unreachable, and running it everywhere is what keeps CI able to test
+it. A test asserts pytest still lacks the guard, so the day upstream adds one,
+the shim's removal is a decision someone makes rather than a duplication nobody
+notices.
+
+**The interpreter the gate runs on was not in the gate.** The report came from
+a local run on Python 3.14, and `ci.yml` tested 3.11 and 3.12. That gap is
+worse than it sounds, because `deploy.yml` does not install anything: it runs
+the suite in the throwaway worktree using *the trading machine's own*
+interpreter. So the version with the final say over whether a commit is adopted
+was the one version nothing verified. 3.14 joined the matrix. 3.13 did not —
+nothing runs on it, and `requires-python = ">=3.11"` is a floor, not a promise
+about every version in between; a matrix entry should name a version somebody
+actually uses.

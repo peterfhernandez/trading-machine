@@ -24,10 +24,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor from requires-python and the version the README recommends.
-        # Both, because a suite that only runs on one of them cannot tell you
-        # which of the two the code actually supports.
-        python-version: ["3.11", "3.12"]
+        # The floor from requires-python, the version the README recommends,
+        # and the one actually installed on the machine that runs the pipeline.
+        # More than one, because a suite that runs on a single version cannot
+        # tell you which versions the code supports.
+        #
+        # 3.14 is here because it was the gap that mattered: the local runs and
+        # the `deploy.yml` verification step both use the trading machine's own
+        # interpreter, so the version gating deployment was the one version CI
+        # never exercised. 3.13 is deliberately not in the matrix — nothing runs
+        # on it, and `requires-python` is a floor, not a per-version promise.
+        python-version: ["3.11", "3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
