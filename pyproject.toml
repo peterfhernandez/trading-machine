@@ -95,7 +95,13 @@ select = [
     "A",    # flake8-builtins
 ]
 ignore = [
-    "E501",  # line too long (handled by formatter)
+    # Line length is NOT enforced. It used to say "handled by formatter", which
+    # stopped being true when CI dropped `ruff format --check` (the formatter
+    # would have reformatted 62 of 87 files, which is churn, not correctness).
+    # Enabling E501 today would surface 50 findings that ruff cannot fix — it
+    # will not rewrap code — so this is a deliberate gap, not an oversight.
+    # line-length = 100 above still guides `ruff format` when run by hand.
+    "E501",
 ]
 
 [tool.ruff.lint.isort]

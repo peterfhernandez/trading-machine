@@ -1,17 +1,14 @@
 """Tests for OHLCV loader."""
 
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import polars as pl
 import pytest
 
-from config import DATASTORE_PATH, LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster, DatasetSchema
+from config import LOADER_CONFIG
+from datastore import AssetMaster, ParquetStore
 from loaders.ohlcv import OHLCVLoader
 from loaders.window import FetchWindow
-from loaders.schemas import OHLCV_SCHEMA
 
 
 @pytest.fixture

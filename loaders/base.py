@@ -3,16 +3,15 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import polars as pl
 
 from config import DATASTORE_PATH, LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster, DatasetSchema
+from datastore import AssetMaster, DatasetSchema, ParquetStore
 from loaders.window import FetchWindow
 from logging_config import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -23,8 +22,8 @@ _PERP_SUFFIX = ":USDT"
 
 
 def select_usdt_symbols(
-    symbols: Optional[list[str]],
-    max_symbols: Optional[int] = None,
+    symbols: list[str] | None,
+    max_symbols: int | None = None,
     prefer_perps: bool = False,
 ) -> list[str]:
     """Pick up to `max_symbols` USDT-quoted symbols from a venue symbol list.
@@ -78,10 +77,10 @@ def venue_supports(exchange: Any, capability: str) -> bool:
 
 
 def paginate_time_series(
-    fetch_page: Callable[[int], Optional[Sequence[Any]]],
+    fetch_page: Callable[[int], Sequence[Any] | None],
     window: FetchWindow,
-    timestamp_of: Callable[[Any], Optional[int]],
-    max_pages: Optional[int] = None,
+    timestamp_of: Callable[[Any], int | None],
+    max_pages: int | None = None,
 ) -> list[Any]:
     """Walk `fetch_page(since_ms)` forward until `window` is covered.
 
@@ -143,7 +142,7 @@ def paginate_time_series(
         if page_num == max_pages:
             logger.warning(
                 f"Stopped paginating at the {max_pages}-page budget with "
-                f"{datetime.fromtimestamp(cursor / 1000, timezone.utc).date()} "
+                f"{datetime.fromtimestamp(cursor / 1000, UTC).date()} "
                 f"of {window.end.date()} reached; raise "
                 f"LOADER_CONFIG.max_pages_per_symbol to fetch the rest"
             )
@@ -157,8 +156,8 @@ class BaseLoader(ABC):
     def __init__(
         self,
         venue: str,
-        store: Optional[ParquetStore] = None,
-        asset_master: Optional[AssetMaster] = None,
+        store: ParquetStore | None = None,
+        asset_master: AssetMaster | None = None,
     ):
         self.venue = venue
         self.store = store or ParquetStore(DATASTORE_PATH)
@@ -190,7 +189,7 @@ class BaseLoader(ABC):
     def resolve_symbols(
         self,
         symbols: list[str],
-        asof: Optional[datetime] = None,
+        asof: datetime | None = None,
     ) -> dict[str, str]:
         """Resolve venue symbols to canonical asset_ids.
 
@@ -226,7 +225,7 @@ class BaseLoader(ABC):
         self,
         df: pl.DataFrame,
         event_ts_col: str = "event_ts",
-        ingested_ts: Optional[datetime] = None,
+        ingested_ts: datetime | None = None,
     ) -> pl.DataFrame:
         """Ensure DataFrame has event_ts and ingested_ts columns.
 
@@ -239,7 +238,7 @@ class BaseLoader(ABC):
             DataFrame with both timestamps guaranteed
         """
         if ingested_ts is None:
-            ingested_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            ingested_ts = datetime.now(UTC).replace(tzinfo=None)
 
         df = df.clone()
 

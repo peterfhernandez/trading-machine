@@ -10,8 +10,7 @@ asset ever considered (not just members) so downstream code can see why an
 asset was excluded and measure turnover over time.
 """
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
@@ -35,7 +34,7 @@ class UniverseBuilder:
 
     def __init__(
         self,
-        store: Optional[ParquetStore] = None,
+        store: ParquetStore | None = None,
         config: UniverseConfig = UNIVERSE_CONFIG,
         venue: str = "binance",
     ):
@@ -112,9 +111,9 @@ class UniverseBuilder:
     def _exclusion_reason(
         self,
         asset_id: str,
-        listing_age_days: Optional[int],
-        dollar_volume_median: Optional[float],
-    ) -> Optional[str]:
+        listing_age_days: int | None,
+        dollar_volume_median: float | None,
+    ) -> str | None:
         cfg = self.config
         if cfg.exclude_stablecoins and asset_id in cfg.stablecoin_symbols:
             return "stablecoin"
@@ -126,7 +125,7 @@ class UniverseBuilder:
             return "low_volume"
         return None
 
-    def build(self, asof: Optional[datetime] = None) -> pl.DataFrame:
+    def build(self, asof: datetime | None = None) -> pl.DataFrame:
         """Build point-in-time universe membership as of `asof` (default: now).
 
         Returns one row per asset observed in the listing-age/volume windows;
@@ -136,7 +135,7 @@ class UniverseBuilder:
         low_volume, or rank_cutoff).
         """
         if asof is None:
-            asof = datetime.now(timezone.utc).replace(tzinfo=None)
+            asof = datetime.now(UTC).replace(tzinfo=None)
 
         volume_df = self._dollar_volume(asof)
         age_df = self._listing_age(asof)
@@ -180,7 +179,7 @@ class UniverseBuilder:
             pl.col("exclusion_reason").is_null().alias("in_universe")
         )
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = datetime.now(UTC).replace(tzinfo=None)
         event_ts = datetime(asof.year, asof.month, asof.day)
 
         universe = universe.with_columns(
@@ -203,7 +202,7 @@ class UniverseBuilder:
             "exclusion_reason",
         )
 
-    def build_and_store(self, asof: Optional[datetime] = None) -> pl.DataFrame:
+    def build_and_store(self, asof: datetime | None = None) -> pl.DataFrame:
         """Build the universe and append it to the datastore (point-in-time)."""
         df = self.build(asof)
         if len(df) == 0:
@@ -242,7 +241,7 @@ class UniverseBuilder:
             )
         return df
 
-    def _previous_snapshot(self, event_date) -> Optional[tuple[object, pl.DataFrame]]:
+    def _previous_snapshot(self, event_date) -> tuple[object, pl.DataFrame] | None:
         """The most recent stored snapshot before `event_date`, for turnover.
 
         Best-effort and never fatal: turnover is an observability nicety, and a

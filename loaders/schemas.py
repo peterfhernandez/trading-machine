@@ -1,8 +1,8 @@
 """Dataset schemas for loaders (OHLCV, funding rates, open interest)."""
 
 import polars as pl
-from datastore import DatasetSchema
 
+from datastore import DatasetSchema
 
 OHLCV_SCHEMA = DatasetSchema(
     name="ohlcv",

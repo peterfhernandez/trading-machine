@@ -11,10 +11,8 @@ from datetime import datetime
 from log_demo import start_demo_run
 
 from config import PAPER
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.backfill import BackfillRunner
-
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +68,7 @@ def main():
 
         try:
             checkpoint_dir = f"{tmpdir}/checkpoints"
-            logger.info(f"Initializing BackfillRunner for Binance...")
+            logger.info("Initializing BackfillRunner for Binance...")
             runner = BackfillRunner("binance", checkpoint_dir, store, am)
 
             logger.info("Running 30-day backfill (mock mode)...")

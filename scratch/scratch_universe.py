@@ -22,8 +22,6 @@ from datastore import ParquetStore
 from loaders.schemas import OHLCV_SCHEMA
 from universe import UniverseBuilder, compute_turnover
 
-
-
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

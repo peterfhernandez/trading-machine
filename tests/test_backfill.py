@@ -2,12 +2,11 @@
 
 import json
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.backfill import BackfillRunner
 from loaders.window import FetchWindow
 

@@ -4,16 +4,14 @@ import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from config import DATASTORE_PATH, LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster
-from loaders.ohlcv import OHLCVLoader
+from datastore import AssetMaster, ParquetStore
 from loaders.funding_rate import FundingRateLoader
+from loaders.ohlcv import OHLCVLoader
 from loaders.open_interest import OpenInterestLoader
 from loaders.window import Coverage, FetchWindow, resume_window, utc_now
 from logging_config import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -32,9 +30,9 @@ class BackfillRunner:
     def __init__(
         self,
         venue: str = "binance",
-        checkpoint_dir: Optional[Path] = None,
-        store: Optional[ParquetStore] = None,
-        asset_master: Optional[AssetMaster] = None,
+        checkpoint_dir: Path | None = None,
+        store: ParquetStore | None = None,
+        asset_master: AssetMaster | None = None,
         ignore_checkpoint: bool = False,
     ):
         self.venue = venue
@@ -54,7 +52,7 @@ class BackfillRunner:
         checkpoint_file = self._checkpoint_file()
         if checkpoint_file.exists():
             try:
-                with open(checkpoint_file, "r") as f:
+                with open(checkpoint_file) as f:
                     data = json.load(f)
                 logger.debug(f"Loaded checkpoint from {checkpoint_file}: {sorted(data)}")
                 return data
@@ -72,13 +70,13 @@ class BackfillRunner:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    def coverage(self, checkpoint: dict, dataset: str) -> Optional[Coverage]:
+    def coverage(self, checkpoint: dict, dataset: str) -> Coverage | None:
         """What `dataset` has already covered, or None to fetch everything."""
         if self.ignore_checkpoint:
             return None
         return Coverage.from_json(checkpoint.get(dataset))
 
-    def plan(self, checkpoint: dict, dataset: str, requested: FetchWindow) -> Optional[FetchWindow]:
+    def plan(self, checkpoint: dict, dataset: str, requested: FetchWindow) -> FetchWindow | None:
         """The part of `requested` still missing for `dataset` (None if nothing)."""
         window = resume_window(
             requested,
@@ -99,8 +97,8 @@ class BackfillRunner:
 
     def run(
         self,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         days_back: int = 1825,
     ) -> None:
         """Run backfill for all loaders.
@@ -236,7 +234,7 @@ class BackfillRunner:
 def run_backfill(
     venue: str = "binance",
     days: int = 30,
-    checkpoint_dir: Optional[Path] = None,
+    checkpoint_dir: Path | None = None,
     ignore_checkpoint: bool = False,
 ) -> None:
     """Run backfill end-to-end.

@@ -11,11 +11,9 @@ from datetime import datetime
 from log_demo import start_demo_run
 
 from config import PAPER
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.ohlcv import OHLCVLoader
 from loaders.schemas import OHLCV_SCHEMA
-
-
 
 logging.basicConfig(
     level=logging.INFO,

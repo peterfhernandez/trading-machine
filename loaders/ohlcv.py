@@ -1,18 +1,16 @@
 """OHLCV loader for daily and hourly candles via ccxt."""
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import ccxt
 import polars as pl
 
-from config import DATASTORE_PATH, LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster
+from config import LOADER_CONFIG
+from datastore import AssetMaster, ParquetStore
 from loaders.base import BaseLoader, paginate_time_series, select_usdt_symbols
 from loaders.schemas import OHLCV_SCHEMA
 from loaders.window import FetchWindow
 from logging_config import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -24,9 +22,9 @@ class OHLCVLoader(BaseLoader):
         self,
         venue: str,
         lookback_days: int = 365,
-        store: Optional[ParquetStore] = None,
-        asset_master: Optional[AssetMaster] = None,
-        max_symbols: Optional[int] = None,
+        store: ParquetStore | None = None,
+        asset_master: AssetMaster | None = None,
+        max_symbols: int | None = None,
     ):
         super().__init__(venue, store, asset_master)
         self.lookback_days = lookback_days
@@ -44,7 +42,7 @@ class OHLCVLoader(BaseLoader):
         return exchange
 
     def fetch(
-        self, timeframe: str = "1d", window: Optional[FetchWindow] = None
+        self, timeframe: str = "1d", window: FetchWindow | None = None
     ) -> pl.DataFrame:
         """Fetch OHLCV data for top assets.
 
@@ -83,7 +81,7 @@ class OHLCVLoader(BaseLoader):
                     continue
 
                 for candle in candles:
-                    ts = datetime.fromtimestamp(candle[0] / 1000, timezone.utc).replace(tzinfo=None)
+                    ts = datetime.fromtimestamp(candle[0] / 1000, UTC).replace(tzinfo=None)
                     rows.append({
                         "symbol": symbol,
                         "timeframe": timeframe,
@@ -140,7 +138,7 @@ class OHLCVLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} rows; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run_daily(self, window: Optional[FetchWindow] = None) -> int:
+    def run_daily(self, window: FetchWindow | None = None) -> int:
         """Fetch and append daily OHLCV. Returns the number of rows appended."""
         df = self.fetch(timeframe="1d", window=window)
         if len(df) == 0:
@@ -148,7 +146,7 @@ class OHLCVLoader(BaseLoader):
         self.append("ohlcv_daily", df, OHLCV_SCHEMA)
         return len(df)
 
-    def run_hourly(self, window: Optional[FetchWindow] = None) -> int:
+    def run_hourly(self, window: FetchWindow | None = None) -> int:
         """Fetch and append hourly OHLCV. Returns the number of rows appended."""
         df = self.fetch(timeframe="1h", window=window)
         if len(df) == 0:

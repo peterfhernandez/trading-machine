@@ -78,6 +78,35 @@ order are defined in PLAN.md and TODO.md — follow them.
   working branch into main.
 - PR text must contain no reference to Claude, AI, or Anthropic.
 
+### Commit authorship — must be me, not the tool
+
+Every commit must be authored *and* committed by:
+
+- Name: `Peter Hernandez`
+- Email: `peter@hernandez.id.au`
+
+Agent environments ship with a global git identity of `Claude
+<noreply@anthropic.com>`, and repo-local config beats global. Before the first
+commit in any session, check it and fix it if it is wrong:
+
+```bash
+git config user.name    # must print: Peter Hernandez
+git config user.email   # must print: peter@hernandez.id.au
+
+# if either is wrong, set the repo-local identity before committing:
+git config user.name "Peter Hernandez"
+git config user.email "peter@hernandez.id.au"
+```
+
+Never pass `--author`, `--reset-author`, or `-c user.*` to work around this —
+set the config, then commit normally. After committing, verify with
+`git log -1 --format='%an <%ae> / %cn <%ce>'`; all four fields must be mine.
+
+A commit with the wrong author is as much a violation as attribution in the
+message, and it is invisible in the message text, so the message check alone
+does not cover it. Noticed before pushing: amend it. Already pushed: say so
+plainly rather than force-pushing.
+
 ## ABSOLUTE RULE — NO ATTRIBUTION, NO EXCEPTIONS
 
 Never write any of the following into a commit message, PR title, PR body,

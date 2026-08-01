@@ -12,10 +12,9 @@ The asset master stores:
 - validity_start, validity_end: when the mapping was/is active (point-in-time)
 """
 
-from datetime import datetime, date, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
-from dataclasses import dataclass, field
 
 import polars as pl
 
@@ -32,7 +31,7 @@ class AssetSymbolMapping:
     venue: str
     symbol: str
     validity_start: datetime
-    validity_end: Optional[datetime] = None  # None = currently active
+    validity_end: datetime | None = None  # None = currently active
     is_primary: bool = True  # Primary symbol for this asset on this venue
 
 
@@ -47,7 +46,7 @@ class AssetMaster:
             store_path: Path to asset_master.parquet file
         """
         self.path = Path(store_path)
-        self._cache: Optional[pl.DataFrame] = None
+        self._cache: pl.DataFrame | None = None
         self._load()
 
     def _load(self) -> None:
@@ -74,7 +73,7 @@ class AssetMaster:
         venue: str,
         symbol: str,
         validity_start: datetime,
-        validity_end: Optional[datetime] = None,
+        validity_end: datetime | None = None,
         is_primary: bool = True,
     ) -> None:
         """
@@ -109,9 +108,9 @@ class AssetMaster:
         self,
         symbol: str,
         venue: str,
-        asof: Optional[datetime] = None,
+        asof: datetime | None = None,
         warn_if_unresolved: bool = True,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Resolve a venue symbol to a canonical asset_id.
 
@@ -129,7 +128,7 @@ class AssetMaster:
             Canonical asset_id, or None if not found
         """
         if asof is None:
-            asof = datetime.now(timezone.utc).replace(tzinfo=None)
+            asof = datetime.now(UTC).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("symbol") == symbol)
@@ -178,8 +177,8 @@ class AssetMaster:
         return matches["asset_id"][0]
 
     def get_symbol(
-        self, asset_id: str, venue: str, asof: Optional[datetime] = None
-    ) -> Optional[str]:
+        self, asset_id: str, venue: str, asof: datetime | None = None
+    ) -> str | None:
         """
         Get the primary symbol for an asset on a venue.
 
@@ -193,12 +192,12 @@ class AssetMaster:
             or None if the mapping doesn't exist
         """
         if asof is None:
-            asof = datetime.now(timezone.utc).replace(tzinfo=None)
+            asof = datetime.now(UTC).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("asset_id") == asset_id)
             & (pl.col("venue") == venue)
-            & (pl.col("is_primary") == True)
+            & (pl.col("is_primary"))
             & (pl.col("validity_start") <= asof)
             & (
                 (pl.col("validity_end").is_null())
@@ -210,17 +209,17 @@ class AssetMaster:
             return None
         return matches["symbol"][0]
 
-    def list_assets(self) -> List[str]:
+    def list_assets(self) -> list[str]:
         """List all canonical asset IDs."""
         return sorted(self._cache["asset_id"].unique().to_list())
 
-    def list_venues(self) -> List[str]:
+    def list_venues(self) -> list[str]:
         """List all venues in the asset master."""
         return sorted(self._cache["venue"].unique().to_list())
 
     def asset_info(
-        self, asset_id: str, asof: Optional[datetime] = None
-    ) -> Dict[str, str]:
+        self, asset_id: str, asof: datetime | None = None
+    ) -> dict[str, str]:
         """
         Get current venue symbols for an asset.
 
@@ -228,11 +227,11 @@ class AssetMaster:
             Dict mapping venue -> primary symbol at asof date
         """
         if asof is None:
-            asof = datetime.now(timezone.utc).replace(tzinfo=None)
+            asof = datetime.now(UTC).replace(tzinfo=None)
 
         matches = self._cache.filter(
             (pl.col("asset_id") == asset_id)
-            & (pl.col("is_primary") == True)
+            & (pl.col("is_primary"))
             & (pl.col("validity_start") <= asof)
             & (
                 (pl.col("validity_end").is_null())
@@ -243,7 +242,13 @@ class AssetMaster:
         if len(matches) == 0:
             return {}
 
-        return dict(zip(matches["venue"].to_list(), matches["symbol"].to_list()))
+        return dict(
+            zip(
+                matches["venue"].to_list(),
+                matches["symbol"].to_list(),
+                strict=True,
+            )
+        )
 
     def _save(self) -> None:
         """Save asset master to disk."""

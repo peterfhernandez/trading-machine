@@ -65,7 +65,7 @@ from config import LOG_CONFIG
 # run_id correlation
 # ---------------------------------------------------------------------------
 
-_run_id_var: "contextvars.ContextVar[str]" = contextvars.ContextVar("run_id", default="-")
+_run_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("run_id", default="-")
 
 
 def new_run_id() -> str:
@@ -165,7 +165,7 @@ class TimestampedRotatingFileHandler(logging.handlers.RotatingFileHandler):
     backups to keep is `retention_days`' business (LOGGING.md section 3.2).
     """
 
-    def doRollover(self) -> None:
+    def doRollover(self) -> None:  # noqa: N802 - overrides a stdlib method name
         if self.stream:
             self.stream.close()
             self.stream = None

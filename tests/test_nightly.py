@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 
-from datastore import ParquetStore, DatasetSchema, AssetMaster
+from datastore import AssetMaster, DatasetSchema, ParquetStore
 from pipeline.nightly import NightlyPipeline, parse_window_arg
 
 

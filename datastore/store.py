@@ -8,15 +8,13 @@ Core principles:
 - Schema-enforced at write time
 """
 
-from datetime import datetime, date, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Any
-from dataclasses import dataclass, field, asdict
+from typing import Any
 
 import polars as pl
 from polars import Schema
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 from logging_config import get_logger
 
@@ -28,7 +26,7 @@ class DatasetSchema:
     """Schema definition for a dataset with required timestamp columns."""
 
     name: str
-    fields: Dict[str, Any]  # Maps column name to Polars data type
+    fields: dict[str, Any]  # Maps column name to Polars data type
 
     def __post_init__(self):
         """Ensure event_ts and ingested_ts are always present."""
@@ -60,7 +58,7 @@ class ParquetStore:
         dataset: str,
         df: pl.DataFrame,
         schema: DatasetSchema,
-        partition_key: Optional[str] = None,
+        partition_key: str | None = None,
     ) -> None:
         """
         Append data to a dataset (append-only, no overwrites).
@@ -129,9 +127,9 @@ class ParquetStore:
     def read(
         self,
         dataset: str,
-        date_range: Optional[tuple[str, str]] = None,
-        asof: Optional[str] = None,
-        columns: Optional[List[str]] = None,
+        date_range: tuple[str, str] | None = None,
+        asof: str | None = None,
+        columns: list[str] | None = None,
     ) -> pl.DataFrame:
         """
         Read data from a dataset with point-in-time semantics.
@@ -214,13 +212,13 @@ class ParquetStore:
 
         return result
 
-    def list_datasets(self) -> List[str]:
+    def list_datasets(self) -> list[str]:
         """List all datasets in the store."""
         if not self.root.exists():
             return []
         return [d.name for d in self.root.iterdir() if d.is_dir()]
 
-    def dataset_info(self, dataset: str) -> Dict[str, Any]:
+    def dataset_info(self, dataset: str) -> dict[str, Any]:
         """
         Get metadata for a dataset.
 
