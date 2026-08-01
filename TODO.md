@@ -237,7 +237,17 @@ different answers. Plus the CI that would have caught some of it.
       `tests/test_tmpdir_cleanup.py` runs pytest in a subprocess over a seeded
       stale link and asserts the exit code, with a negative control that fails
       if the harness ever stops reproducing the crash
-- [ ] Make `ci.yml` a **required status check** on `main` in the repository's
+- [x] **`python -m scratch.<demo>` died on its first import.** Phase 5.5 gave
+      every demo `from log_demo import start_demo_run`, which resolves only
+      when the demo's own directory leads `sys.path` — i.e. when it is run as a
+      script. Under `-m` the repo root leads and `scratch/` is nowhere on the
+      path, so all fifteen demos raised `ModuleNotFoundError: No module named
+      'log_demo'` before printing a line. `scratch/__init__.py` puts both
+      directories on the path and is imported before the module runs, so future
+      demos inherit the fix; `tests/test_scratch_demos.py` runs both
+      invocations in subprocesses, because the test process has `scratch/`
+      reachable through neither entry and cannot see the defect in-process
+- [x] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
 
@@ -610,3 +620,24 @@ different answers. Plus the CI that would have caught some of it.
   entry should name a version somebody actually uses. `ruff` stays on
   `target-version = "py311"` and mypy on `python_version = "3.11"`: both are
   about the *floor* of supported syntax, which 3.14 does not move.
+- 2026-08-01: **The scratch demos could not be run as modules.**
+  `python -m scratch.scratch_audit` raised `ModuleNotFoundError: No module
+  named 'log_demo'` on line one. Phase 5.5 opened every demo with
+  `from log_demo import start_demo_run`, which resolves only under
+  `python scratch/scratch_audit.py` — there `sys.path[0]` is the script's own
+  directory. Under `-m` `sys.path[0]` is the repo root and `scratch/` is not on
+  the path at all, so the import failed for all fifteen demos before any of
+  them printed a line. Fixed with `scratch/__init__.py`, which inserts both the
+  scratch directory (for `log_demo`) and the repo root (for `config`,
+  `logging_config` and the project packages): `python -m` imports the package
+  before it runs the module, so the inserts happen first and a demo added later
+  inherits the fix instead of rediscovering the bug. The direct-script form is
+  untouched — `log_demo` still inserts the repo root itself, so a demo run as a
+  script does not depend on the package having been imported. 9 new tests
+  (`tests/test_scratch_demos.py`): every `scratch_*` module imported as a
+  package submodule, plus both invocations of `scratch_audit` run end to end.
+  They are subprocesses for the same reason the `python -m pipeline.nightly`
+  regression test is: pytest runs from the repo root with `scratch/` reachable
+  through neither entry, so nothing in-process reproduces the failing path.
+  Removing `scratch/__init__.py` fails 5 of the 9, which is the negative
+  control. 603 tests passing.
