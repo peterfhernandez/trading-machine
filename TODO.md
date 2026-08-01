@@ -256,6 +256,25 @@ different answers. Plus the CI that would have caught some of it.
 - [x] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
+- [x] **`python -m scratch.scratch_observability` died on Windows** with a
+      `FileNotFoundError` on the log file it had just asked a child pipeline to
+      write. The child had exited 1 without writing anything: the demo built
+      its environment from a four-key dict, and `pipeline.nightly` imports
+      `ccxt` — so `ssl` and `socket`, whose extension modules do not load on
+      Windows without the environment the interpreter was started with. The
+      demo captured the child's stderr and never printed it, so the one place
+      the reason was written down was thrown away. Environment inherited then
+      overridden (the pattern `tests/test_logging.py` already used); the child's
+      stderr is printed when the log file is missing;
+      `tests/test_scratch_demos.py::_run` had the same literal-dict fragility
+      (a POSIX `PATH`, a guessed `SYSTEMROOT`) and was fixed with it
+- [x] **A redirected `python -m pipeline.nightly` failed its own report.**
+      `sys.stdout` takes the locale encoding when it is not a terminal —
+      cp1252 on a default Windows install — and `_report_stage` prints `✓` and
+      `🛑`. The `print` raised `UnicodeEncodeError`, the stage failed, the run
+      was logged CRITICAL, and a live run exited 1: piping the output changed
+      the outcome of the pipeline. The CLI now reconfigures both streams with
+      `errors="replace"`, leaving the encoding itself alone
 
 ## Phase 6 — Risk model (M7)
 
@@ -647,3 +666,39 @@ different answers. Plus the CI that would have caught some of it.
   through neither entry, so nothing in-process reproduces the failing path.
   Removing `scratch/__init__.py` fails 5 of the 9, which is the negative
   control. 603 tests passing.
+- 2026-08-01: **The observability demo could not run its own subprocess.**
+  `python -m scratch.scratch_observability` printed `exit code: 1` and then
+  died with `FileNotFoundError` on `<tmp>\module-run\pipeline.log` — the file
+  its child `python -m pipeline.nightly` was supposed to have written. Two
+  separate defects, neither in the logging mechanism the demo exists to show.
+  (1) **The child was handed a four-key environment** — `PATH`, `PAPER`,
+  `TM_LOG_DIR`, `PYTHONPATH` — and `pipeline.nightly` imports `ccxt` at module
+  scope, so `ssl` and `socket` with it; on Windows those extension modules do
+  not load without the environment the interpreter was started with
+  (`SYSTEMROOT` chief among them). The child therefore failed at import, before
+  any logging was configured, which is why there was no `pipeline.log` to read.
+  The environment is now inherited and then overridden — the pattern
+  `tests/test_logging.py`'s own CLI regression test already used, and which the
+  demo had diverged from. `tests/test_scratch_demos.py::_run` carried the same
+  literal dict, with a POSIX `PATH` hardcoded and `SYSTEMROOT` guessed as
+  `C:\Windows`, and was fixed alongside it. (2) **The demo threw away the one
+  thing that explained the failure:** it captured the child's stderr and never
+  printed it, then indexed straight into a file that did not exist, so a
+  four-line traceback in the parent stood in for a diagnosis in the child. A
+  missing log file is now reported as the finding it is, with the child's own
+  stderr attached, and `main()` returns non-zero. Found on the way, and worse:
+  **a redirected `python -m pipeline.nightly` failed its own report stage.**
+  `sys.stdout` takes the locale encoding when it is not a terminal — cp1252 on
+  a default Windows install — and `_report_stage` prints `✓` and `🛑`, which
+  cp1252 cannot encode. The `print` raised `UnicodeEncodeError`, `_stage`
+  logged the stage CRITICAL, `run()` logged the run as failed, and a live
+  (non-dry) run exited 1. Piping the output changed the outcome of the
+  pipeline, and `deploy.yml`-style automation keying off an exit code would
+  have believed it. The CLI now reconfigures stdout and stderr with
+  `errors="replace"`, leaving the encoding alone — a glyph the console cannot
+  show degrades to `?` instead of ending the night's run. 10 new tests: the
+  demo's child environment inherits the parent's and still overrides the three
+  values it controls; the demo runs end to end as a module; and the CLI under
+  `PYTHONIOENCODING=cp1252` exits 0, prints its report, logs no CRITICAL, and
+  still emits the real glyphs on a UTF-8 console. The cp1252 pair fails without
+  the fix, which is the negative control. 613 tests passing.

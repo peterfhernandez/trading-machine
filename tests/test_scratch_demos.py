@@ -18,6 +18,7 @@ reachable through neither entry. That is the Phase 5.6 lesson about
 the code path that is broken.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,18 +34,27 @@ DEMO_MODULES = sorted(p.stem for p in SCRATCH_DIR.glob("scratch_*.py"))
 
 
 def _run(args: list[str], tmp_path: Path) -> subprocess.CompletedProcess:
-    """Run a demo in its own process, kept away from the real logs directory."""
+    """Run a demo in its own process, kept away from the real logs directory.
+
+    The environment is inherited and then overridden, rather than built from a
+    literal dict. The literal version named a POSIX `PATH` and guessed at
+    `SYSTEMROOT`, which is a list that has to stay right on every platform the
+    suite runs on — and the demos import `ccxt`, so `ssl` and `socket`, which
+    on Windows do not load without the environment the interpreter was started
+    with. Only the three values these tests actually control are set here.
+    """
     return subprocess.run(
         args,
         cwd=PROJECT_ROOT,
         env={
-            "PATH": "/usr/bin:/bin",
+            **os.environ,
             "PAPER": "true",
             "TM_LOG_DIR": str(tmp_path / "logs"),
-            "SYSTEMROOT": "C:\\Windows",  # Windows needs this for sockets/random
+            "PYTHONIOENCODING": "utf-8",
         },
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
 
@@ -128,3 +138,76 @@ class TestTheReportedInvocation:
         audit_log = tmp_path / "logs" / "audit.log"
         assert audit_log.exists(), "the demo produced no audit.log"
         assert audit_log.read_text().splitlines()
+
+
+class TestTheEnvironmentAChildDemoGets:
+    """`scratch_observability` runs the pipeline in a subprocess; that child
+    needs a working interpreter environment, and hand-building one is how it
+    stopped having one.
+
+    The reported symptom was a `FileNotFoundError` on the log file the demo had
+    just asked the child to write. The child had exited 1 without writing
+    anything, because a four-key env dict (PATH, PAPER, TM_LOG_DIR, PYTHONPATH)
+    left out everything else Windows needs to import `ssl` and `socket` — which
+    `ccxt`, imported at `pipeline.nightly`'s module scope, pulls in. The
+    diagnosis was in a stderr pipe the demo captured and never printed.
+
+    These are in-process because the failure is in a dict, not in a process.
+    """
+
+    @staticmethod
+    def _env(tmp_path: Path) -> dict[str, str]:
+        from scratch.scratch_observability import child_env
+
+        return child_env(tmp_path / "module-run")
+
+    def test_it_inherits_the_parent_environment(self, tmp_path, monkeypatch):
+        """The name is a stand-in for SYSTEMROOT, TEMP, and anything else a
+        platform needs; the point is that the child is not handed a whitelist."""
+        monkeypatch.setenv("TM_DEMO_CANARY", "inherited")
+
+        assert self._env(tmp_path).get("TM_DEMO_CANARY") == "inherited"
+
+    def test_it_still_overrides_the_three_values_the_demo_controls(self, tmp_path):
+        monkeypatch_free = self._env(tmp_path)
+
+        assert monkeypatch_free["PAPER"] == "true"
+        assert monkeypatch_free["TM_LOG_DIR"] == str(tmp_path / "module-run")
+        assert monkeypatch_free["PYTHONPATH"] == str(PROJECT_ROOT)
+
+    def test_the_log_directory_override_wins_over_an_inherited_one(self, tmp_path, monkeypatch):
+        """Otherwise the demo would write into whatever TM_LOG_DIR the shell
+        already had — including the real `logs/`."""
+        monkeypatch.setenv("TM_LOG_DIR", "/somewhere/else")
+
+        assert self._env(tmp_path)["TM_LOG_DIR"] == str(tmp_path / "module-run")
+
+    def test_the_child_is_told_to_write_utf8(self, tmp_path):
+        """The pipeline's report prints `✓`; a captured stdout would otherwise
+        take the locale encoding, which on Windows cannot encode it."""
+        assert self._env(tmp_path)["PYTHONIOENCODING"] == "utf-8"
+
+
+@pytest.mark.integration
+class TestTheObservabilityDemoRunsEndToEnd:
+    """The demo in the bug report, run both documented ways.
+
+    It is the one demo that starts a subprocess of its own, so it is the one
+    where the parent's environment matters — and an import-only sweep cannot
+    see that, exactly as an import-only test could not see `tm.__main__`.
+    """
+
+    def test_running_it_as_a_module_succeeds(self, tmp_path):
+        result = _run([sys.executable, "-m", "scratch.scratch_observability"], tmp_path)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "FAILED: no pipeline.log" not in result.stdout
+        assert "record(s)" in result.stdout
+
+    def test_the_child_pipeline_wrote_its_log(self, tmp_path):
+        """The demo's actual claim: `python -m pipeline.nightly` leaves records
+        in `pipeline.log`, under `tm.pipeline` rather than `tm.__main__`."""
+        result = _run([sys.executable, "-m", "scratch.scratch_observability"], tmp_path)
+
+        assert "exit code: 0" in result.stdout
+        assert "logger:  tm.pipeline" in result.stdout

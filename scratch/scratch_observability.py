@@ -21,6 +21,7 @@ No network, no store writes: a temporary log directory and synthetic records.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -41,32 +42,64 @@ def section(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
-def demo_module_invocation(tmp: Path) -> None:
+def child_env(log_dir: Path) -> dict[str, str]:
+    """Environment for the child pipeline: the parent's, plus three overrides.
+
+    Inherited rather than hand-built. A minimal dict looks tidy and is a trap:
+    the child imports `ccxt`, and therefore `ssl` and `socket`, whose extension
+    modules do not load on Windows when `SYSTEMROOT` is absent. Passing only
+    PATH killed the child at import — before any logging was configured, so
+    there was no `pipeline.log` to read and no clue in the demo's output as to
+    why. Anything the interpreter needs to start is the parent's business, not
+    a list this file has to keep correct on three platforms.
+
+    `PYTHONIOENCODING` is the second half: the pipeline's report prints `✓` and
+    `🛑`, and a captured stdout takes the locale encoding (cp1252 on a default
+    Windows install), where those characters cannot be encoded at all.
+    """
+    return {
+        **os.environ,
+        "PAPER": "true",
+        "TM_LOG_DIR": str(log_dir),
+        "PYTHONPATH": str(PROJECT_ROOT),
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
+def demo_module_invocation(tmp: Path) -> bool:
     section("1. `python -m pipeline.nightly` leaves a record")
 
     log_dir = tmp / "module-run"
     result = subprocess.run(
         [sys.executable, "-m", "pipeline.nightly", "--dry-run", "--days", "1"],
         cwd=PROJECT_ROOT,
-        env={
-            "PATH": __import__("os").environ.get("PATH", ""),
-            "PAPER": "true",
-            "TM_LOG_DIR": str(log_dir),
-            "PYTHONPATH": str(PROJECT_ROOT),
-        },
+        env=child_env(log_dir),
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
     print(f"exit code: {result.returncode}")
 
     written = log_dir / "pipeline.log"
+    if result.returncode != 0 or not written.exists():
+        # The demo's whole claim is that this file gets written, so a missing
+        # file is the finding — report it with the child's own diagnosis
+        # attached, rather than raising FileNotFoundError from the parent and
+        # burying the reason in a discarded stderr pipe.
+        print(f"  FAILED: no {written.name} at {log_dir}")
+        print(f"  the child's stderr ({len(result.stderr.splitlines())} line(s)):")
+        for line in result.stderr.splitlines()[-15:]:
+            print(f"    {line}")
+        return False
+
     records = [json.loads(line) for line in written.read_text().splitlines() if line.strip()]
     print(f"{written.name}: {len(records)} record(s)")
     print(f"  logger:  {records[0]['logger']}   (was tm.__main__, which had no file)")
     print(f"  run_id:  {records[0]['run_id']}")
     for record in records[:4]:
         print(f"    {record['level']:8s} {record['message'][:60]}")
+    return True
 
 
 def demo_level_override(tmp: Path) -> None:
@@ -152,12 +185,12 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        demo_module_invocation(tmp)
+        ok = demo_module_invocation(tmp)
         demo_level_override(tmp)
         demo_rotation_collision(tmp)
         demo_signal_status()
 
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

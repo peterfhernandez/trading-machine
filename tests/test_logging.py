@@ -652,6 +652,78 @@ class TestMainModuleLoggerBinding:
         assert {r["run_id"] for r in records} != {"-"}
 
 
+class TestTheCliSurvivesANarrowConsole:
+    """`python -m pipeline.nightly > out.txt` on Windows died on a checkmark.
+
+    `sys.stdout` takes the locale encoding when it is not a terminal — cp1252
+    on a default Windows install — and `_report_stage` prints `✓` and `🛑`,
+    neither of which exists there. The `print` raised `UnicodeEncodeError`, so
+    the report stage failed, `run()` logged the run as failed, and a live run
+    exited 1. Redirecting the output changed the outcome of the pipeline.
+
+    Only a subprocess can carry a stdout encoding, so that is what these use;
+    `PYTHONIOENCODING=cp1252` reproduces the Windows default on any platform.
+    """
+
+    @staticmethod
+    def _run(tmp_path, encoding):
+        env = {
+            **os.environ,
+            "PAPER": "true",
+            "TM_LOG_DIR": str(tmp_path),
+            "PYTHONPATH": str(PROJECT_ROOT),
+            "PYTHONIOENCODING": encoding,
+        }
+        return subprocess.run(
+            [sys.executable, "-m", "pipeline.nightly", "--dry-run", "--days", "1"],
+            cwd=PROJECT_ROOT, env=env, capture_output=True,
+            encoding=encoding, errors="replace", timeout=180,
+        )
+
+    @pytest.mark.integration
+    def test_the_report_stage_completes_on_a_cp1252_stdout(self, tmp_path):
+        result = self._run(tmp_path, "cp1252")
+
+        assert result.returncode == 0, result.stderr
+        assert "UnicodeEncodeError" not in result.stderr
+        assert "Trading Status" in result.stdout
+
+    @pytest.mark.integration
+    def test_the_run_is_not_logged_as_failed(self, tmp_path):
+        """The symptom that mattered: a full pipeline reported as failed, with
+        a CRITICAL record, because of an unprintable glyph."""
+        self._run(tmp_path, "cp1252")
+
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "pipeline.log").read_text().splitlines()
+        ]
+        assert not [r for r in records if r["level"] == "CRITICAL"], (
+            "the run logged a CRITICAL on a stdout encoding it should tolerate"
+        )
+        assert any("Pipeline complete" in r["message"] for r in records)
+
+    @pytest.mark.integration
+    def test_a_utf8_console_still_gets_the_real_glyphs(self, tmp_path):
+        """`errors="replace"` must not be a downgrade for consoles that cope."""
+        result = self._run(tmp_path, "utf-8")
+
+        assert result.returncode == 0, result.stderr
+        assert "✓ ACTIVE" in result.stdout
+
+    def test_reconfiguring_a_stream_without_the_method_is_a_no_op(self):
+        """pytest's captured stdout is not always a TextIOWrapper, and neither
+        is a stream someone has replaced; the guard must not raise."""
+        from pipeline.nightly import tolerate_a_narrow_console
+
+        original = sys.stdout
+        sys.stdout = types.SimpleNamespace(write=lambda _: None)
+        try:
+            tolerate_a_narrow_console()
+        finally:
+            sys.stdout = original
+
+
 class TestLevelOverride:
     """DEBUG has to be reachable without editing config.py."""
 
