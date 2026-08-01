@@ -8,7 +8,9 @@ A single-person, low-cost implementation of a multifactor crypto trading system.
 
 ### Prerequisites
 
-- Python 3.11 or 3.12 (both are covered by CI; `requires-python = ">=3.11"`)
+- Python 3.11, 3.12 or 3.14 (all three are covered by CI;
+  `requires-python = ">=3.11"`). 3.14 is in the matrix because it is what the
+  trading machine runs, and therefore what `deploy.yml` verifies with.
 - pip/poetry for dependency management
 
 ### Installation
@@ -259,7 +261,7 @@ ruff check .               # clean; CI fails on any finding
 Two workflows in `.github/workflows/`:
 
 - **`ci.yml`** — on every pull request and every push to `main`, on
-  GitHub-hosted runners across Python 3.11 and 3.12: ruff (a hard gate), the
+  GitHub-hosted runners across Python 3.11, 3.12 and 3.14: ruff (a hard gate), the
   full suite, and mypy (advisory). Make it a required check on `main` and a
   red suite stops
   being mergeable. It also fails a PR whose commit messages carry tool

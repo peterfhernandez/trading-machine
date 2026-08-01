@@ -30,7 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
-| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 594 hermetic tests on 3.11 and 3.12), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 594 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 
@@ -1015,9 +1015,10 @@ merged into; and two merges in quick succession raced on one directory.
 Split in two, because they answer different questions:
 
 - **`ci.yml`** gates the merge — pull requests and pushes to `main`, on
-  GitHub-hosted runners, Python 3.11 and 3.12. The suite is hermetic (every
-  ccxt call mocked, every store a `tmp_path`), so 578 tests run in ~35 s with
-  no network. Required-check territory.
+  GitHub-hosted runners, Python 3.11, 3.12 and 3.14 (3.14 added later; see
+  below). The suite is hermetic (every ccxt call mocked, every store a
+  `tmp_path`), so 594 tests run in ~35 s with no network. Required-check
+  territory.
 - **`deploy.yml`** gates the *deployment*, which is a stronger claim than a
   status check: `git fetch` is non-destructive, so the incoming commit is
   checked out into a throwaway worktree and the suite is run **on the trading
@@ -1089,3 +1090,13 @@ fallback is unreachable, and running it everywhere is what keeps CI able to test
 it. A test asserts pytest still lacks the guard, so the day upstream adds one,
 the shim's removal is a decision someone makes rather than a duplication nobody
 notices.
+
+**The interpreter the gate runs on was not in the gate.** The report came from
+a local run on Python 3.14, and `ci.yml` tested 3.11 and 3.12. That gap is
+worse than it sounds, because `deploy.yml` does not install anything: it runs
+the suite in the throwaway worktree using *the trading machine's own*
+interpreter. So the version with the final say over whether a commit is adopted
+was the one version nothing verified. 3.14 joined the matrix. 3.13 did not —
+nothing runs on it, and `requires-python = ">=3.11"` is a floor, not a promise
+about every version in between; a matrix entry should name a version somebody
+actually uses.

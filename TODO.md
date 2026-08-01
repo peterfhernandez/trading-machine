@@ -188,9 +188,9 @@ different answers. Plus the CI that would have caught some of it.
       parsed enum, so `signal_statuses()` answers "which signals have
       evidence?" instead of a paragraph in the README
 - [x] **Pre-merge CI** (`.github/workflows/ci.yml`): pull requests and pushes
-      to `main`, Python 3.11 and 3.12, ruff + full suite + advisory mypy, and
-      a check that commit messages carry no tool attribution. Make it a
-      required check on `main`
+      to `main`, Python 3.11, 3.12 and 3.14, ruff + full suite + advisory
+      mypy, and a check that commit messages carry no tool attribution. Make it
+      a required check on `main`
 - [x] **Deploy tests before it pulls** (`.github/workflows/deploy.yml`,
       replacing `pr-merge.yml`): fetch (non-destructive) → check the incoming
       commit out into a throwaway worktree → run the suite there → only then
@@ -535,8 +535,10 @@ different answers. Plus the CI that would have caught some of it.
   omitted `max_gap_days` and/or `history_buffer_days`, so half the "specs"
   described a different signal from the one being backtested. `Status` became a
   parsed enum, so `signal_statuses()` replaces a paragraph. **CI:** `ci.yml`
-  runs ruff and the full suite on 3.11 and 3.12 for every PR (make it required
-  on `main`); `deploy.yml` replaces `pr-merge.yml` and tests before it pulls —
+  runs ruff and the full suite on 3.11, 3.12 and 3.14 for every PR (3.14 added
+  later, when the exit-code defect showed it was the gap that mattered; make it
+  required on `main`); `deploy.yml` replaces `pr-merge.yml` and tests before it
+  pulls —
   fetch, check the incoming commit out into a throwaway worktree, run the suite
   there, and only then `git reset --hard`, so a failure leaves the trading box
   on the last known-good commit. Three latent faults in the old workflow fixed
@@ -591,7 +593,20 @@ different answers. Plus the CI that would have caught some of it.
   observe the thing that was broken. The negative control paid for itself
   immediately: the first harness seeded the link under a `pytest-of-<user>`
   directory pytest never looked at, so the positive test was green for no
-  reason. 594 tests passing. Worth noting separately: the report came from a
-  local run on **Python 3.14**, which neither `ci.yml` (3.11, 3.12) nor
-  `requires-python` covers — unrelated to this defect, which is about Windows
-  rather than the interpreter, but the version gap is real and undecided.
+  reason. 594 tests passing.
+- 2026-08-01: **Python 3.14 added to the CI matrix** (`3.11`, `3.12`, `3.14`),
+  which the exit-code defect above surfaced: it was reported from a local run
+  on 3.14, and CI tested 3.11 and 3.12 only. The gap matters more than a
+  version-support question, because `deploy.yml` installs nothing — it runs the
+  suite in the throwaway worktree with *the trading machine's own* interpreter.
+  So the version with the final say over whether a commit is adopted was the
+  one version nothing verified. Confirmed before adding it rather than after:
+  the full suite installs and passes on 3.14 (594 passed, ~34 s; polars 1.43,
+  pyarrow 25, pandas 3.0, numpy 2.5, ccxt 4.5 all have 3.14 wheels), though the
+  only 3.14 build available in the environment that checked was `3.14.0rc2`, so
+  CI on GitHub's 3.14 release is the first run against a final build. 3.13 was
+  deliberately left out: nothing runs on it, and `requires-python = ">=3.11"`
+  is a floor rather than a promise about every version in between — a matrix
+  entry should name a version somebody actually uses. `ruff` stays on
+  `target-version = "py311"` and mypy on `python_version = "3.11"`: both are
+  about the *floor* of supported syntax, which 3.14 does not move.
