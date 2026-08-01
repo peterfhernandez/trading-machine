@@ -2,13 +2,13 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a real backfill · Phase 5.5 (Logging & observability) — applied**
+**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a real backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied**
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11 or 3.12 (both are covered by CI; `requires-python = ">=3.11"`)
 - pip/poetry for dependency management
 
 ### Installation
@@ -38,8 +38,10 @@ All configuration lives in `config.py`. Key settings:
 - **Alerts**: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - **Logging**: `LOG_CONFIG` — the existing `level`/`file` stub in `config.py`,
   extended with `console_level`, `dir` (replaces the single `file` path),
-  `max_bytes` (10 MB), `retention_days` (365), and `components`. See
-  [Logging](#logging) below and `LOGGING.md`.
+  `max_bytes` (10 MB), `retention_days` (365), and `components`. Levels and the
+  log directory are overridable without editing the file: `TM_LOG_LEVEL`,
+  `TM_CONSOLE_LOG_LEVEL`, `TM_LOG_DIR`. See [Logging](#logging) below and
+  `LOGGING.md`.
 
 Example:
 
@@ -68,6 +70,7 @@ pipeline/      — Daily scheduled job orchestration
 
 tests/         — pytest test suite
 scratch/       — Research notebooks & demo scripts
+.github/workflows/ — CI (pre-merge) and deploy (test-then-pull); see Testing and CI
 config.py      — Central configuration
 logging_config.py — Logging setup (get_logger, run_id, retention pruning); see Logging below
 pipeline/prune_logs.py — Standalone log retention (`python -m pipeline.prune_logs`)
@@ -122,6 +125,27 @@ This project follows a strict phased build order defined in `TODO.md`. Each phas
       the alert is attempted, and `prune_old_logs()` runs as the nightly
       pipeline's last step
 
+### Completed: Phase 5.6 (CI, test isolation, observability fixes)
+
+Auditing the applied retrofit asked a different question from building it —
+*does it work?* — and found four defects in the mechanism:
+
+- [x] `python -m pipeline.nightly` wrote **nothing** to `logs/pipeline.log`
+      (its logger was `tm.__main__`, under no component); fixed for every
+      future `python -m` entry point, and tested by running the CLI rather
+      than importing it
+- [x] DEBUG was unreachable without editing `config.py` — `--log-level` and
+      `TM_LOG_LEVEL` now exist
+- [x] Rotation destroyed a backup when two rotations landed in the same
+      second, and cost ~320 ms of syscalls per rotation at the configured
+      `backupCount`
+- [x] Log files were created for components that do not exist yet
+- [x] Test isolation: an autouse fixture keeps every test out of the real
+      datastore (the one regression that only failed on a machine with data)
+- [x] Methodology docs are parsed and checked against the code; `Status` is a
+      queryable field
+- [x] Pre-merge CI, and a deploy workflow that tests before it pulls
+
 ## Testing
 
 ```bash
@@ -166,11 +190,24 @@ timestamped and pruned once older than 12 months
 pipeline). A `run_id` is attached to every record so one pipeline run can be
 traced across every component's log file.
 
+A log file appears when its component first logs something, not at import: an
+empty `risk.log` would claim a Phase 6 that does not exist yet.
+
 ```python
 from logging_config import get_logger
 
 log = get_logger(__name__)
 log.info("loaded %d symbols", len(symbols))
+```
+
+**Turning up the detail.** DEBUG carries the per-asset signal reject reasons,
+the backtester's per-rebalance detail, and the duplicate-bar collapse count. It
+is off by default and does not require editing `config.py`:
+
+```bash
+python -m pipeline.nightly --log-level DEBUG --console-log-level INFO
+TM_LOG_LEVEL=DEBUG python -m pipeline.prune_logs      # any entry point
+TM_LOG_DIR=/tmp/tm-logs python -m pipeline.nightly    # write elsewhere
 ```
 
 Logs are distinct from Telegram alerts: logs are the always-written technical
@@ -186,6 +223,10 @@ python -m pipeline.prune_logs --dry-run   # what would be deleted
 python -m pipeline.prune_logs             # delete expired backups
 ```
 
+```bash
+PAPER=true python scratch/scratch_observability.py   # all of the above, demonstrated
+```
+
 `NightlyPipeline.run()` already calls it as its final step — in a `finally`, so
 a failed run still prunes. The standalone command is for a research box that
 runs backtests and sweeps (writing to `backtest.log` and `signals.log`) without
@@ -198,8 +239,44 @@ attempted. Telegram being down is exactly the kind of thing that should still
 appear in the log.
 
 Full design rationale — why rotation and retention are decoupled, log levels,
-the per-module map and the two places the retrofit deviated from it — is in
+the per-module map and the places the retrofit deviated from it — is in
 `LOGGING.md`.
+
+## Testing and CI
+
+```bash
+pytest                     # 578 tests, ~35s, no network
+ruff check . && ruff format --check .
+```
+
+Two workflows in `.github/workflows/`:
+
+- **`ci.yml`** — on every pull request and every push to `main`, on
+  GitHub-hosted runners across Python 3.11 and 3.12: ruff, the full suite, and
+  mypy (advisory). Make it a required check on `main` and a red suite stops
+  being mergeable. It also fails a PR whose commit messages carry tool
+  attribution, per `CLAUDE.md`.
+- **`deploy.yml`** — when a PR merges into `main`, on the self-hosted
+  `trading-machine` runner. It **tests before it pulls**: `git fetch` (which
+  touches nothing), check the incoming commit out into a throwaway worktree,
+  run the suite there, and only then `git reset --hard` the live working copy.
+  A failure leaves the machine on the last known-good commit. There is
+  deliberately no `git clean` — `data/` and `logs/` are git-ignored and hold
+  the datastore and the durable run record.
+
+Two things about the suite worth knowing:
+
+- **pytest ≥ 8.4 is a floor, not a preference.** The `tm` logger tree does not
+  propagate to the root logger, and only 8.4+ attaches `caplog` to
+  non-propagating loggers. On anything older the assertions that a halt leaves
+  a CRITICAL record stop working — the negative ones silently. A canary test
+  fails loudly if that ever changes.
+- **No test may touch the real datastore.** An autouse fixture
+  (`tests/conftest.py::isolate_production_datastore`) redirects every module's
+  `DATASTORE_PATH` default to a per-test directory. Without it a loader built
+  without an explicit `asset_master=` reads the developer's own
+  `data/parquet/asset_master.parquet` — green on a clean checkout, failing on
+  the machine that has actually run the pipeline.
 
 ## Development
 
@@ -590,6 +667,23 @@ data inputs and their point-in-time contract, construction, parameters, backtest
 evidence, breadth check, failure modes) — copy `TEMPLATE.md`. The doc is the spec
 and comes first: `signals.register` raises if a signal's doc does not exist.
 
+Existence is not the whole contract — the doc has to describe *this* signal.
+Registration parses the header table and the §4 parameter table, and refuses a
+signal whose doc declares a different `Signal ID` or `Family`, or that runs a
+parameter the doc never mentions. (Three of the six did: `max_gap_days` and
+`history_buffer_days` were live parameters documented nowhere.) The reverse is
+allowed — `markov_mean_reversion` documents `pooling` as considered and not
+implemented, which is worth being able to write down.
+
+`Status` is therefore data rather than prose:
+
+```python
+from signals import signal_statuses, get
+
+signal_statuses()          # {'carry': 'draft', 'cross_sectional_momentum': 'draft', ...}
+get("carry").is_evidenced  # False — nothing leaves `draft` without §5 numbers
+```
+
 ```bash
 PAPER=true python scratch/scratch_signal_markov_mean_reversion.py   # demo
 ```
@@ -661,6 +755,19 @@ Filling those sections needs, in order:
    one `ingested_ts`.
 4. `scratch/scratch_signal_breadth.py` against that store, to fill Section 6
    with measured correlations rather than expectations.
+
+**Where the backfill has to run.** Binance geo-blocks by egress IP: from a US
+address `api.binance.com` and `fapi.binance.com` answer **HTTP 451**
+("restricted location") for every endpoint, including public market data. ccxt
+surfaces that as a bare `NetworkError` with the status code and the reason
+stripped out, so the loaders see an unreachable venue, write nothing, and the
+run ends as an audit `data_presence` halt — a misleading symptom for a network
+policy. Reachable from a blocked address, if that is where you are:
+`data-api.binance.vision` (public **spot** market data only — no `fapi`, so no
+funding rate and no open interest, which means no `carry`), `api.binance.us`
+(separate entity, no perps), and Deribit, Kraken, Coinbase, Gate, KuCoin,
+Bitget and MEXC in full. The straightforward answer is to run the backfill on
+the machine that runs the pipeline.
 
 **Also outstanding:** the 10 MB rotation size and 12-month retention window in
 `LOGGING.md` were specified, not measured — no component's real log volume is

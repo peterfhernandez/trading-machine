@@ -7,7 +7,8 @@
 | Author | peter |
 | Created | 2026-07-31 |
 | Last reviewed | 2026-07-31 |
-| Status | draft (implemented + tested; backtest evidence pending a real backfill) |
+| Status | draft |
+| Status note | implemented + tested; backtest evidence pending a real backfill |
 
 ## 1. Hypothesis
 
@@ -101,7 +102,9 @@ against its own volatility; no cross-sectional demeaning).
 | `skip_days` | 0 | 0–7 (grid pending) | see the skip-window note |
 | `vol_window_days` | 60 | 30–120 (grid pending) | long enough to be a stable scale estimate, short enough to track a regime change |
 | `min_vol_observations` | 40 | — | two-thirds of the vol window; a volatility from a handful of points is a number, not an estimate |
+| `max_gap_days` | 1 | not tuned | daily bars must be consecutive; a hole in the formation window changes what the return measures, so the asset scores `None` instead |
 | `winsorize_pct` | 2.5 | 0–5 | shared default across signals |
+| `history_buffer_days` | 30 | not tuned | extra calendar days requested from the store so ordinary missing bars do not push an eligible asset under the minimum |
 
 **Parameter sensitivity:** not yet established; needs the walk-forward grid
 against a real backfill. Until then, a number from this signal is a

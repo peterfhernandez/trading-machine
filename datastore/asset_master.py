@@ -150,9 +150,29 @@ class AssetMaster:
                 logger.warning(f"Unresolved symbol {venue}:{symbol} at {asof.date()}")
             return None
         if len(matches) > 1:
-            logger.warning(
-                f"Multiple mappings for {venue}:{symbol} at {asof.date()}; "
-                f"returning first (is_primary filter recommended)"
+            candidates = matches["asset_id"].unique().to_list()
+            if len(candidates) > 1:
+                # A genuine ambiguity: one venue symbol mapping to two different
+                # canonical assets is a security-matching failure, and picking
+                # the first silently attributes rows to the wrong asset. Prefer
+                # the primary mapping, and say so loudly either way.
+                primary = matches.filter(pl.col("is_primary"))
+                chosen = (primary if len(primary) else matches)["asset_id"][0]
+                logger.warning(
+                    f"Ambiguous mappings for {venue}:{symbol} at {asof.date()}: "
+                    f"{sorted(candidates)}; resolving to {chosen}"
+                )
+                return chosen
+
+            # Same asset, recorded more than once. Append-only storage plus a
+            # nightly job that re-registers the venue's symbols makes this the
+            # ordinary state of an old asset master, and it changes nothing
+            # about the answer — so it is DEBUG, not a WARNING per symbol per
+            # run. (It used to warn, which on a populated master meant hundreds
+            # of warnings a night for a non-problem.)
+            logger.debug(
+                f"{len(matches)} identical mappings for {venue}:{symbol} at "
+                f"{asof.date()}; all resolve to {candidates[0]}"
             )
 
         return matches["asset_id"][0]

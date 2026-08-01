@@ -17,6 +17,10 @@ from collections.abc import Sequence
 
 import polars as pl
 
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
 DEFAULT_BAR_KEYS: tuple[str, ...] = ("asset_id", "event_ts")
 
 
@@ -61,6 +65,18 @@ def latest_per_bar(
     ordering = [c for c in ordering if c in df.columns]
 
     collapsed = df.sort(ingested_col).group_by(keys).last()
+    dropped = len(df) - len(collapsed)
+    if dropped:
+        # DEBUG, not INFO: this fires on every read of every dataset, and a
+        # non-zero count is the expected state (the resume overlap re-fetches
+        # the trailing day on purpose). It is worth having at all because a
+        # rate that climbs run over run means the loaders are re-fetching
+        # history the store already holds — the audit reports the same thing
+        # once per run as `duplicate_bars`; this is the per-read view.
+        logger.debug(
+            "latest_per_bar collapsed %d of %d rows (%d bars) on %s",
+            dropped, len(df), len(collapsed), "+".join(keys),
+        )
     return collapsed.sort(ordering) if ordering else collapsed
 
 

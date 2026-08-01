@@ -30,6 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 578 hermetic tests on 3.11 and 3.12), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 
@@ -897,3 +898,152 @@ so a failed run still prunes) and standalone via
 `python -m pipeline.prune_logs`. `risk/`, `portfolio/`, `execution/` and
 `attribution/` have their log files reserved and build logging in as they are
 written (Phases 6-9).
+
+---
+
+## Phase 5.6 Implementation Notes (CI, test isolation, observability fixes)
+
+### Why this phase exists
+
+Phase 5.5 answered "is logging wired in?" — every module takes
+`get_logger(__name__)`, the halt path logs CRITICAL, retention runs nightly.
+This phase asked the different question, "does it work?", by running the things
+rather than reading them. Four of the answers were no. None of them were
+visible to the test suite, and one of them is the reason a test suite that
+never runs the CLI cannot tell you your CLI is silent.
+
+### The `__main__` logger, and why no test could see it
+
+`pipeline/nightly.py` does `logger = get_logger(__name__)` at module scope.
+Imported, `__name__` is `"pipeline.nightly"` and the logger is
+`tm.pipeline.nightly`, which inherits `tm.pipeline`'s rotating file handler.
+Run as `python -m pipeline.nightly` — the invocation in the README, and the one
+a scheduled job uses — `__name__` is `"__main__"`, the logger is `tm.__main__`,
+which belongs to no component, has no file handler, and emits at INFO, below
+the console threshold. The entire `logs/pipeline.log` story evaporated on the
+only code path a human actually types. The same dry run, both ways: 18 records
+imported, 0 records under `-m`.
+
+Three things worth taking from it beyond the fix:
+
+- **The fix belongs in `get_logger`, not in the two CLIs.** `resolve_logger_name`
+  maps `"__main__"` back through `sys.modules["__main__"].__spec__.name`, so
+  Phase 8's execution CLI and Phase 9's report CLI inherit the fix instead of
+  re-discovering the bug.
+- **The test has to be a subprocess.** Every import-based assertion passed
+  throughout — importing the module is precisely what hides the defect. The
+  regression test runs the CLI with `TM_LOG_DIR` pointed at a `tmp_path` and
+  reads the file back, which meant `LogConfig.dir` needed an env override it
+  did not have.
+- **"Wired in" and "works" are different claims,** and the retrofit's own tests
+  could only speak to the first. That generalizes to Phases 6-9: each new
+  module's logging needs at least one test that exercises it the way it will be
+  run.
+
+### Rotation was destroying the thing it exists to preserve
+
+The namer stamps a rotated backup with the UTC second. `RotatingFileHandler.
+doRollover` renames onto `namer(<file>.1)` after removing whatever sits there,
+so two rotations inside one second collapsed to one file and 10 MB of history
+disappeared. Separately, `backupCount` was set to 100,000 — reasoning recorded
+at the time as "large enough that rotation never drops a backup before the
+pruner judges it by age", which misread `backupCount` as a passive limit. It is
+a loop bound: every rotation walked it, one namer call and one `stat` per step,
+~320 ms measured against 1.4 ms at `backupCount=5`.
+
+`TimestampedRotatingFileHandler` rolls over directly to a unique name and never
+consults `backupCount`. That is not a new decision, it is the one §3.2 of
+`LOGGING.md` already claimed — rotation is size, retention is calendar, and
+`backupCount` belongs to neither.
+
+### Test isolation: the failure that only reproduces on the real machine
+
+The reported regression was `{'BTC/USDT': 'BTC'} != {'BTC/USDT': None}` in a
+logging test. Not a code defect: the test constructed a loader with an isolated
+`store=` but no `asset_master=`, and `BaseLoader.__init__` fills that default
+from the production `DATASTORE_PATH`. On a clean checkout that file does not
+exist and nothing resolves; on a machine that has run the pipeline it holds
+13,000 mappings and `BTC/USDT` resolves to `BTC`.
+
+The shape of it is worth recording, because it is the worst-behaved kind of
+test defect: **green everywhere except on the machine that runs the system for
+real**, and failing there in a way that looks like broken code. Seven modules
+carry a production-path default (`loaders.base`, `loaders.backfill`,
+`audit.auditor`, `universe.builder`, `backtest.engine`, `pipeline.nightly`,
+plus `config` itself). They bind `DATASTORE_PATH` by value at import, so
+patching `config` alone does not reach them; the autouse fixture replaces the
+name in each module's own namespace, and a test fails if an eighth module
+appears without joining the list.
+
+### The doc as a checked spec, not a required file
+
+`register` enforced that `signals/methodology/<id>.md` exists. Existence turned
+out to be nearly the weakest possible contract: it cannot notice that a doc
+describes a different signal, and it cannot notice a parameter the code runs
+and the doc never mentions. The second had happened three times out of six —
+`max_gap_days` and `history_buffer_days` were live parameters, absent from §4,
+in `short_term_reversal`, `time_series_momentum` and (one of them)
+`low_volatility`. Half the specs described a different signal from the one
+being backtested, and the "the doc is the spec" rule was doing no work.
+
+Registration now parses the header table and the §4 parameter table and refuses
+a mismatch. Two deliberate asymmetries:
+
+- **The parameter check runs one way.** Fields must be documented; documented
+  rows need not be fields. `markov_mean_reversion` documents `pooling` as
+  considered and not implemented, which is exactly the kind of thing a
+  methodology doc should be able to say.
+- **Prose is never parsed.** Hypothesis, failure modes and the review log are
+  for humans; a schema over them would produce writing aimed at the schema.
+
+`Status` became a parsed enum (`draft` / `backtested` / `live-paper` /
+`retired`) with the free text moved to a `Status note` row, so Phase 5's honest
+summary is a query — `signal_statuses()` — rather than a paragraph someone has
+to remember to update. `test_all_six_are_still_draft` is *designed* to fail on
+the day a real backfill fills in a §5.
+
+### CI: gate before the merge, verify before the pull
+
+The repository had one workflow, firing on `pull_request: [closed]` and
+resetting the laptop to `origin/main`. It ran no tests at any point, and it
+carried three latent faults: a failed `git fetch` followed by a successful
+`git reset` exited 0 and deployed the previous commit (PowerShell does not fail
+a step on a native command's exit code, and a custom `shell:` string gets no
+`$LASTEXITCODE` epilogue); it reset to `origin/main` whatever branch the PR had
+merged into; and two merges in quick succession raced on one directory.
+
+Split in two, because they answer different questions:
+
+- **`ci.yml`** gates the merge — pull requests and pushes to `main`, on
+  GitHub-hosted runners, Python 3.11 and 3.12. The suite is hermetic (every
+  ccxt call mocked, every store a `tmp_path`), so 578 tests run in ~35 s with
+  no network. Required-check territory.
+- **`deploy.yml`** gates the *deployment*, which is a stronger claim than a
+  status check: `git fetch` is non-destructive, so the incoming commit is
+  checked out into a throwaway worktree and the suite is run **on the trading
+  machine itself** before `git reset --hard` touches the live tree. A failure
+  leaves the box on the last known-good commit.
+
+Two constraints that shaped the deploy job. It must not `pip install -e .` in
+the worktree — an editable install from a temporary directory would repoint the
+machine's site-packages at a path the job then deletes — so a merge that adds a
+dependency fails at import, which is the correct answer. And it must not
+`git clean`: `data/` and `logs/` are git-ignored, and they are the datastore and
+the durable run record.
+
+### Testing Coverage (Phase 5.6)
+
+- `tests/test_isolation.py`: 7 tests — every production-path default lands in
+  the sandbox, the exact shape of the reported failure, and a completeness
+  check that fails when a new module references `DATASTORE_PATH` without
+  joining the fixture
+- `tests/test_methodology_docs.py`: 27 tests — header and §4 parsing including
+  the annotated-name form, the status enum rejecting free text, the one-way
+  parameter check, registration refusing every kind of mismatch, and the real
+  six-signal set against its real six docs
+- `tests/test_logging.py`: +13 — the CLI-as-subprocess regression, `__main__`
+  resolution, the level override reaching handlers as well as loggers,
+  same-second rotation losing no record, and a canary asserting `caplog` can
+  still see the non-propagating `tm` tree
+
+578 passing overall.

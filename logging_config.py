@@ -33,6 +33,7 @@ import contextvars
 import json
 import logging
 import logging.handlers
+import sys
 import time
 from pathlib import Path
 
@@ -122,21 +123,73 @@ def _timestamped_namer(default_name: str) -> str:
     return f"{base}.{stamp}.log"
 
 
-# backupCount just has to be large enough that the size-triggered rotation
-# never silently drops a backup before prune_old_logs() gets to judge it by
-# age — retention is governed by retention_days, not by this count.
-_BACKUP_COUNT = 100_000
+def _unique_backup_name(default_name: str, namer=_timestamped_namer) -> str:
+    """A timestamped backup name that is not already taken.
+
+    The stamp has one-second resolution, so two rotations inside the same
+    second produce the same name. `RotatingFileHandler` would `os.remove` the
+    collision and rename onto it — silently destroying a full backup, which is
+    the one thing a retention mechanism must never do. A `-1`, `-2`, ... suffix
+    is appended instead; the result still ends in `.log`, so it still matches
+    `BACKUP_GLOB` and the pruner still judges it by mtime.
+    """
+    candidate = namer(default_name)
+    if not Path(candidate).exists():
+        return candidate
+
+    stem = candidate[: -len(".log")] if candidate.endswith(".log") else candidate
+    for n in range(1, 1000):
+        alternative = f"{stem}-{n}.log"
+        if not Path(alternative).exists():
+            return alternative
+    return f"{stem}-{time.time_ns()}.log"
 
 
-def _make_handler(component: str, cfg=LOG_CONFIG) -> logging.handlers.RotatingFileHandler:
+class TimestampedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Size-triggered rotation straight to a timestamped backup.
+
+    `RotatingFileHandler.doRollover` exists to maintain a numbered window of
+    backups: it shuffles `<file>.1` -> `<file>.2` -> ... and deletes what falls
+    off the end. Retention here is calendar-based (`prune_old_logs`), so that
+    shuffle has nothing to do — but it is not free, and it is not harmless:
+
+    * it walks `range(backupCount - 1, 0, -1)`, calling the namer and `stat`
+      once per step. At the `backupCount` this module used to carry (100,000)
+      one 10 MB rotation cost ~320 ms of pure syscalls, measured.
+    * the last step renames onto `namer(<file>.1)`, removing whatever is
+      already there. With a one-second stamp, two rotations in the same second
+      resolve to the same name and the earlier backup is destroyed.
+
+    So the rollover is done directly: close, rename to a unique timestamped
+    name, reopen. `backupCount` is deliberately not consulted — how many
+    backups to keep is `retention_days`' business (LOGGING.md section 3.2).
+    """
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        destination = _unique_backup_name(
+            f"{self.baseFilename}.1", namer=self.rotation_filename
+        )
+        if Path(self.baseFilename).exists():
+            self.rotate(self.baseFilename, destination)
+
+        if not self.delay:
+            self.stream = self._open()
+
+
+def _make_handler(component: str, cfg=LOG_CONFIG) -> logging.Handler:
     cfg.dir.mkdir(parents=True, exist_ok=True)
     path = cfg.dir / f"{component}.log"
-    handler = logging.handlers.RotatingFileHandler(
-        path, maxBytes=cfg.max_bytes, backupCount=_BACKUP_COUNT, encoding="utf-8"
+    handler = TimestampedRotatingFileHandler(
+        path, maxBytes=cfg.max_bytes, backupCount=0, encoding="utf-8"
     )
     handler.namer = _timestamped_namer
     handler.setFormatter(JsonFormatter())
     handler.addFilter(_RunIdFilter())
+    handler.setLevel(cfg.level)
     return handler
 
 
@@ -145,19 +198,30 @@ def _make_handler(component: str, cfg=LOG_CONFIG) -> logging.handlers.RotatingFi
 # ---------------------------------------------------------------------------
 
 _configured = False
+_active_cfg = LOG_CONFIG
 
 
-def configure_logging(cfg=LOG_CONFIG) -> None:
-    """Idempotent. Wires one rotating file handler per component under
-    `tm.<component>`, plus a shared human-readable console handler on the
-    `tm` root logger."""
-    global _configured
-    if _configured:
+def configure_logging(cfg=LOG_CONFIG, force: bool = False) -> None:
+    """Idempotent. Puts the shared human-readable console handler on the `tm`
+    root logger; each component's rotating file handler is created on first use
+    by `get_logger` (see `_ensure_component_handler`).
+
+    Args:
+        cfg: Logging configuration to apply.
+        force: Re-apply even if logging was already configured — used by
+            `set_level` and by tests that swap `cfg`.
+    """
+    global _configured, _active_cfg
+    if _configured and not force:
         return
 
+    _active_cfg = cfg
     root = logging.getLogger("tm")
     root.setLevel(cfg.level)
     root.propagate = False
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
 
     console = logging.StreamHandler()
     console.setLevel(cfg.console_level)
@@ -165,13 +229,52 @@ def configure_logging(cfg=LOG_CONFIG) -> None:
     console.addFilter(_RunIdFilter())
     root.addHandler(console)
 
-    for component in cfg.components:
-        logger = logging.getLogger(f"tm.{component}")
-        logger.setLevel(cfg.level)
-        logger.addHandler(_make_handler(component, cfg))
-        logger.propagate = True  # bubble up to tm's console handler too
-
     _configured = True
+
+
+def _ensure_component_handler(component: str, cfg=None) -> None:
+    """Give `tm.<component>` its rotating file handler, once, on first use.
+
+    Created lazily rather than for every name in `cfg.components` up front:
+    eager creation left `risk.log`, `portfolio.log`, `execution.log` and
+    `attribution.log` sitting in `logs/` at 0 bytes from Phase 5.5 onwards,
+    which reads as "wired up and silent" when the truth is "not written yet"
+    (those modules arrive in Phases 6-9). A file in `logs/` now means that
+    component has actually logged something.
+    """
+    cfg = cfg or _active_cfg
+    if component not in cfg.components:
+        return
+
+    logger = logging.getLogger(f"tm.{component}")
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+
+    logger.setLevel(cfg.level)
+    logger.addHandler(_make_handler(component, cfg))
+    logger.propagate = True  # bubble up to tm's console handler too
+
+
+def resolve_logger_name(name: str) -> str:
+    """Map a module's `__name__` onto its `tm.<component>...` logger name.
+
+    The subtlety this exists for: a module run as `python -m pipeline.nightly`
+    has `__name__ == "__main__"`, so `get_logger(__name__)` asked for
+    `tm.__main__` — a logger under no component, with no file handler, and
+    below the console threshold at INFO. The pipeline's own records (the
+    `run_id` banner, every stage entry/exit/duration, the CRITICAL on an
+    unhandled stage failure) went nowhere at all when the pipeline was run the
+    documented way. Tests never saw it because they import the class instead.
+
+    `__main__.__spec__.name` is the dotted name `-m` was invoked with, which is
+    exactly the name the module would have had if it had been imported.
+    """
+    if name == "__main__":
+        spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        resolved = getattr(spec, "name", None)
+        if resolved and resolved != "__main__":
+            name = resolved
+    return name if name.startswith("tm.") else f"tm.{name}"
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -182,8 +285,44 @@ def get_logger(name: str) -> logging.Logger:
     module added ahead of its phase) still work — they just have no file
     handler of their own and only reach the console."""
     configure_logging()
-    qualified = name if name.startswith("tm.") else f"tm.{name}"
+    qualified = resolve_logger_name(name)
+    _ensure_component_handler(qualified.split(".")[1] if "." in qualified else "")
     return logging.getLogger(qualified)
+
+
+def set_level(level: str, console_level: str | None = None, cfg=None) -> None:
+    """Change the log level at runtime — what `--log-level` is wired to.
+
+    Without this the DEBUG records the Phase 5.5 retrofit added (every signal's
+    per-asset reject reason, the backtester's per-rebalance detail) could only
+    be reached by editing `config.py`, which meant they were never reachable in
+    practice on a machine running the nightly job.
+    """
+    cfg = cfg or _active_cfg
+    cfg = replace_log_level(cfg, level, console_level)
+    configure_logging(cfg, force=True)
+
+    for component in cfg.components:
+        logger = logging.getLogger(f"tm.{component}")
+        logger.setLevel(cfg.level)
+        for handler in logger.handlers:
+            handler.setLevel(cfg.level)
+
+
+def replace_log_level(cfg, level: str, console_level: str | None = None):
+    """A copy of `cfg` with the levels replaced (dataclasses.replace, guarded
+    so a non-dataclass stand-in in a test still works)."""
+    import dataclasses
+
+    updates = {"level": level.upper()}
+    if console_level is not None:
+        updates["console_level"] = console_level.upper()
+
+    if dataclasses.is_dataclass(cfg):
+        return dataclasses.replace(cfg, **updates)
+    for key, value in updates.items():
+        setattr(cfg, key, value)
+    return cfg
 
 
 # ---------------------------------------------------------------------------

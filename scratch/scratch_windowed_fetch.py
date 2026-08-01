@@ -108,7 +108,9 @@ def main():
 
         # The stub only implements OHLCV; funding/OI warn that they got nothing,
         # which is not what this section is about.
-        logging.getLogger("loaders").setLevel(logging.ERROR)
+        # "tm.loaders", not "loaders": every project logger lives under the
+        # `tm` root, so silencing the bare name silenced nothing.
+        logging.getLogger("tm.loaders").setLevel(logging.ERROR)
 
         with patch("loaders.ohlcv.ccxt.binance", return_value=venue), \
              patch("loaders.funding_rate.ccxt.binance", return_value=venue), \

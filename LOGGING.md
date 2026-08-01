@@ -77,11 +77,35 @@ often than `loaders.log` during a backfill).
 
 So the two are decoupled deliberately:
 
-- **Rotation** is size-triggered, at 10 MB, via `RotatingFileHandler`. A
+- **Rotation** is size-triggered, at 10 MB, via
+  `TimestampedRotatingFileHandler` (a `RotatingFileHandler` subclass). A
   custom `namer` stamps each rotated backup with the UTC time of rotation
   (`loaders.log.20260731T041502Z.log`) instead of a bare numeric suffix, so a
   backup's age is legible from its filename rather than inferred from file
   mtimes across renames.
+
+  **Why the subclass** (2026-08-01). The stdlib `doRollover` exists to maintain
+  a *numbered window* of backups: it shuffles `<file>.1 -> <file>.2 -> ...`
+  across the whole `backupCount` range and deletes what falls off the end.
+  Under a timestamped namer that shuffle has nothing left to do, and it is
+  neither free nor harmless:
+
+  - it walks `range(backupCount - 1, 0, -1)`, calling the namer and `stat`
+    once per step. At the `backupCount` this module carried (100,000, chosen
+    so size-rotation could never delete a backup before the pruner judged it
+    by age) one rotation cost ~320 ms of pure syscalls — measured, against
+    1.4 ms at `backupCount=5`.
+  - its final step renames onto `namer(<file>.1)` after `os.remove`-ing
+    whatever is already there. The stamp has one-second resolution, so two
+    rotations inside the same second resolve to the same name and the earlier
+    backup is **destroyed** — a full 10 MB of history, silently, by the code
+    whose job is to preserve it.
+
+  So the rollover is done directly: close, rename to a unique timestamped name
+  (`...Z-1.log`, `...Z-2.log` on collision — still inside `BACKUP_GLOB`, so
+  retention still sees them), reopen. `backupCount` is not consulted at all,
+  which is the honest expression of this section's claim: how many backups to
+  keep is `retention_days`' business and nothing else's.
 - **Retention** is time-triggered: `prune_old_logs()` deletes any *rotated
   backup* (never the live `*.log` file currently being written) whose
   timestamp is older than 365 days. It runs as the last step of the nightly
@@ -112,7 +136,7 @@ case this exists for.
 
 | Level | Used for |
 | --- | --- |
-| DEBUG | per-asset/per-bar detail (signal reject reasons, per-rebalance backtest detail) — off by default, opt in for research |
+| DEBUG | per-asset/per-bar detail (signal reject reasons, per-rebalance backtest detail, the duplicate-bar collapse count) — off by default, opt in for research |
 | INFO | stage start/end, record counts, durations, key decisions (symbols loaded, universe size, audit check verdicts that pass) |
 | WARNING | non-fatal issues — matches `AuditResult` severity "warning"; unresolved symbols; a loader falling back |
 | ERROR | a caught exception that doesn't halt the run (e.g. one loader failing; the nightly pipeline's load stage is documented as non-fatal) |
@@ -123,6 +147,22 @@ This is an application-logging level scheme; it sits alongside, not on top of,
 concept internal to the audit module and stays exactly as documented in
 `PLAN.md`.
 
+**"Off by default, opt in for research" needs a way to opt in** (2026-08-01).
+It did not have one: `LogConfig.level` was the literal `"INFO"`, so every DEBUG
+call site added by the retrofit was unreachable without editing `config.py` —
+which is not something anyone does on a box mid-run, and meant the DEBUG rows
+of this table described records that could not be produced. There are now two
+ways in, neither of which touches a file:
+
+```bash
+python -m pipeline.nightly --log-level DEBUG        # one run
+TM_LOG_LEVEL=DEBUG python -m pipeline.prune_logs    # any entry point
+```
+
+`logging_config.set_level()` is what `--log-level` calls; it re-applies the
+level to the `tm` root, every component logger, and their handlers, because a
+handler left at INFO would swallow the records regardless of the logger.
+
 ### 3.6 Logger naming
 
 Loggers are named `tm.<component>[.<submodule>]` — e.g. `tm.loaders.ohlcv`,
@@ -130,6 +170,25 @@ Loggers are named `tm.<component>[.<submodule>]` — e.g. `tm.loaders.ohlcv`,
 new public call: `get_logger(__name__)`, mirroring the "narrow public
 interface per module" principle already in `PLAN.md` §4 — logging doesn't
 introduce a second way to depend on another module.
+
+The `tm` root sets `propagate = False`, so nothing here reaches the stdlib root
+logger. Two consequences worth writing down, both of which bit:
+
+- **`logging.basicConfig()` does nothing for this project.** `pipeline/nightly.py`
+  called it in its `__main__` block to get INFO on the console; it configured
+  the root logger, which no `tm.*` record ever reaches. Removed
+  (2026-08-01) — console verbosity is `LOG_CONFIG.console_level`.
+- **`caplog` needs a pytest that attaches to non-propagating loggers.** pytest
+  installs its capture handler on the root logger; only from 8.4 does it also
+  attach to loggers with `propagate = False` that already exist. On anything
+  older, every `caplog` assertion in `tests/test_logging.py` either fails or —
+  for the "assert no CRITICAL was logged" ones — passes having captured
+  nothing. `pyproject.toml` and `pytest.ini` pin the floor, and
+  `TestCaplogCanary` fails loudly if the mechanism ever stops working. §8.
+
+`get_logger` also resolves `__name__ == "__main__"` back to the module's real
+dotted name via `__main__.__spec__.name` — see §6, where the reason is a bug
+report rather than a design note.
 
 ## 4. Configuration
 
@@ -242,6 +301,41 @@ function, not a signature change.
   kept below INFO deliberately. `signals.breadth` logs the effective
   independent-bet count and redundant-pair count at INFO.
 
+### 6.1 Deviations found by auditing the applied retrofit (2026-08-01)
+
+The three above were found while writing the retrofit. These were found by
+going back and asking whether it *worked*, which turned out to be a different
+question:
+
+- **The pipeline's own log file was empty on the documented code path.**
+  `pipeline/nightly.py` does `logger = get_logger(__name__)`, and under
+  `python -m pipeline.nightly` — the invocation in the README, the one the
+  scheduled job uses — `__name__` is `"__main__"`. That resolved to
+  `tm.__main__`: a logger under no component, so no file handler, and INFO is
+  below the console threshold. The `run_id` banner, every stage entry/exit and
+  duration, and the CRITICAL on an unhandled stage failure all went nowhere.
+  Measured on the same dry run: 18 records via `NightlyPipeline().run()`,
+  **0 records** via `-m`. The tests could not see it because importing the
+  module gives it the right name; only running it as a process reproduces it,
+  which is now what `TestMainModuleLoggerBinding` does. Fixed in
+  `resolve_logger_name`, so it is fixed for every future `python -m` entry
+  point rather than for these two.
+- **Component files were created eagerly, including for phases that do not
+  exist.** `configure_logging` opened a handler for all eleven components at
+  import, so `risk.log`, `portfolio.log`, `execution.log` and
+  `attribution.log` sat in `logs/` at 0 bytes from the day the retrofit
+  landed — indistinguishable from "that component ran and had nothing to
+  say". Handlers are now created on first use (`_ensure_component_handler`);
+  a file in `logs/` means that component logged something.
+- **`resolve_symbol` warned about a non-problem, hundreds of times a run.**
+  Every duplicate mapping for one venue symbol logged
+  `Multiple mappings ... (is_primary filter recommended)` — but the append-only
+  asset master accumulates identical mappings by design, and every one of them
+  resolves to the same `asset_id`, so the answer was never in doubt. It now
+  logs DEBUG when the candidates agree and WARNING only when they genuinely
+  disagree, which is a security-matching failure and the case the warning was
+  presumably meant for.
+
 ## 7. Built in from the start — Phases 6-9
 
 Risk, portfolio, execution, and attribution don't exist yet, so they don't
@@ -267,6 +361,21 @@ assert, via `pytest`'s `caplog`:
   agree on the backup filename format — and if they ever disagree, retention
   silently never runs, with no symptom until the disk fills.
 
+Three more earned their place after the audit above (2026-08-01):
+
+- **Run the CLI, don't import it.** A subprocess test that runs
+  `python -m pipeline.nightly` with `TM_LOG_DIR` pointed at a `tmp_path`, and
+  asserts records land in `pipeline.log`. Every import-based test passed while
+  that path wrote nothing; the invocation *is* the thing under test.
+- **Rotate twice in one second and count what survives.** With the clock
+  frozen, three rotations must leave three distinct backups and lose no
+  record.
+- **A canary for `caplog` itself.** `tm` does not propagate to the root
+  logger, so capture depends on pytest ≥ 8.4 behaviour (§3.6). Without the
+  canary, an environment with an older pytest turns the halt-logging
+  assertions vacuous rather than red — the failure mode a test suite is least
+  able to report on itself.
+
 ## 9. Open items
 
 - **10 MB / 12 months were specified directly**, not derived from a measured
@@ -284,4 +393,5 @@ assert, via `pytest`'s `caplog`:
 | Date | Reviewer | Change / decision |
 | --- | --- | --- |
 | 2026-07-31 | peter | Created (design only; `logging_config.py` written and smoke-tested, nothing wired in). |
+| 2026-08-01 | peter | Audited the applied retrofit end to end, which found four defects in the mechanism itself rather than in its coverage: the pipeline's own records never reached `pipeline.log` under `python -m` (§6.1), DEBUG was unreachable without editing `config.py` (§3.5), a same-second rotation destroyed a backup and a 100k `backupCount` cost ~320 ms per rotation (§3.2), and file handlers were created for components that do not exist yet (§6.1). Also recorded: `logging.basicConfig` in the pipeline's `__main__` had never affected a single record, and `caplog` capture rests on a pytest ≥ 8.4 behaviour that is now pinned and canaried (§3.6, §8). |
 | 2026-07-31 | peter | Phase 5.5 applied across Phases 1-5 source. Two deviations recorded in §6: the "no-overwrite guard" does not exist as a raising check, and `resolve_symbol` needed a `warn_if_unresolved` opt-out for the pipeline's membership probe. Added `expired_log_backups()` for `--dry-run`, and a test asserting the namer and the pruner agree on the backup filename format. §9's open item — 10 MB / 12 months were specified, not measured — still stands: no real backfill has run, so no component's real rotation frequency is known yet. |

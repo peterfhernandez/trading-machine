@@ -15,6 +15,7 @@
 | Created | YYYY-MM-DD |
 | Last reviewed | YYYY-MM-DD |
 | Status | draft / backtested / live-paper / retired |
+| Status note | one line of context; free text, not parsed |
 
 ## 1. Hypothesis
 

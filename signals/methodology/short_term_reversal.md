@@ -7,7 +7,8 @@
 | Author | peter |
 | Created | 2026-07-31 |
 | Last reviewed | 2026-07-31 |
-| Status | draft (implemented + tested; backtest evidence pending a real backfill) |
+| Status | draft |
+| Status note | implemented + tested; backtest evidence pending a real backfill |
 
 ## 1. Hypothesis
 
@@ -98,7 +99,9 @@ contamination of it. This is the exact complement of `cross_sectional_momentum`'
 | `vol_scale` | True | {True, False} (grid pending) | see the note above |
 | `vol_window_days` | 30 | 20–90 (grid pending) | short enough to reflect the asset's current regime, since the overshoot is judged against *current* noise |
 | `min_vol_observations` | 20 | — | two-thirds of the vol window |
+| `max_gap_days` | 1 | not tuned | daily bars must be consecutive; a hole in the window turns a 5-day return into something else, so the asset scores `None` instead |
 | `winsorize_pct` | 2.5 | 0–5 | shared default across signals |
+| `history_buffer_days` | 30 | not tuned | extra calendar days requested from the store so ordinary missing bars do not push an eligible asset under the minimum |
 
 **Parameter sensitivity:** not yet established, and this is the signal where the
 answer matters most: a reversal signal that works at exactly one lookback is

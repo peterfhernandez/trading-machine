@@ -57,6 +57,12 @@ from .markov_mean_reversion import (
     MarkovDiagnostics,
     MarkovMeanReversionParams,
 )
+from .methodology_doc import (
+    STATUSES,
+    MethodologyDoc,
+    parse_methodology,
+    undocumented_parameters,
+)
 from .panel import CachedClosePanel
 from .registry import (
     FAMILIES,
@@ -66,6 +72,7 @@ from .registry import (
     methodology_path,
     register,
     signal_functions,
+    signal_statuses,
 )
 from .transforms import (
     cross_sectional_scale,
@@ -102,12 +109,14 @@ def signal_families() -> dict[str, str]:
 __all__ = [
     "FAMILIES",
     "MARKOV_DEFAULT_PARAMS",
+    "STATUSES",
     "BreadthReport",
     "CachedClosePanel",
     "CombinedAlpha",
     "IcEstimate",
     "MarkovDiagnostics",
     "MarkovMeanReversionParams",
+    "MethodologyDoc",
     "PairCorrelation",
     "ScoreRecorder",
     "Series",
@@ -131,6 +140,7 @@ __all__ = [
     "low_volatility",
     "markov_mean_reversion",
     "methodology_path",
+    "parse_methodology",
     "realized_vol",
     "register",
     "scale_to_unit_dispersion",
@@ -138,8 +148,10 @@ __all__ = [
     "short_term_reversal",
     "signal_families",
     "signal_functions",
+    "signal_statuses",
     "time_series_momentum",
     "trailing_return",
+    "undocumented_parameters",
     "winsorize",
     "zscore",
 ]

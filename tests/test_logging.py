@@ -17,9 +17,15 @@ formatting, and that every component named in `LOG_CONFIG.components` gets a
 file handler.
 """
 
+import importlib
+import importlib.machinery
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
+import types
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,15 +33,17 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import config
 import logging_config
 from audit.auditor import AuditResult, DataAudit
 from config import LOG_CONFIG
-from datastore import ParquetStore
+from datastore import AssetMaster, ParquetStore
 from loaders.base import BaseLoader
 from loaders.schemas import OHLCV_SCHEMA
 from pipeline import prune_logs
 from pipeline.nightly import NightlyPipeline
 
+PROJECT_ROOT = Path(__file__).parent.parent
 D1 = datetime(2024, 1, 1)
 
 
@@ -359,7 +367,14 @@ class TestLoaderAppendErrors:
         assert errors[0].exc_info is not None
 
     def test_unresolved_symbols_log_a_warning_with_a_count(self, datastore_path, caplog):
-        loader = DummyLoader("binance", store=ParquetStore(datastore_path))
+        # The asset master is passed explicitly: without it `BaseLoader` falls
+        # back to the production `data/parquet/asset_master.parquet`, and on a
+        # machine that has run the pipeline these symbols resolve.
+        loader = DummyLoader(
+            "binance",
+            store=ParquetStore(datastore_path),
+            asset_master=AssetMaster(datastore_path / "asset_master.parquet"),
+        )
 
         with caplog.at_level(logging.WARNING, logger="tm"):
             resolved = loader.resolve_symbols(["BTC/USDT", "ETH/USDT"])
@@ -388,36 +403,47 @@ class TestLoggingMechanism:
         assert logging_config.get_logger("loaders.ohlcv").name == "tm.loaders.ohlcv"
         assert logging_config.get_logger("tm.audit").name == "tm.audit"
 
-    def test_every_configured_component_has_a_file_handler(self):
-        logging_config.configure_logging()
+    def test_every_configured_component_gets_a_file_handler_on_first_use(self):
         for component in LOG_CONFIG.components:
+            logging_config.get_logger(f"{component}.probe")
             handlers = logging.getLogger(f"tm.{component}").handlers
             assert handlers, f"{component} has no handler"
-            assert any(
-                isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
-            ), component
+            assert any(isinstance(h, logging.FileHandler) for h in handlers), component
+
+    def test_a_component_that_never_logs_gets_no_file(self):
+        """Handlers are lazy: an empty risk.log would claim Phase 6 exists."""
+        unused = "attribution"
+        logging.Logger.manager.loggerDict.pop(f"tm.{unused}", None)
+        logging_config.configure_logging(force=True)
+
+        assert not [
+            h
+            for h in logging.getLogger(f"tm.{unused}").handlers
+            if isinstance(h, logging.FileHandler)
+        ]
 
     def test_component_files_are_named_per_component(self):
-        logging_config.configure_logging()
         for component in ("datastore", "loaders", "audit", "signals", "backtest"):
+            logging_config.get_logger(f"{component}.probe")
             handler = next(
                 h for h in logging.getLogger(f"tm.{component}").handlers
-                if isinstance(h, logging.handlers.RotatingFileHandler)
+                if isinstance(h, logging.FileHandler)
             )
             assert Path(handler.baseFilename).name == f"{component}.log"
 
     def test_rotation_size_comes_from_config(self):
-        logging_config.configure_logging()
+        logging_config.get_logger("loaders.probe")
         handler = next(
             h for h in logging.getLogger("tm.loaders").handlers
-            if isinstance(h, logging.handlers.RotatingFileHandler)
+            if isinstance(h, logging.FileHandler)
         )
         assert handler.maxBytes == LOG_CONFIG.max_bytes
 
     def test_configure_logging_is_idempotent(self):
-        logging_config.configure_logging()
+        logging_config.get_logger("loaders.probe")
         before = len(logging.getLogger("tm.loaders").handlers)
         logging_config.configure_logging()
+        logging_config.get_logger("loaders.probe")
         assert len(logging.getLogger("tm.loaders").handlers) == before
 
     def test_json_formatter_emits_one_object_per_record(self):
@@ -549,4 +575,186 @@ def test_replace_keeps_logconfig_a_dataclass():
     """`replace` is how tests and callers point logging at a temp directory."""
     swapped = replace(LOG_CONFIG, retention_days=7)
     assert swapped.retention_days == 7
+
+
+# ===========================================================================
+# Running as `python -m ...` (the documented way to run the pipeline)
+# ===========================================================================
+
+
+class TestMainModuleLoggerBinding:
+    """`__name__` is `"__main__"` under `-m`, which used to mean no log file.
+
+    The whole `logs/pipeline.log` story — the run_id banner, per-stage
+    entry/exit/duration, CRITICAL on an unhandled stage failure — was written
+    to `tm.__main__`, a logger under no component: no file handler, and INFO is
+    below the console threshold. The tests could not see it because importing
+    the module gives it the right name; only actually running it reproduces it.
+    """
+
+    def test_main_resolves_to_the_module_it_was_invoked_as(self, monkeypatch):
+        spec = importlib.machinery.ModuleSpec("pipeline.nightly", loader=None)
+        fake_main = types.SimpleNamespace(__spec__=spec)
+        monkeypatch.setitem(sys.modules, "__main__", fake_main)
+
+        assert logging_config.resolve_logger_name("__main__") == "tm.pipeline.nightly"
+
+    def test_a_plain_script_without_a_spec_still_works(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "__main__", types.SimpleNamespace(__spec__=None))
+        assert logging_config.resolve_logger_name("__main__") == "tm.__main__"
+
+    def test_ordinary_module_names_are_untouched(self):
+        assert logging_config.resolve_logger_name("loaders.ohlcv") == "tm.loaders.ohlcv"
+        assert logging_config.resolve_logger_name("tm.audit") == "tm.audit"
+
+    @pytest.mark.integration
+    def test_running_the_pipeline_as_a_module_writes_pipeline_log(self, tmp_path):
+        """The end-to-end version: run the CLI, then look in the log directory."""
+        env = {
+            **os.environ,
+            "PAPER": "true",
+            "TM_LOG_DIR": str(tmp_path),
+            "PYTHONPATH": str(PROJECT_ROOT),
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "pipeline.nightly", "--dry-run", "--days", "1"],
+            cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=180,
+        )
+
+        assert result.returncode == 0, result.stderr
+        written = (tmp_path / "pipeline.log").read_text().splitlines()
+        assert written, "running as `-m` produced no pipeline.log records"
+
+        records = [json.loads(line) for line in written]
+        assert all(r["logger"].startswith("tm.pipeline") for r in records)
+        assert any("run_id=" in r["message"] for r in records)
+        assert {r["run_id"] for r in records} != {"-"}
+
+
+class TestLevelOverride:
+    """DEBUG has to be reachable without editing config.py."""
+
+    def test_log_level_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("TM_LOG_LEVEL", "debug")
+        importlib.reload(config)
+        try:
+            assert config.LOG_CONFIG.level == "DEBUG"
+        finally:
+            monkeypatch.delenv("TM_LOG_LEVEL")
+            importlib.reload(config)
+
+    def test_default_is_still_info(self):
+        assert logging.getLevelName(logging.getLogger("tm").level) in ("INFO", "DEBUG")
+
+    def test_set_level_reaches_component_loggers_and_their_handlers(self):
+        original = LOG_CONFIG.level
+        logging_config.get_logger("signals.probe")
+        try:
+            logging_config.set_level("DEBUG")
+
+            component = logging.getLogger("tm.signals")
+            assert component.level == logging.DEBUG
+            assert logging_config.get_logger("signals.probe").isEnabledFor(logging.DEBUG)
+            assert all(h.level <= logging.DEBUG for h in component.handlers)
+        finally:
+            logging_config.set_level(original)
+
+    def test_debug_records_are_dropped_at_the_default_level(self):
+        """The other half: INFO must still mean INFO, so DEBUG stays off by
+        default and a long backtest does not flood the log."""
+        original = LOG_CONFIG.level
+        try:
+            logging_config.set_level("INFO")
+            probe = logging_config.get_logger("signals.probe")
+            assert not probe.isEnabledFor(logging.DEBUG)
+            assert probe.isEnabledFor(logging.INFO)
+        finally:
+            logging_config.set_level(original)
+
+
+class TestRotation:
+    """Rotation must not eat a backup, and must not cost 100k syscalls."""
+
+    def _handler(self, tmp_path, max_bytes=200):
+        cfg = FakeLogConfig(dir=tmp_path, max_bytes=max_bytes)
+        return logging_config._make_handler("loaders", cfg)
+
+    def test_two_rotations_in_the_same_second_keep_both_backups(self, tmp_path, monkeypatch):
+        """One-second stamps collide; the loser used to be os.remove'd."""
+        monkeypatch.setattr(
+            logging_config.time, "strftime", lambda *a, **k: "20260801T000000Z"
+        )
+        handler = self._handler(tmp_path, max_bytes=400)
+        logger = logging.getLogger("tm.test.rotation")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+        for _ in range(3):
+            logger.info("x" * 300)
+        handler.close()
+
+        backups = sorted(tmp_path.glob(logging_config.BACKUP_GLOB))
+        assert len({p.name for p in backups}) == len(backups), "same-second names collided"
+
+        # The property that matters: rotating three times loses no record.
+        # The stdlib rollover would have removed the earlier backup and renamed
+        # onto its name, so two of the three would be gone.
+        survived = sum(
+            len([line for line in path.read_text().splitlines() if line.strip()])
+            for path in [*backups, tmp_path / "loaders.log"]
+        )
+        assert survived == 3, [p.name for p in backups]
+
+    def test_every_backup_still_matches_the_prune_glob(self, tmp_path, monkeypatch):
+        """Uniquifying the name must not put it outside retention's reach."""
+        monkeypatch.setattr(
+            logging_config.time, "strftime", lambda *a, **k: "20260801T000000Z"
+        )
+        name = logging_config._unique_backup_name(str(tmp_path / "loaders.log.1"))
+        Path(name).write_text("{}\n")
+        collision = logging_config._unique_backup_name(str(tmp_path / "loaders.log.1"))
+
+        assert collision != name
+        assert Path(collision).match(logging_config.BACKUP_GLOB)
+
+    def test_rollover_makes_exactly_one_backup_and_walks_no_window(self, tmp_path):
+        """backupCount is not consulted: how many to keep is retention_days' job.
+
+        The stdlib rollover shuffles `<file>.1 -> <file>.2 -> ...` across the
+        whole `backupCount` range, one namer call and one stat per step — 100k
+        of them at the count this module used to carry, ~320 ms per rotation.
+        """
+        handler = self._handler(tmp_path)
+        assert isinstance(handler, logging_config.TimestampedRotatingFileHandler)
+        assert handler.backupCount == 0
+
+        handler.stream.write("x" * 300)
+        handler.doRollover()
+        handler.close()
+
+        assert len(list(tmp_path.glob(logging_config.BACKUP_GLOB))) == 1
+        assert not list(tmp_path.glob("*.log.1"))
+        assert (tmp_path / "loaders.log").exists()
+
+
+class TestCaplogCanary:
+    """`tm` does not propagate, so pytest must attach to it directly.
+
+    pytest gained that behaviour for non-propagating loggers in 8.x; on an
+    older pytest every `caplog` assertion in this file either fails or — worse,
+    for the `assert not [criticals]` ones — passes without capturing anything.
+    `pyproject.toml` pins the floor; this is the canary that fires if the
+    mechanism ever stops working.
+    """
+
+    def test_caplog_actually_captures_tm_records(self, caplog):
+        log = logging_config.get_logger("audit.canary")
+        with caplog.at_level(logging.CRITICAL, logger="tm.audit"):
+            log.critical("canary")
+
+        assert any(r.getMessage() == "canary" for r in caplog.records), (
+            "caplog captured nothing from a non-propagating tm.* logger — every "
+            "halt-logging assertion in this file is now vacuous"
+        )
     assert LOG_CONFIG.retention_days == 365

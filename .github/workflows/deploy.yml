@@ -1,0 +1,122 @@
+name: Deploy to trading machine
+
+# Replaces pr-merge.yml. Same job — pull merged code onto the laptop that runs
+# the pipeline — with the ordering fixed: the working copy is only moved after
+# the incoming commit has passed the test suite *on this machine*.
+#
+# "Run the tests before pulling" decomposes cleanly once you notice that
+# `git fetch` is non-destructive and `git reset --hard` is the destructive step:
+#
+#     fetch  ->  test origin/main in a throwaway worktree  ->  reset if green
+#
+# A failed suite leaves the working copy on the last known-good commit, which is
+# the state you want a trading box left in.
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+# Two merges in quick succession used to run two jobs against the same
+# directory at the same time. Queue them instead, and never cancel a run
+# mid-reset.
+concurrency:
+  group: deploy-trading-machine
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REPO_DIR: C:\Users\Peter\coderepo\trading-machine
+  WORKTREE_DIR: C:\Users\Peter\coderepo\trading-machine-verify
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  deploy:
+    # Merged, and merged into main specifically: the old workflow reset the
+    # laptop to origin/main whatever branch the PR had actually landed on.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'main')
+    runs-on: [self-hosted, trading-machine]
+    timeout-minutes: 45
+
+    steps:
+      - name: Fix git safe directory
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global --add safe.directory '${{ env.REPO_DIR }}'
+          git config --global --add safe.directory '${{ env.WORKTREE_DIR }}'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Fetch (does not touch the working copy)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C '${{ env.REPO_DIR }}' fetch origin main --prune
+          # PowerShell does not fail a step on a native command's exit code —
+          # which is how a failed fetch followed by a successful reset used to
+          # deploy the *previous* commit and report success.
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+
+          $sha = git -C '${{ env.REPO_DIR }}' rev-parse origin/main
+          if ($LASTEXITCODE -ne 0) { throw "could not resolve origin/main" }
+          Write-Host "origin/main is $sha"
+
+      - name: Check out the incoming commit in a throwaway worktree
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path '${{ env.WORKTREE_DIR }}') {
+            git -C '${{ env.REPO_DIR }}' worktree remove --force '${{ env.WORKTREE_DIR }}'
+          }
+          git -C '${{ env.REPO_DIR }}' worktree add --detach '${{ env.WORKTREE_DIR }}' origin/main
+          if ($LASTEXITCODE -ne 0) { throw "git worktree add failed" }
+
+      - name: Run the test suite against the incoming commit
+        env:
+          PAPER: "true"
+          # Keep the verification run out of the machine's real logs/ and out
+          # of its datastore; the suite is hermetic but the log directory is
+          # the one thing it writes by default.
+          TM_LOG_DIR: ${{ runner.temp }}\tm-verify-logs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location '${{ env.WORKTREE_DIR }}'
+          try {
+            # Deliberately no `pip install -e .` here: an editable install from
+            # a temporary worktree would repoint the machine's site-packages at
+            # a directory this job then deletes. The suite needs no install —
+            # conftest.py puts the worktree on sys.path, and third-party deps
+            # come from the machine's existing environment. A merge that adds a
+            # dependency therefore fails here with ImportError, which is the
+            # correct answer: install it, then re-run this workflow.
+            python -m pytest -q
+            if ($LASTEXITCODE -ne 0) { throw "tests failed on the incoming commit" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Adopt the verified commit
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Only now. Note there is no `git clean`: data/ and logs/ are
+          # git-ignored and hold the datastore and the durable run record, and
+          # this is the one command in the workflow that could destroy them.
+          git -C '${{ env.REPO_DIR }}' reset --hard origin/main
+          if ($LASTEXITCODE -ne 0) { throw "git reset failed" }
+
+          $sha = git -C '${{ env.REPO_DIR }}' rev-parse HEAD
+          Write-Host "Deployed $sha"
+
+      - name: Remove the worktree
+        if: always()
+        run: |
+          if (Test-Path '${{ env.WORKTREE_DIR }}') {
+            git -C '${{ env.REPO_DIR }}' worktree remove --force '${{ env.WORKTREE_DIR }}'
+          }
+          git -C '${{ env.REPO_DIR }}' worktree prune
+          exit 0

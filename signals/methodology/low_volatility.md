@@ -7,7 +7,8 @@
 | Author | peter |
 | Created | 2026-07-31 |
 | Last reviewed | 2026-07-31 |
-| Status | draft (implemented + tested; backtest evidence pending a real backfill) |
+| Status | draft |
+| Status note | implemented + tested; backtest evidence pending a real backfill |
 
 ## 1. Hypothesis
 
@@ -100,6 +101,7 @@ there is no short-horizon reversal to skip past.
 | `periods_per_year` | 365 | — | crypto trades 24/7; matches the backtester's annualization |
 | `max_gap_days` | 1 | — | daily bars |
 | `winsorize_pct` | 2.5 | 0–5 | shared default; see the note above on why it does more work here |
+| `history_buffer_days` | 30 | not tuned | extra calendar days requested from the store so ordinary missing bars do not push an eligible asset under the minimum |
 
 **Parameter sensitivity:** not yet established. Expected to be the *least*
 sensitive signal in the set — volatility rankings are highly persistent, so

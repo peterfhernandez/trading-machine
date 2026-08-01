@@ -7,7 +7,8 @@
 | Author | peter |
 | Created | 2026-07-31 |
 | Last reviewed | 2026-07-31 |
-| Status | draft (implemented + tested; backtest evidence pending a real backfill) |
+| Status | draft |
+| Status note | implemented + tested; backtest evidence pending a real backfill |
 
 ## 1. Hypothesis
 

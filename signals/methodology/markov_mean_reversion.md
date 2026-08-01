@@ -7,7 +7,8 @@
 | Author | |
 | Created | 2026-07-28 |
 | Last reviewed | 2026-07-30 |
-| Status | draft (implemented; backtest evidence not yet collected) |
+| Status | draft |
+| Status note | implemented; backtest evidence not yet collected |
 
 ## 1. Hypothesis
 
