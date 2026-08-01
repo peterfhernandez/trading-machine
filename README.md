@@ -252,7 +252,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 579 tests, ~35s, no network
+pytest                     # 594 tests, ~35s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -277,7 +277,7 @@ Two workflows in `.github/workflows/`:
   deliberately no `git clean` — `data/` and `logs/` are git-ignored and hold
   the datastore and the durable run record.
 
-Two things about the suite worth knowing:
+Three things about the suite worth knowing:
 
 - **pytest ≥ 8.4 is a floor, not a preference.** The `tm` logger tree does not
   propagate to the root logger, and only 8.4+ attaches `caplog` to
@@ -290,6 +290,18 @@ Two things about the suite worth knowing:
   without an explicit `asset_master=` reads the developer's own
   `data/parquet/asset_master.parquet` — green on a clean checkout, failing on
   the machine that has actually run the pipeline.
+- **A green run must exit 0, and on Windows it did not.** Every test passed and
+  then pytest exited **1** with `PermissionError: [WinError 5]` from
+  `cleanup_dead_symlinks` — its own temp-directory housekeeping tripping over
+  the stale `pytest-current` link it keeps in `%TEMP%\pytest-of-<user>\`. The
+  removal is unguarded and runs in `pytest_sessionfinish`, which is called from
+  a `finally` that catches only `exit.Exception`, so it escapes as a raw
+  traceback. That is a deployment gate, not a cosmetic annoyance: `deploy.yml`
+  keys `git reset --hard` off this exit code, so the trading machine refused
+  commits whose tests had all passed. `tests/conftest.py` replaces the cleanup
+  with one that falls back to `rmdir` (how a directory link is removed on
+  Windows) and cannot raise; `tests/test_tmpdir_cleanup.py` pins it, exit code
+  included.
 
 ## Development
 

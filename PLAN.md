@@ -30,7 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
-| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 578 hermetic tests on 3.11 and 3.12), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 594 hermetic tests on 3.11 and 3.12), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 
@@ -1047,3 +1047,45 @@ the durable run record.
   still see the non-propagating `tm` tree
 
 578 passing overall.
+
+### The suite's exit code is part of the suite
+
+A later addition to this phase, and the same lesson a third time. Every test
+passed on the Windows machine and `python -m pytest tests/` still exited **1**,
+on a `PermissionError` raised by pytest's own temp-directory housekeeping after
+the last test had run.
+
+The chain: pytest keeps a `pytest-current` link beside its numbered temp
+directories; `_force_symlink` cannot re-point it on Windows, because unlinking a
+*directory* link there needs `RemoveDirectoryW` rather than `DeleteFileW`, and
+it swallows the failure; the link goes stale, its target is eventually cleaned
+up, and `cleanup_dead_symlinks` then calls the same failing `unlink()` on it —
+this time unguarded. Session-finish hooks run inside `wrap_session`'s `finally`,
+which catches only `exit.Exception`, so it is not even converted into an
+INTERNAL_ERROR status: it escapes as a raw traceback and the process exits 1.
+The `1 passed` summary line never prints, because the crash happens below the
+terminal reporter's own hook.
+
+Three things make this worth a section rather than a line:
+
+- **It gates deployment.** `deploy.yml` runs the suite on the trading machine
+  and throws on `$LASTEXITCODE -ne 0`. A run where nothing failed looked
+  identical to a run where something did, and the box kept its old checkout.
+- **It is the module-level fix again.** The guard belongs in the cleanup, not
+  in a "delete the stale link first" step in this repo's conftest — which would
+  mean re-deriving pytest's temp-root layout (`--basetemp`,
+  `PYTEST_DEBUG_TEMPROOT`, `pytest-of-<user>`) and racing pytest for it.
+- **Only a subprocess can see an exit code.** The unit tests around the shim
+  call the cleanup directly and cannot observe the thing that was broken; the
+  regression test runs pytest for real, over a seeded stale link, with
+  `Path.unlink` refusing on that one name — which is exactly what Windows does.
+  Its negative control earned its place immediately: the first harness seeded
+  the link under the wrong `pytest-of-<user>` directory and the positive test
+  passed for no reason.
+
+The shim keeps pytest's semantics, adds an `rmdir` fallback and cannot raise. It
+is installed unconditionally rather than under `os.name == "nt"`: on POSIX the
+fallback is unreachable, and running it everywhere is what keeps CI able to test
+it. A test asserts pytest still lacks the guard, so the day upstream adds one,
+the shim's removal is a decision someone makes rather than a duplication nobody
+notices.

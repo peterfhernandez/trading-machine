@@ -223,6 +223,20 @@ different answers. Plus the CI that would have caught some of it.
       length is unenforced: `E501` stays in the ignore list, where it used to
       claim the formatter handled it. Re-enabling it means 50 findings ruff
       cannot fix (it will not rewrap code), so that is a separate decision
+- [x] **A green suite exited 1 on Windows.** `python -m pytest tests/` printed
+      every test as PASSED and then died with `PermissionError: [WinError 5]`
+      in pytest's own `cleanup_dead_symlinks`: the stale `pytest-current` link
+      in `%TEMP%\pytest-of-<user>\` cannot be removed with `os.unlink` there
+      (a directory link needs `RemoveDirectoryW`), pytest's removal is
+      unguarded, and session-finish hooks run in a `finally` that catches only
+      `exit.Exception` — so it escapes and the process exits 1. `deploy.yml`
+      keys `git reset --hard` off that exit code, so the trading machine was
+      refusing commits whose tests had all passed. Shimmed in
+      `tests/conftest.py` (rmdir fallback, cannot raise, installed at both call
+      sites since `_pytest.tmpdir` binds the name at import);
+      `tests/test_tmpdir_cleanup.py` runs pytest in a subprocess over a seeded
+      stale link and asserts the exit code, with a negative control that fails
+      if the harness ever stops reproducing the crash
 - [ ] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
@@ -545,3 +559,39 @@ different answers. Plus the CI that would have caught some of it.
   on the machine that runs the pipeline. Worth adding when that happens: a venue
   preflight that logs the HTTP status and response body, so "we are blocked"
   stops looking identical to "the venue is down".
+- 2026-08-01: **A passing suite exited 1 on Windows**, which meant the deploy
+  gate was rejecting good commits. `python -m pytest tests/` printed every test
+  as PASSED and then raised `PermissionError: [WinError 5] Access is denied:
+  '...\Temp\pytest-of-Peter\pytest-current'` out of pytest's own temp-directory
+  housekeeping. Not this project's code, but this project's exit code. The
+  chain, all inside pytest: `make_numbered_dir` keeps a `pytest-current` link
+  beside its numbered temp dirs and re-points it through `_force_symlink`,
+  which starts by unlinking the old one — on Windows a link to a *directory* is
+  removed with `RemoveDirectoryW`, not the `DeleteFileW` behind `os.unlink`, so
+  that fails, and `_force_symlink` swallows every error by design. The link
+  therefore keeps pointing at an older run; that run's directory is eventually
+  cleaned up (`keep=3`); and `cleanup_dead_symlinks` then calls the same failing
+  `unlink()` on the now-dangling link — the one removal in `_pytest/pathlib.py`
+  that is not inside a `try` (the other six are). Session-finish hooks are
+  invoked from `wrap_session`'s `finally`, which catches only `exit.Exception`,
+  so it is not even downgraded to an INTERNAL_ERROR status: it propagates
+  through `_console_main` and the interpreter exits 1. The `1 passed` summary
+  never prints either, because the crash happens below the terminal reporter's
+  own hook — which is why the output jumps straight from the last PASSED line to
+  a traceback. Fixed with a shim in `tests/conftest.py` that keeps pytest's
+  semantics (remove links whose target is gone), falls back to `rmdir`, and
+  cannot raise; installed into `_pytest.pathlib` *and* `_pytest.tmpdir`, since
+  the latter binds the name at import time and is the call site in the
+  traceback, and installed unconditionally rather than under `os.name == "nt"`
+  so CI exercises it. It self-heals: the stale link is removed at the end of the
+  first run after the fix, and the next run creates a live one. 15 new tests
+  (`tests/test_tmpdir_cleanup.py`) — the unit ones simulate Windows by making
+  `unlink` refuse, and two integration ones run pytest in a subprocess over a
+  seeded stale link and assert the **exit code**, because nothing in-process can
+  observe the thing that was broken. The negative control paid for itself
+  immediately: the first harness seeded the link under a `pytest-of-<user>`
+  directory pytest never looked at, so the positive test was green for no
+  reason. 594 tests passing. Worth noting separately: the report came from a
+  local run on **Python 3.14**, which neither `ci.yml` (3.11, 3.12) nor
+  `requires-python` covers — unrelated to this defect, which is about Windows
+  rather than the interpreter, but the version gap is real and undecided.
