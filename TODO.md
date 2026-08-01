@@ -210,14 +210,19 @@ different answers. Plus the CI that would have caught some of it.
       and the CLI-subprocess, rotation, level-override and caplog-canary cases
       in `tests/test_logging.py`); 578 passing
 - [x] `scratch/scratch_observability.py` demonstrates all of it end to end
-- [ ] **Clear the ruff backlog and make lint a hard gate.** `ruff check .`
-      reports 168 pre-existing findings — 158 auto-fixable, overwhelmingly
-      `Optional[X]` → `X | None`, `timezone.utc` → `datetime.UTC` (which
-      `CLAUDE.md` already asks for), and import ordering. `ci.yml` runs lint
-      advisory-only until then, because a gate that is red the day it lands
-      just teaches everyone to ignore the red X. Files touched in Phase 5.6
-      are already clean; do the rest as one mechanical commit, then flip
-      `continue-on-error` off in the same change
+- [x] **Cleared the ruff backlog and made lint a hard gate.** 168 findings →
+      zero: `ruff check --fix` handled 163 (`Optional[X]` → `X | None`, unused
+      imports, import ordering, `timezone.utc` → `datetime.UTC`), and five
+      needed a human (two `== True` filters, a `zip(strict=True)`, a
+      `raise ... from e`, and a `noqa` for `doRollover`, whose casing belongs
+      to the stdlib method it overrides). No behaviour change; the suite passed
+      unchanged. `continue-on-error` is off, so a finding now fails CI
+- [x] **The formatter is deliberately not a gate.** `ruff format --check`
+      would have reformatted 62 of 87 files — a large diff for no correctness
+      gain — so `ci.yml` runs `ruff check` only. The consequence is that line
+      length is unenforced: `E501` stays in the ignore list, where it used to
+      claim the formatter handled it. Re-enabling it means 50 findings ruff
+      cannot fix (it will not rewrap code), so that is a separate decision
 - [ ] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)

@@ -168,15 +168,22 @@ pytest -v
 ## Code Quality
 
 ```bash
-# Lint with ruff
+# Lint with ruff — clean, and enforced by CI
 ruff check .
 
-# Format with ruff
+# Format with ruff — available, deliberately NOT enforced (see below)
 ruff format .
 
-# Type checking (mypy)
+# Type checking (mypy) — advisory in CI
 mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 ```
+
+`ruff format` is not a gate and the codebase is not formatter-clean: adopting it
+would reformat 62 of 87 files in one commit, which is a large diff for no
+correctness gain. Run it on a file you are already rewriting if you like, but
+don't reformat the repo in a change that does anything else. Line length is
+consequently unenforced — `E501` is in the ignore list in `pyproject.toml`,
+with the reasoning written down there.
 
 ## Logging
 
@@ -245,15 +252,16 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 578 tests, ~35s, no network
-ruff check . && ruff format --check .
+pytest                     # 579 tests, ~35s, no network
+ruff check .               # clean; CI fails on any finding
 ```
 
 Two workflows in `.github/workflows/`:
 
 - **`ci.yml`** — on every pull request and every push to `main`, on
-  GitHub-hosted runners across Python 3.11 and 3.12: ruff, the full suite, and
-  mypy (advisory). Make it a required check on `main` and a red suite stops
+  GitHub-hosted runners across Python 3.11 and 3.12: ruff (a hard gate), the
+  full suite, and mypy (advisory). Make it a required check on `main` and a
+  red suite stops
   being mergeable. It also fails a PR whose commit messages carry tool
   attribution, per `CLAUDE.md`.
 - **`deploy.yml`** — when a PR merges into `main`, on the self-hosted
