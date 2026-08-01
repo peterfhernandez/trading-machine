@@ -558,9 +558,30 @@ class TestModuleLoggers:
 def test_log_config_has_no_stale_file_field():
     """`LogConfig.file` was replaced by `dir` (LOGGING.md section 4)."""
     assert not hasattr(LOG_CONFIG, "file")
-    assert LOG_CONFIG.dir.name == "logs"
+    assert isinstance(LOG_CONFIG.dir, Path)
     assert LOG_CONFIG.max_bytes == 10 * 1024 * 1024
     assert LOG_CONFIG.retention_days == 365
+
+
+def test_log_dir_defaults_to_logs_and_honours_the_override(monkeypatch):
+    """Asserted against a reloaded config, not the ambient one.
+
+    This test used to read `LOG_CONFIG.dir.name == "logs"`, which quietly made
+    it a test of the *environment* rather than of the default — and it failed
+    the moment CI set `TM_LOG_DIR` to keep its log writes in the runner's temp
+    directory. Same shape as the production-datastore leak these changes fix:
+    a green suite that depends on where it happens to be run.
+    """
+    monkeypatch.delenv("TM_LOG_DIR", raising=False)
+    importlib.reload(config)
+    assert config.LOG_CONFIG.dir.name == "logs"
+
+    monkeypatch.setenv("TM_LOG_DIR", "/tmp/somewhere-else")
+    importlib.reload(config)
+    assert config.LOG_CONFIG.dir == Path("/tmp/somewhere-else")
+
+    monkeypatch.delenv("TM_LOG_DIR")
+    importlib.reload(config)
 
 
 def test_every_pipeline_component_is_declared():
