@@ -55,6 +55,59 @@ export TELEGRAM_CHAT_ID="your-chat-id"
 export PAPER=true
 ```
 
+#### `.env` at the repository root
+
+Rather than exporting them, put those `KEY=VALUE` lines in a `.env` file at the
+repository root. `config.py` loads it itself, at import, before any of the
+values above are read:
+
+```bash
+TELEGRAM_BOT_TOKEN=your-token
+TELEGRAM_CHAT_ID=your-chat-id
+PAPER=true
+```
+
+`.env` is git-ignored and must stay that way. Three properties are worth
+knowing, and each is pinned by a test in `tests/test_dotenv.py`:
+
+- **The real environment wins.** The file fills gaps; it never overrides a
+  variable the process was started with. So `TM_LOG_DIR=/tmp/x python -m
+  pipeline.nightly` still writes to `/tmp/x`, and `deploy.yml`'s verification
+  run keeps the `PAPER` and `TM_LOG_DIR` it sets, on a machine whose repo root
+  holds a real `.env`.
+- **The file is found relative to the repository root, not the working
+  directory.** A scheduled job started from `C:\` loads the same file as a run
+  from the checkout, and a `.env` belonging to some other project in the
+  directory you happen to be standing in is ignored.
+- **It is loaded before the values are read.** `AlertConfig`'s fields are
+  dataclass defaults, evaluated when `config.py` is imported, so a load placed
+  any lower in the file would parse correctly and change nothing.
+
+It is a `KEY=VALUE` file, not a shell script: no `export`, no `${VAR}`
+interpolation, no multi-line values. Matched surrounding quotes are stripped;
+an unparseable line is skipped rather than raised on, because a typo in `.env`
+should not stop the machine from starting.
+
+Until this existed, nothing in the repository read `.env` — the credentials
+reached the process only when an editor (VS Code's `python.envFile` defaults to
+`${workspaceFolder}/.env`) loaded them into the environment it launched the
+interpreter in. The same command in a plain shell got a different result, which
+is the same class of defect as the `python -m pipeline.nightly` logger and the
+`python -m scratch.<demo>` import.
+
+**One consequence, stated plainly:** on any machine with Telegram credentials in
+`.env`, `pytest` now sends a real Telegram message. `tests/test_logging.py`
+exercises the audit halt path against a fabricated failure and calls the real
+`DataAudit.send_alerts()`, which is guarded by `ALERT_CONFIG.enabled` and
+nothing else. The alert reads `⚠️ Data Audit Alert / ❌ coverage: only 3 of 150`
+— a fixture string, not a real audit result. That was already true whenever the
+editor supplied the variables; it is now true for every launcher, including
+`deploy.yml`'s verification run on the trading machine.
+
+```bash
+PAPER=true python scratch/scratch_dotenv.py   # what was loaded, masked
+```
+
 ## Architecture
 
 ```text

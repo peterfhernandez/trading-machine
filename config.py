@@ -19,6 +19,59 @@ from pathlib import Path
 # ============================================================================
 
 PROJECT_ROOT = Path(__file__).parent
+
+
+def _load_dotenv(path: Path) -> list[str]:
+    """Populate `os.environ` from a `KEY=VALUE` file. Returns the keys set.
+
+    Every secret below is read with `os.getenv` at import time — these are
+    dataclass *defaults*, evaluated when the class body executes — so anything
+    that loads the file after `import config` is too late. Hence: here, above
+    the first `getenv`, inside the module every other module imports.
+
+    Two properties are the whole point, and both are tested:
+
+    - **Anchored to `PROJECT_ROOT`, never the working directory.** A path
+      relative to the CWD would load the file for a run started from the repo
+      root and silently load nothing for the same command run from anywhere
+      else — a scheduled job's working directory is not usually the one you
+      developed in.
+    - **The real environment wins** (`setdefault`, not assignment). `.env`
+      fills gaps; it never overrides a value the process was started with.
+      `deploy.yml` sets `PAPER` and `TM_LOG_DIR` for its verification run, and
+      a checked-out `.env` must not quietly beat them.
+
+    Deliberately stdlib rather than `python-dotenv`: `deploy.yml` runs the
+    suite on the trading machine without a `pip install` step, so a new
+    dependency fails there at import until it is installed by hand.
+    """
+    if not path.is_file():
+        return []
+
+    loaded = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        # A `KEY=VALUE` file, not a shell script: no `export`, no interpolation,
+        # no multi-line values. Anything unparseable is skipped rather than
+        # raised on — a malformed line must not stop the machine from starting.
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
+DOTENV_PATH = PROJECT_ROOT / ".env"
+DOTENV_KEYS = _load_dotenv(DOTENV_PATH)
+
 DATASTORE_PATH = PROJECT_ROOT / "data" / "parquet"
 LOGS_PATH = PROJECT_ROOT / "logs"
 SCRATCH_PATH = PROJECT_ROOT / "scratch"

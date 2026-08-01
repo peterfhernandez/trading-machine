@@ -764,3 +764,43 @@ different answers. Plus the CI that would have caught some of it.
   buys an identical answer for double the wall clock. Adding the new check to
   the required list is a repository setting and is on the checklist above,
   unticked; until it is taken the job reports without blocking.
+- 2026-08-01: **`.env` is now loaded by the code that needs it.** Running the
+  test suite locally sent a real Telegram message to the trading machine's bot;
+  running the same commit in CI did not. Neither was a test doing anything
+  unusual: `tests/test_logging.py` exercises the audit halt path against a
+  fabricated `coverage: only 3 of 150` failure and calls the real
+  `DataAudit.send_alerts()`, whose only guard is `ALERT_CONFIG.enabled` —
+  `bool(token and chat_id)`, read from `os.getenv` at import. Nothing in the
+  repository had ever read a `.env` file (no `python-dotenv` dependency, no
+  `load_dotenv`, nothing in `pytest.ini` or `conftest.py`); the credentials
+  reached the process because VS Code's `python.envFile` defaults to
+  `${workspaceFolder}/.env` and populates the environment it launches the
+  interpreter in. So the same command behaved differently depending on how it
+  was started — the `python -m pipeline.nightly` logger and the
+  `python -m scratch.<demo>` import a third time, and the reason a secret
+  living only in `.env` still has to be treated as loaded everywhere.
+  `config._load_dotenv` fixes it in the one place it can work: at the top of
+  `config.py`, above the first `getenv`. Three decisions. It is **anchored to
+  `PROJECT_ROOT`**, because a CWD-relative load is correct exactly when you
+  test it and silently loads nothing from a scheduled job's working directory.
+  The **real environment wins** (`key not in os.environ`, not assignment) —
+  `deploy.yml` sets `PAPER` and `TM_LOG_DIR` for its verification run on the
+  machine whose repo root holds the real `.env`, and a file that overrode them
+  would point the verification run at the live log directory. And it is
+  **stdlib rather than `python-dotenv`**, because `deploy.yml` deliberately
+  runs the suite without a `pip install` step, so a new dependency fails there
+  at import until someone installs it by hand. 19 tests
+  (`tests/test_dotenv.py`), of which the two that matter are subprocesses: the
+  test process has already imported `config` from the repo root, so nothing
+  in-process can see either the working-directory anchoring or the fact that
+  the load must precede the dataclass defaults. They build a fake project root
+  — a copy of `config.py` beside a `.env` — rather than writing into the real
+  one, which a test must never do. Both negative controls reproduce: making the
+  path CWD-relative fails 2, and moving the load below `AlertConfig` fails the
+  `ALERT_CONFIG.enabled` test while every unit test still passes, which is
+  exactly the failure mode the ordering test exists for. 636 tests passing;
+  `scratch/scratch_dotenv.py` reports what was loaded, by name and masked,
+  never a value. **Known consequence, not fixed here:** the local test-run
+  alert is now deterministic rather than editor-dependent, and it will also
+  fire from `deploy.yml`'s verification run. The alert has no test seam — it
+  goes straight to `requests.post` — so giving it one is its own change.
