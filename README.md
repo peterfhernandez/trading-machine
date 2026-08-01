@@ -147,6 +147,14 @@ Auditing the applied retrofit asked a different question from building it —
 - [x] Methodology docs are parsed and checked against the code; `Status` is a
       queryable field
 - [x] Pre-merge CI, and a deploy workflow that tests before it pulls
+- [x] Two subprocess-environment defects, both Windows-only:
+      `scratch_observability.py` handed its child pipeline a four-key
+      environment, so the child could not import `ssl`/`socket` and died before
+      logging anything — and the demo discarded the stderr that said so, then
+      crashed reading the log file that was never written. And the pipeline CLI
+      raised `UnicodeEncodeError` on its own report whenever stdout was
+      redirected (cp1252 cannot encode `✓`), which failed the run. Both now
+      inherit the parent environment and tolerate a narrow console
 
 ## Testing
 
@@ -254,7 +262,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 603 tests, ~40s, no network
+pytest                     # 613 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 

@@ -30,7 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
-| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 603 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 613 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 

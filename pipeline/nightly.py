@@ -341,8 +341,29 @@ def run_nightly(
         sys.exit(1)
 
 
+def tolerate_a_narrow_console() -> None:
+    """Let the report's `✓` and `🛑` survive a non-UTF-8 stdout.
+
+    `sys.stdout` takes the locale encoding when it is not a terminal — cp1252
+    on a default Windows install — and neither character exists there, so
+    `_report_stage`'s `print` raised `UnicodeEncodeError` the moment the output
+    was redirected or piped. The report stage then failed, `run()` logged the
+    whole run as failed, and a live run exited 1: a checkmark, ending the
+    night's pipeline.
+
+    `errors="replace"` degrades the glyph to `?` instead. The encoding itself
+    is left alone — this is about not dying, not about overriding what the
+    user's console can display.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+
 if __name__ == "__main__":
     import argparse
+
+    tolerate_a_narrow_console()
 
     # No logging.basicConfig() here: it configures the *stdlib root* logger,
     # and the `tm` tree deliberately does not propagate to it (LOGGING.md
