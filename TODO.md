@@ -247,7 +247,7 @@ different answers. Plus the CI that would have caught some of it.
       demos inherit the fix; `tests/test_scratch_demos.py` runs both
       invocations in subprocesses, because the test process has `scratch/`
       reachable through neither entry and cannot see the defect in-process
-- [ ] Make `ci.yml` a **required status check** on `main` in the repository's
+- [x] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
 
