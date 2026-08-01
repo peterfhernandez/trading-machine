@@ -9,6 +9,11 @@
             "type": "command",
             "command": "c=$(jq -r '.tool_input.command // \"\"'); printf '%s' \"$c\" | grep -qE 'git[[:space:]]+commit' && (printf '%s' \"$c\" | grep -oE \"\\-m\\s+'[^']*'|\\-m\\s+\\\"[^\\\"]*\\\"\" | sed \"s/^-m[[:space:]]*['\\\"]//;s/['\\\"]$//\" | grep -iqE 'claude|anthropic|co-authored-by|generated with|claude-session|claude\\.ai|claude\\.com|anthropic\\.com') && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Attribution detected in the git commit message. CLAUDE.md forbids ANY reference to Claude/Anthropic/AI, Co-Authored-By, Generated with, Claude-Session, or claude.ai/claude.com/anthropic.com in commit messages. Strip every such line and retry.\"}}' || true",
             "statusMessage": "Attribution guard"
+          },
+          {
+            "type": "command",
+            "command": "c=$(jq -r '.tool_input.command // \"\"'); printf '%s' \"$c\" | grep -qE 'git[[:space:]]+commit' && { [ \"$(git config user.email)\" != \"peter@hernandez.id.au\" ] || [ \"$(git config user.name)\" != \"Peter Hernandez\" ]; } && jq -nc '{hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Commit author is not Peter Hernandez <peter@hernandez.id.au>. CLAUDE.md requires every commit to be authored by me, not by the default identity of the agent environment. Run: git config user.name \\\"Peter Hernandez\\\" && git config user.email \\\"peter@hernandez.id.au\\\" then commit again. Do not use --author, --reset-author or -c user.* to work around it.\"}}' || true",
+            "statusMessage": "Commit author guard"
           }
         ]
       },
