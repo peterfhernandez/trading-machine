@@ -31,7 +31,14 @@ dependencies = [
     "numpy>=1.26.0",
     "ccxt>=4.0.0",
     "deribit-api>=0.0.1",
-    "pytest>=7.4.0",
+    # 8.4 is a hard floor, not a preference: `configure_logging` sets
+    # propagate=False on the `tm` logger, and only pytest >= 8.4 attaches the
+    # caplog handler to non-propagating loggers. On an older pytest every
+    # caplog assertion in tests/test_logging.py either fails outright or — for
+    # the "assert no CRITICAL was logged" ones — passes while capturing
+    # nothing. tests/test_logging.py::TestCaplogCanary fails loudly if this
+    # ever stops holding.
+    "pytest>=8.4.0",
     "requests>=2.31.0",
     "python-dateutil>=2.8.2",
     "pydantic>=2.0.0",
@@ -55,22 +62,17 @@ viz = [
     "plotly>=5.17.0",
 ]
 
-[tool.pytest.ini_options]
-minversion = "7.0"
-testpaths = ["tests"]
-python_files = "test_*.py"
-python_classes = "Test*"
-python_functions = "test_*"
-addopts = "-v --strict-markers --tb=short"
-markers = [
-    "unit: unit tests",
-    "integration: integration tests (may hit filesystem/APIs)",
-    "slow: slow tests (backfill, backtest)",
-]
+# pytest configuration lives in pytest.ini, not here. Both files existed, and
+# pytest.ini wins by precedence — so the block that used to sit here was dead,
+# and pytest printed "WARNING: ignoring pytest config in pyproject.toml" on
+# every run. One source of truth; edit pytest.ini.
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+# The *floor* of requires-python, not the newest interpreter we run on: ruff's
+# target-version decides which syntax it may suggest, and suggesting 3.12-only
+# syntax would break the 3.11 half of the CI matrix.
+target-version = "py311"
 exclude = [
     ".git",
     ".venv",
@@ -112,7 +114,7 @@ known-first-party = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

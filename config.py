@@ -286,17 +286,26 @@ ALERT_CONFIG = AlertConfig()
 class LogConfig:
     """Logging configuration."""
 
-    # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
-    level: str = "INFO"
+    # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    # Overridable without editing this file — the DEBUG records the modules
+    # carry (every signal's per-asset reject reason, the backtester's
+    # per-rebalance detail) are unreachable at the INFO default, and editing
+    # config.py to see them is not something you do on a box mid-run.
+    # `python -m pipeline.nightly --log-level DEBUG` sets it per run.
+    level: str = os.getenv("TM_LOG_LEVEL", "INFO").upper()
 
     # Console (stderr) log level — quieter than the file level by default
-    console_level: str = "WARNING"
+    console_level: str = os.getenv("TM_CONSOLE_LOG_LEVEL", "WARNING").upper()
 
-    # Directory holding one rotating log file per pipeline component
-    # (pipeline.log, datastore.log, loaders.log, audit.log, universe.log,
-    # backtest.log, signals.log, risk.log, portfolio.log, execution.log,
-    # attribution.log)
-    dir: Path = LOGS_PATH
+    # Directory holding one rotating log file per pipeline component that has
+    # actually logged something (pipeline.log, datastore.log, loaders.log,
+    # audit.log, universe.log, backtest.log, signals.log; risk.log,
+    # portfolio.log, execution.log and attribution.log appear in Phases 6-9,
+    # when those modules start writing). Handlers are created on first use, so
+    # a file present here means that component ran. TM_LOG_DIR relocates the
+    # whole set, which is what lets a test run the CLI as a subprocess without
+    # writing into the developer's own logs/.
+    dir: Path = Path(os.getenv("TM_LOG_DIR", str(LOGS_PATH)))
 
     # Rotate each component's file at this size
     max_bytes: int = 10 * 1024 * 1024  # 10 MB

@@ -135,6 +135,93 @@ start instead (see their checklists below).
       `run_id` and prints that component's log tail at exit)
 - [x] Add `logs/` to `.gitignore` (already present from the Phase 0 scaffold)
 
+## Phase 5.6 — CI, test isolation, and the observability fixes
+
+Phase 5.5 asked "is logging wired in?" and the answer was yes. This phase asked
+"does it work?", which turned out to be a different question with four
+different answers. Plus the CI that would have caught some of it.
+
+- [x] **The pipeline's own log file was empty on the documented code path.**
+      `get_logger(__name__)` under `python -m pipeline.nightly` resolves
+      `__name__` to `"__main__"`, giving `tm.__main__` — no component, no file
+      handler, and INFO is below the console threshold. Measured on one dry
+      run: 18 records when imported, 0 records via `-m`. Fixed in
+      `logging_config.resolve_logger_name` (so every future `python -m` entry
+      point is covered, not just these two) and tested by *running the CLI in a
+      subprocess* — every import-based test passed throughout
+- [x] **DEBUG was unreachable.** `LogConfig.level` was the literal `"INFO"`,
+      so the per-asset signal reject reasons and the backtester's
+      per-rebalance detail could only be seen by editing `config.py`.
+      `TM_LOG_LEVEL`, `TM_CONSOLE_LOG_LEVEL`, `--log-level`,
+      `--console-log-level`, and `logging_config.set_level()`
+- [x] **Rotation could destroy a backup.** The namer stamps to the second, and
+      `RotatingFileHandler.doRollover` `os.remove`s a colliding name before
+      renaming onto it — two rotations inside one second lost 10 MB of
+      history. Also `backupCount = 100_000` made every rotation walk 100k
+      `stat` calls: ~320 ms measured, against 1.4 ms at `backupCount=5`.
+      Both fixed by `TimestampedRotatingFileHandler`, which rolls over
+      directly to a unique name and never consults `backupCount` — retention
+      is `retention_days`' job, which is what `LOGGING.md` §3.2 always claimed
+- [x] **Log files existed for phases that do not.** `risk.log`,
+      `portfolio.log`, `execution.log`, `attribution.log` sat at 0 bytes since
+      the retrofit. Handlers are created on first use
+- [x] `resolve_symbol` warned once per duplicate mapping per run — hundreds of
+      WARNINGs a night for the expected state of an append-only asset master.
+      DEBUG when the duplicates agree; WARNING kept for the case it was
+      presumably meant for, two `asset_id`s behind one venue symbol
+- [x] `logging.basicConfig()` in the nightly `__main__` had never affected a
+      single record (`tm` does not propagate); removed
+- [x] `scratch_windowed_fetch.py` silenced `logging.getLogger("loaders")`,
+      which is not a logger this project uses; `tm.loaders`
+- [x] **Test isolation.** `BaseLoader` (and six other modules) default to the
+      production `DATASTORE_PATH`, so a test that passed `store=` but not
+      `asset_master=` read the developer's real asset master — green on a
+      clean checkout, failing on a machine that has run the pipeline, and the
+      failure looks like a code defect. Autouse fixture in `tests/conftest.py`
+      redirects all seven; `tests/test_isolation.py` fails if a new module
+      joins the list without joining the fixture
+- [x] **The methodology doc is checked against the code.** Registration parses
+      the header table and the §4 parameter table and refuses a doc that names
+      a different signal or family, or that omits a parameter the code runs.
+      Three of six omitted one or more (`max_gap_days`,
+      `history_buffer_days`); those docs now document them. `Status` is a
+      parsed enum, so `signal_statuses()` answers "which signals have
+      evidence?" instead of a paragraph in the README
+- [x] **Pre-merge CI** (`.github/workflows/ci.yml`): pull requests and pushes
+      to `main`, Python 3.11 and 3.12, ruff + full suite + advisory mypy, and
+      a check that commit messages carry no tool attribution. Make it a
+      required check on `main`
+- [x] **Deploy tests before it pulls** (`.github/workflows/deploy.yml`,
+      replacing `pr-merge.yml`): fetch (non-destructive) → check the incoming
+      commit out into a throwaway worktree → run the suite there → only then
+      `git reset --hard`. Also fixes: a failed `git fetch` followed by a
+      successful `reset` used to exit 0 and deploy the *previous* commit
+      (PowerShell does not fail a step on a native command's exit code); the
+      job reset to `origin/main` whatever branch the PR merged into; and two
+      merges in quick succession ran two resets against one directory
+- [x] **pytest ≥ 8.4 pinned.** `caplog` only attaches to non-propagating
+      loggers from 8.4, and `tm` does not propagate — on an older pytest the
+      "a halt leaves a CRITICAL record" assertions fail, and the negative ones
+      pass having captured nothing. Canary test added
+- [x] One source of truth for pytest config (`pytest.ini`; the duplicate block
+      in `pyproject.toml` was dead and warned on every run), and ruff/mypy
+      target the `requires-python` floor rather than a version CI does not pin
+- [x] Tests: 47 new (`tests/test_isolation.py`, `tests/test_methodology_docs.py`,
+      and the CLI-subprocess, rotation, level-override and caplog-canary cases
+      in `tests/test_logging.py`); 578 passing
+- [x] `scratch/scratch_observability.py` demonstrates all of it end to end
+- [ ] **Clear the ruff backlog and make lint a hard gate.** `ruff check .`
+      reports 168 pre-existing findings — 158 auto-fixable, overwhelmingly
+      `Optional[X]` → `X | None`, `timezone.utc` → `datetime.UTC` (which
+      `CLAUDE.md` already asks for), and import ordering. `ci.yml` runs lint
+      advisory-only until then, because a gate that is red the day it lands
+      just teaches everyone to ignore the red X. Files touched in Phase 5.6
+      are already clean; do the rest as one mechanical commit, then flip
+      `continue-on-error` off in the same change
+- [ ] Make `ci.yml` a **required status check** on `main` in the repository's
+      branch protection settings — the workflow gates nothing until it is
+      (this is a GitHub setting, not something a file in the repo can do)
+
 ## Phase 6 — Risk model (M7)
 
 - [ ] Wire logging per `LOGGING.md` as the module is built (`get_logger`,
@@ -392,3 +479,64 @@ start instead (see their checklists below).
   pruner's glob, without which retention would silently never run. All 14
   existing scratch demos call `start_demo_run("<component>")` and print that
   component's log tail on exit. 531 tests passing.
+- 2026-08-01: Phase 5.6 — audited the Phase 5.5 retrofit rather than extending
+  it, which found that the mechanism itself was broken in four places. The one
+  that matters: **`python -m pipeline.nightly` wrote nothing to
+  `logs/pipeline.log`**. Run as a module, `__name__` is `"__main__"`, so
+  `get_logger(__name__)` returned `tm.__main__` — a logger under no component,
+  with no file handler, and INFO sits below the console threshold — so the
+  `run_id` banner, every stage entry/exit/duration and the CRITICAL on an
+  unhandled stage failure all went nowhere on the exact invocation the README
+  documents and the scheduled job uses. The same dry run: 18 records via
+  `NightlyPipeline().run()`, 0 via `-m`. Every test passed throughout, because
+  importing the module gives it the right name; the fix is in
+  `resolve_logger_name` (covering every future `python -m` entry point) and the
+  test now runs the CLI in a subprocess. Also: DEBUG was unreachable without
+  editing `config.py`, so the per-asset reject reasons the retrofit added could
+  not be produced (`TM_LOG_LEVEL`, `--log-level`, `set_level()`); a
+  same-second rotation destroyed a backup, because the namer stamps to the
+  second and `doRollover` removes a colliding name before renaming onto it, and
+  `backupCount=100_000` cost ~320 ms of `stat` calls per rotation against 1.4 ms
+  at 5 (both fixed by rolling over directly to a unique name and not consulting
+  `backupCount` at all, which is what §3.2 always claimed); and file handlers
+  were created eagerly for `risk`/`portfolio`/`execution`/`attribution`, four
+  0-byte files claiming phases that do not exist. `resolve_symbol`'s duplicate
+  warning was downgraded to DEBUG when the duplicates agree — an append-only
+  asset master accumulates identical mappings by design, and warning per symbol
+  per run buried the case worth seeing, two `asset_id`s behind one venue symbol.
+  **Test isolation:** the reported failure (`{'BTC/USDT': 'BTC'} !=
+  {'BTC/USDT': None}`) was not a code defect — the test passed an isolated
+  `store=` but no `asset_master=`, and `BaseLoader` filled that in from the
+  production `DATASTORE_PATH`, so on a machine with a real asset master the
+  symbols resolved. Seven modules carry that default; an autouse fixture
+  redirects all of them, and a test fails if an eighth appears without joining
+  the list. **The doc is now checked against the code:** registration parses the
+  methodology header and §4 parameter table and refuses a doc naming a different
+  signal or family, or omitting a parameter the code runs — three of six
+  omitted `max_gap_days` and/or `history_buffer_days`, so half the "specs"
+  described a different signal from the one being backtested. `Status` became a
+  parsed enum, so `signal_statuses()` replaces a paragraph. **CI:** `ci.yml`
+  runs ruff and the full suite on 3.11 and 3.12 for every PR (make it required
+  on `main`); `deploy.yml` replaces `pr-merge.yml` and tests before it pulls —
+  fetch, check the incoming commit out into a throwaway worktree, run the suite
+  there, and only then `git reset --hard`, so a failure leaves the trading box
+  on the last known-good commit. Three latent faults in the old workflow fixed
+  on the way: a failed `git fetch` followed by a successful `reset` exited 0 and
+  deployed the previous commit, the job reset to `origin/main` regardless of
+  which branch the PR merged into, and concurrent merges raced on one directory.
+  pytest pinned to ≥ 8.4 (below it `caplog` cannot see the non-propagating `tm`
+  tree and the halt-logging assertions go vacuous), duplicate pytest config
+  removed, ruff/mypy pointed at the `requires-python` floor. 578 tests passing;
+  `scratch/scratch_observability.py` demonstrates the lot.
+- 2026-08-01: Venue access, recorded because it gates the Phase 5 backfill:
+  Binance answers **HTTP 451 "restricted location"** to every request from a US
+  egress IP — spot and `fapi`, public endpoints included — and ccxt reports it
+  as a bare `NetworkError` with the status and reason stripped, so the loaders
+  see an unreachable venue, write nothing, and the run ends as an audit
+  `data_presence` halt. Confirmed reachable from a blocked address:
+  `data-api.binance.vision` (public spot only — no funding rate, no open
+  interest, so no `carry`), `api.binance.us` (separate entity, no perps),
+  Deribit, Kraken, Coinbase, Gate, KuCoin, Bitget, MEXC. The backfill should run
+  on the machine that runs the pipeline. Worth adding when that happens: a venue
+  preflight that logs the HTTP status and response body, so "we are blocked"
+  stops looking identical to "the venue is down".

@@ -1,6 +1,5 @@
 """Nightly pipeline: load → audit → report."""
 
-import logging
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,7 +10,7 @@ from datastore import ParquetStore, AssetMaster
 from loaders.backfill import BackfillRunner
 from loaders.window import utc_now
 from audit.auditor import DataAudit
-from logging_config import get_logger, new_run_id, prune_old_logs, set_run_id
+from logging_config import get_logger, new_run_id, prune_old_logs, set_level, set_run_id
 
 
 logger = get_logger(__name__)
@@ -345,10 +344,10 @@ def run_nightly(
 if __name__ == "__main__":
     import argparse
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    # No logging.basicConfig() here: it configures the *stdlib root* logger,
+    # and the `tm` tree deliberately does not propagate to it (LOGGING.md
+    # section 3.6), so it never affected a single record this pipeline emits.
+    # Console verbosity is LOG_CONFIG.console_level, changed with --log-level.
 
     parser = argparse.ArgumentParser(
         description="Run nightly data pipeline",
@@ -371,8 +370,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Re-fetch the whole window even where the checkpoint says it is covered",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help=(
+            "Level for logs/*.log for this run (default: TM_LOG_LEVEL, else "
+            "INFO). DEBUG adds per-asset signal reject reasons and "
+            "per-rebalance backtest detail"
+        ),
+    )
+    parser.add_argument(
+        "--console-log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Level for stderr for this run (default: TM_CONSOLE_LOG_LEVEL, else WARNING)",
+    )
 
     args = parser.parse_args()
+
+    if args.log_level or args.console_log_level:
+        set_level(args.log_level or LOG_CONFIG.level, args.console_log_level)
 
     run_nightly(
         venue=args.venue,
