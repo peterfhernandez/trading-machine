@@ -254,7 +254,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 594 tests, ~35s, no network
+pytest                     # 603 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -315,6 +315,23 @@ Three things about the suite worth knowing:
 4. Create scratch script in `scratch/scratch_<module>.py` (demo only)
 5. Wire logging via `get_logger(__name__)` (see Logging above and `LOGGING.md`)
 6. Update `README.md` progress
+
+### Running a scratch demo
+
+Both forms work, and both are tested (`tests/test_scratch_demos.py`):
+
+```bash
+PAPER=true python scratch/scratch_audit.py     # as a script
+PAPER=true python -m scratch.scratch_audit     # as a module
+```
+
+The second used to fail with `ModuleNotFoundError: No module named 'log_demo'`:
+every demo opens with `from log_demo import start_demo_run`, and under `-m` the
+repo root leads `sys.path` while `scratch/` is not on it at all. The package
+marker `scratch/__init__.py` puts both directories on the path, and `-m` imports the
+package before it runs the module — so a new demo inherits the fix rather than
+rediscovering the bug. A demo run as a script does not depend on it:
+`log_demo` still inserts the repo root itself.
 
 ### Datastore Access
 
