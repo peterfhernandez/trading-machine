@@ -80,6 +80,12 @@ Legend: [ ] todo · [~] in progress · [x] done
       collected" rather than carrying a synthetic number that would only
       measure the generator. Until this is done, all six signals stay
       `draft` — they are implemented and tested, not evidenced.
+      **How to get the data: `DATA.md`.** Binance's public archive
+      (`data.binance.vision`) serves 2020-01 → present as checksummed monthly
+      zips and answers 200 from the same address where the API answers 451, so
+      the backfill no longer has to run on the trading machine. Route, format
+      gotchas, acceptance checks and the research steps that follow are all
+      there.
 
 ## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
 
