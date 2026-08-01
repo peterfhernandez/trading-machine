@@ -256,6 +256,18 @@ different answers. Plus the CI that would have caught some of it.
 - [x] Make `ci.yml` a **required status check** on `main` in the repository's
       branch protection settings — the workflow gates nothing until it is
       (this is a GitHub setting, not something a file in the repo can do)
+- [x] **CI runs the suite on Windows**, on `windows-latest` at 3.14 — the
+      platform and version the trading machine runs. Three defects had by then
+      reached `main` with every CI job green and failed on the box afterwards
+      (pytest's temp-dir cleanup exiting 1, cp1252 stdout, an open log handle
+      blocking a temp-dir removal); all three are POSIX/Windows differences
+      that a Python-version matrix cannot reach. A separate job, not an `os`
+      dimension: a dimension renames the three existing checks, and those names
+      are what branch protection requires on `main`
+- [ ] Add **`tests (windows, python 3.14)`** to the required status checks on
+      `main`. Same category as the item above it — a GitHub setting, not
+      something a file in the repo can do — and until it is taken the Windows
+      job reports without blocking a merge
 - [x] **`python -m scratch.scratch_observability` died on Windows** with a
       `FileNotFoundError` on the log file it had just asked a child pipeline to
       write. The child had exited 1 without writing anything: the demo built
@@ -733,3 +745,22 @@ different answers. Plus the CI that would have caught some of it.
   for — the suite failed in the throwaway worktree, `git reset --hard` never
   ran, and the trading machine stayed on the last known-good commit while
   `main` carried a commit that fails there.
+- 2026-08-01: **Windows joined `ci.yml`.** The gap the entry above exposed is
+  structural rather than particular to that bug: `ci.yml` ran three Linux jobs,
+  `deploy.yml` was the only thing that ever ran the suite on Windows, and it
+  runs *after* the merge. Three defects have now taken that route — pytest's
+  temp-directory cleanup exiting 1, a cp1252 stdout killing the nightly report,
+  and a log handler left open on a temp directory Windows then refused to
+  delete — every one a filesystem or console difference no Python-version
+  matrix can reach. A `tests (windows, python 3.14)` job now runs the suite on
+  `windows-latest` before the merge. Two limits, both deliberate: 3.14 only,
+  because the platform is the question the job exists to answer and Windows
+  minutes bill at 2x; and a separate job rather than an `os` dimension on the
+  existing matrix, because a dimension renames `tests (python 3.11)` to
+  `tests (ubuntu-latest, python 3.11)` and those three names are what branch
+  protection has marked required on `main` — a rename leaves the required
+  checks waiting forever on names nothing reports. No lint or mypy step on the
+  Windows job either: neither is platform-dependent, and running them twice
+  buys an identical answer for double the wall clock. Adding the new check to
+  the required list is a repository setting and is on the checklist above,
+  unticked; until it is taken the job reports without blocking.
