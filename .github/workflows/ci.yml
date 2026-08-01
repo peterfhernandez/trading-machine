@@ -71,6 +71,57 @@ jobs:
         continue-on-error: true
         run: mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 
+  test-windows:
+    # The trading machine is a Windows box on 3.14, and until now nothing
+    # tested that combination before a merge: `ci.yml` is Linux-only, so the
+    # only Windows verification in the project happened in `deploy.yml`, which
+    # runs *after* the merge. Three defects have now reached `main` green and
+    # failed there — pytest's temp-directory cleanup exiting 1, cp1252 stdout,
+    # and an open log handle blocking a temp-directory removal. Every one of
+    # them is a POSIX/Windows filesystem or console difference that no amount
+    # of Linux matrix breadth can see.
+    #
+    # A separate job rather than an `os` dimension on the matrix above, for one
+    # practical reason: adding a dimension renames the existing checks
+    # ("tests (python 3.11)" -> "tests (ubuntu-latest, python 3.11)"), and
+    # those names are what branch protection has marked required on `main`. A
+    # rename leaves the required checks waiting forever on names nothing
+    # reports. This job adds a name instead of changing three.
+    name: tests (windows, python 3.14)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to the version the trading machine runs, not the full
+          # matrix. The point of this job is the *platform*, and Windows
+          # minutes bill at 2x; the language-version question is already
+          # answered three ways above.
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Deliberately no lint or mypy step: neither is platform-dependent, and
+      # running them twice would double the wall clock for an identical answer.
+
+      - name: Tests
+        env:
+          PAPER: "true"
+          TM_LOG_DIR: ${{ runner.temp }}/tm-logs
+        # The exit code is part of the assertion, not just the summary line:
+        # a green Windows run that exits 1 is exactly the failure
+        # `tests/test_tmpdir_cleanup.py` exists for, and `deploy.yml` keys
+        # `git reset --hard` off the same code.
+        run: pytest
+
   no-attribution:
     name: no attribution in commit messages
     runs-on: ubuntu-latest

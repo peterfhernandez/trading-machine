@@ -155,6 +155,12 @@ Auditing the applied retrofit asked a different question from building it —
       raised `UnicodeEncodeError` on its own report whenever stdout was
       redirected (cp1252 cannot encode `✓`), which failed the run. Both now
       inherit the parent environment and tolerate a narrow console
+- [x] A third, found by the deploy gate once the first two let the demo run to
+      the end: it left rotating file handlers open on its temporary directory,
+      and Windows will not delete a file another handle has open — so cleanup
+      raised `PermissionError: [WinError 32]` after every section had printed.
+      The demo now closes them and restores the real `LOG_CONFIG` in a
+      `finally`
 
 ## Testing
 
@@ -262,7 +268,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 613 tests, ~40s, no network
+pytest                     # 617 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -272,7 +278,9 @@ Two workflows in `.github/workflows/`:
   GitHub-hosted runners across Python 3.11, 3.12 and 3.14: ruff (a hard gate), the
   full suite, and mypy (advisory). Make it a required check on `main` and a
   red suite stops
-  being mergeable. It also fails a PR whose commit messages carry tool
+  being mergeable. A fourth job runs the suite on **`windows-latest` at 3.14**,
+  the platform and version the trading machine itself runs — see
+  [Why Windows is in CI](#why-windows-is-in-ci) below. It also fails a PR whose commit messages carry tool
   attribution, per `CLAUDE.md` — using the same rule as the three `PreToolUse`
   hooks in `.claude/settings.json`, so a message the hooks accept cannot be
   rejected by CI or vice versa. The rule strips the two repo paths
@@ -312,6 +320,33 @@ Three things about the suite worth knowing:
   with one that falls back to `rmdir` (how a directory link is removed on
   Windows) and cannot raise; `tests/test_tmpdir_cleanup.py` pins it, exit code
   included.
+
+### Why Windows is in CI
+
+Three defects have now reached `main` with every CI job green and then failed
+on the trading machine: pytest's temp-directory cleanup exiting 1, a cp1252
+stdout killing the nightly report, and a log handler left open on a temporary
+directory Windows then refused to delete. Every one is a filesystem or console
+difference between POSIX and Windows, and no amount of Linux matrix breadth can
+see any of them — a Python-version dimension answers a different question from
+a platform dimension.
+
+Until this job existed, the only Windows verification in the project was
+`deploy.yml`, which runs **after** the merge. That is a genuine gate — it keeps
+the bad commit off the live checkout — but it leaves `main` carrying code the
+trading machine will not accept, and it tells you so by email rather than on
+the pull request.
+
+Two deliberate limits. The job is **3.14 only**, because the platform is the
+question and the language version is already answered three ways; Windows
+minutes also bill at twice the rate. And it is a **separate job rather than an
+`os` dimension** on the existing matrix: adding a dimension renames
+`tests (python 3.11)` to `tests (ubuntu-latest, python 3.11)`, and those three
+names are what branch protection has marked required on `main` — a rename
+leaves the required checks waiting forever on names nothing reports. Adding
+`tests (windows, python 3.14)` to the required list is a separate, deliberate
+step in the repository settings, and until it is taken this job reports without
+blocking.
 
 ## Development
 
