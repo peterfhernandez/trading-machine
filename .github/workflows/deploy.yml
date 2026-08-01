@@ -94,7 +94,7 @@ jobs:
             # come from the machine's existing environment. A merge that adds a
             # dependency therefore fails here with ImportError, which is the
             # correct answer: install it, then re-run this workflow.
-            python -m pytest -q
+            C:\Users\Peter\coderepo\trading-machine\venv\Scripts\python -m pytest -q
             if ($LASTEXITCODE -ne 0) { throw "tests failed on the incoming commit" }
           } finally {
             Pop-Location
