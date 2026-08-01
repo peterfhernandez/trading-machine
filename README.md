@@ -810,8 +810,17 @@ policy. Reachable from a blocked address, if that is where you are:
 `data-api.binance.vision` (public **spot** market data only — no `fapi`, so no
 funding rate and no open interest, which means no `carry`), `api.binance.us`
 (separate entity, no perps), and Deribit, Kraken, Coinbase, Gate, KuCoin,
-Bitget and MEXC in full. The straightforward answer is to run the backfill on
-the machine that runs the pipeline.
+Bitget and MEXC in full.
+
+That is about the *API*. Binance's **bulk public archive** is a separate host
+and is not blocked: `data.binance.vision/data/futures/um/monthly/...` answers
+200 from the same address, serving checksummed monthly zips of klines **and**
+funding rate back to 2020-01 across 938 USDT-M symbols — the two datasets
+Phase 5 actually needs. (Not to be confused with `data-api.binance.vision`, the
+REST mirror named one hyphen apart, which really is spot-only.) So the backfill
+does not have to run on the trading machine; it needs a bulk loader instead of
+ccxt. Route, file formats, acceptance checks and the research steps that follow
+are in **`DATA.md`**.
 
 **Also outstanding:** the 10 MB rotation size and 12-month retention window in
 `LOGGING.md` were specified, not measured — no component's real log volume is
