@@ -2,7 +2,6 @@
 Tests for the configuration module.
 """
 
-import pytest
 
 import config
 

@@ -2,9 +2,9 @@
 Datastore module: append-only Parquet store with point-in-time semantics.
 """
 
-from .store import ParquetStore, DatasetSchema
 from .asset_master import AssetMaster, AssetSymbolMapping
 from .dedupe import DEFAULT_BAR_KEYS, count_duplicate_bars, latest_per_bar
+from .store import DatasetSchema, ParquetStore
 
 __all__ = [
     "ParquetStore",

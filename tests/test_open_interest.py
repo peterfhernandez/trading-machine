@@ -1,16 +1,14 @@
 """Tests for Open Interest loader."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
-import polars as pl
 import pytest
 
 from config import LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.open_interest import OpenInterestLoader
 from loaders.window import FetchWindow, utc_now
-from loaders.schemas import OPEN_INTEREST_SCHEMA
 
 
 @pytest.fixture
@@ -213,7 +211,7 @@ def mock_binance_with_history():
     exchange.has = {"fetchOpenInterestHistory": True}
 
     stamps = [
-        int(datetime(2024, 1, day, tzinfo=timezone.utc).timestamp() * 1000)
+        int(datetime(2024, 1, day, tzinfo=UTC).timestamp() * 1000)
         for day in (1, 2, 3)
     ]
 

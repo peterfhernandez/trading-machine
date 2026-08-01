@@ -2,15 +2,13 @@
 Tests for the datastore module (ParquetStore and AssetMaster).
 """
 
-import pytest
-from datetime import datetime, timedelta
-from pathlib import Path
-import tempfile
 import shutil
+from datetime import datetime, timedelta
 
 import polars as pl
+import pytest
 
-from datastore import ParquetStore, DatasetSchema, AssetMaster
+from datastore import AssetMaster, DatasetSchema, ParquetStore
 
 
 @pytest.fixture

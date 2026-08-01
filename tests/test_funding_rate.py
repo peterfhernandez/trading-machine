@@ -1,16 +1,14 @@
 """Tests for Funding Rate loader."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
-import polars as pl
 import pytest
 
 from config import LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.funding_rate import FundingRateLoader
 from loaders.window import FetchWindow, utc_now
-from loaders.schemas import FUNDING_RATE_SCHEMA
 
 
 @pytest.fixture
@@ -219,7 +217,7 @@ def mock_binance_with_history():
     # Three fixed eight-hourly funding stamps on 2024-01-01, served from
     # `since` forward -- a venue has a finite record, not an endless stream.
     stamps = [
-        int(datetime(2024, 1, 1, hour, tzinfo=timezone.utc).timestamp() * 1000)
+        int(datetime(2024, 1, 1, hour, tzinfo=UTC).timestamp() * 1000)
         for hour in (0, 8, 16)
     ]
 

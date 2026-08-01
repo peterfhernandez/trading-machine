@@ -8,11 +8,10 @@ This script:
 4. Never places real trades (PAPER-only demo)
 """
 
-from datetime import datetime, timedelta
-from pathlib import Path
 import sys
 import tempfile
-import shutil
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -21,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from log_demo import start_demo_run  # noqa: E402
 
 from config import DATASTORE_PATH, PAPER
-from datastore import ParquetStore, DatasetSchema, AssetMaster
+from datastore import AssetMaster, DatasetSchema, ParquetStore
 
 
 def demo_parquet_store():
@@ -213,7 +212,7 @@ def main():
         )
         return
 
-    print(f"\n[+] Configuration:")
+    print("\n[+] Configuration:")
     print(f"    DATASTORE_PATH: {DATASTORE_PATH}")
     print(f"    PAPER mode: {PAPER}")
 

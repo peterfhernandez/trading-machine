@@ -4,7 +4,6 @@ import polars as pl
 
 from datastore import DatasetSchema
 
-
 UNIVERSE_SCHEMA = DatasetSchema(
     name="universe",
     fields={

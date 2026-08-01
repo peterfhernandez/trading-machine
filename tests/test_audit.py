@@ -5,9 +5,9 @@ from datetime import datetime, timedelta
 import polars as pl
 import pytest
 
+from audit.auditor import AuditResult, DataAudit
 from config import AUDIT_CONFIG
-from datastore import ParquetStore, DatasetSchema
-from audit.auditor import DataAudit, AuditResult
+from datastore import DatasetSchema, ParquetStore
 from universe import UNIVERSE_SCHEMA
 
 

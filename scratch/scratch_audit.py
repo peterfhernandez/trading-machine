@@ -12,12 +12,10 @@ import polars as pl
 # project imports below resolve when this script is run directly.
 from log_demo import start_demo_run
 
-from config import PAPER
-from datastore import ParquetStore, DatasetSchema
 from audit.auditor import DataAudit
+from config import PAPER
+from datastore import DatasetSchema, ParquetStore
 from universe import UNIVERSE_SCHEMA
-
-
 
 logging.basicConfig(
     level=logging.INFO,

@@ -1,13 +1,12 @@
 """Open interest loader for perpetual swaps."""
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import ccxt
 import polars as pl
 
-from config import DATASTORE_PATH, LOADER_CONFIG
-from datastore import ParquetStore, AssetMaster
+from config import LOADER_CONFIG
+from datastore import AssetMaster, ParquetStore
 from loaders.base import (
     BaseLoader,
     paginate_time_series,
@@ -17,7 +16,6 @@ from loaders.base import (
 from loaders.schemas import OPEN_INTEREST_SCHEMA
 from loaders.window import FetchWindow, utc_now
 from logging_config import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -34,9 +32,9 @@ class OpenInterestLoader(BaseLoader):
         self,
         venue: str,
         lookback_days: int = 30,
-        store: Optional[ParquetStore] = None,
-        asset_master: Optional[AssetMaster] = None,
-        max_symbols: Optional[int] = None,
+        store: ParquetStore | None = None,
+        asset_master: AssetMaster | None = None,
+        max_symbols: int | None = None,
         history_timeframe: str = "1d",
     ):
         super().__init__(venue, store, asset_master)
@@ -106,7 +104,7 @@ class OpenInterestLoader(BaseLoader):
             rows.append({
                 "symbol": symbol,
                 "event_ts": datetime.fromtimestamp(
-                    entry["timestamp"] / 1000, timezone.utc
+                    entry["timestamp"] / 1000, UTC
                 ).replace(tzinfo=None),
                 "open_interest": amount,
                 "open_interest_usd": value,
@@ -120,7 +118,7 @@ class OpenInterestLoader(BaseLoader):
             return []
 
         ts = (
-            datetime.fromtimestamp(oi_data["timestamp"] / 1000, timezone.utc).replace(tzinfo=None)
+            datetime.fromtimestamp(oi_data["timestamp"] / 1000, UTC).replace(tzinfo=None)
             if oi_data.get("timestamp")
             else utc_now()
         )
@@ -135,7 +133,7 @@ class OpenInterestLoader(BaseLoader):
             "open_interest_usd": value,
         }]
 
-    def fetch(self, window: Optional[FetchWindow] = None) -> pl.DataFrame:
+    def fetch(self, window: FetchWindow | None = None) -> pl.DataFrame:
         """Fetch open interest for top assets.
 
         Args:
@@ -207,7 +205,7 @@ class OpenInterestLoader(BaseLoader):
         logger.info(f"Prepared {len(df)} OI snapshots; coverage: {df['asset_id'].n_unique()} unique assets")
         return df
 
-    def run(self, window: Optional[FetchWindow] = None) -> int:
+    def run(self, window: FetchWindow | None = None) -> int:
         """Fetch and append open interest. Returns the number of rows appended."""
         df = self.fetch(window=window)
         if len(df) == 0:

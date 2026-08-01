@@ -2,12 +2,11 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
-from config import AUDIT_CONFIG, ALERT_CONFIG, DATASTORE_PATH
+from config import ALERT_CONFIG, AUDIT_CONFIG, DATASTORE_PATH
 from datastore import (
     DEFAULT_BAR_KEYS,
     ParquetStore,
@@ -15,7 +14,6 @@ from datastore import (
     latest_per_bar,
 )
 from logging_config import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -49,9 +47,9 @@ class DataAudit:
 
     def __init__(
         self,
-        store: Optional[ParquetStore] = None,
+        store: ParquetStore | None = None,
         venue: str = "binance",
-        universe_size: Optional[int] = None,
+        universe_size: int | None = None,
     ):
         """
         Args:
@@ -67,7 +65,7 @@ class DataAudit:
         self.universe_size_override = universe_size
         self.results: list[AuditResult] = []
 
-    def audit_dataset(self, dataset: str, date: Optional[datetime] = None) -> list[AuditResult]:
+    def audit_dataset(self, dataset: str, date: datetime | None = None) -> list[AuditResult]:
         """Audit a single dataset.
 
         Args:
@@ -78,7 +76,7 @@ class DataAudit:
             List of AuditResult objects
         """
         if date is None:
-            date = datetime.now(timezone.utc).replace(tzinfo=None)
+            date = datetime.now(UTC).replace(tzinfo=None)
 
         self.results = []
         logger.info(f"Auditing {dataset} for {date.date()}")
@@ -152,7 +150,7 @@ class DataAudit:
                 f"{'PASS' if result.passed else 'FAIL'} — {result.message}",
             )
 
-    def resolve_universe_size(self, date: datetime) -> tuple[Optional[int], str]:
+    def resolve_universe_size(self, date: datetime) -> tuple[int | None, str]:
         """Coverage denominator as of `date`, and where it came from.
 
         Convenience wrapper over `resolve_universe` for callers that only need
@@ -163,7 +161,7 @@ class DataAudit:
 
     def resolve_universe(
         self, date: datetime
-    ) -> tuple[Optional[set[str]], Optional[int], str]:
+    ) -> tuple[set[str] | None, int | None, str]:
         """Universe membership as of `date`: (members, size, source).
 
         The coverage check needs a denominator — "% of *what*". The only
@@ -223,8 +221,8 @@ class DataAudit:
     def _check_coverage(
         self,
         df: pl.DataFrame,
-        members: Optional[set[str]],
-        universe_size: Optional[int],
+        members: set[str] | None,
+        universe_size: int | None,
         universe_source: str,
     ) -> None:
         """Check coverage: how much of the point-in-time universe has data.
@@ -488,7 +486,7 @@ class DataAudit:
         return len(critical_failures) > 0
 
 
-def run_audit(dataset: str, date: Optional[datetime] = None) -> AuditResult:
+def run_audit(dataset: str, date: datetime | None = None) -> AuditResult:
     """Run audit on a dataset and report results.
 
     Args:

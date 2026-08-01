@@ -2,16 +2,14 @@
 
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
+from audit.auditor import DataAudit
 from config import DATASTORE_PATH, LOADER_CONFIG, LOG_CONFIG
-from datastore import ParquetStore, AssetMaster
+from datastore import AssetMaster, ParquetStore
 from loaders.backfill import BackfillRunner
 from loaders.window import utc_now
-from audit.auditor import DataAudit
 from logging_config import get_logger, new_run_id, prune_old_logs, set_level, set_run_id
-
 
 logger = get_logger(__name__)
 
@@ -34,8 +32,8 @@ class NightlyPipeline:
     def run(
         self,
         days: int = 1,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> bool:
         """Run the nightly pipeline.
 
@@ -178,7 +176,7 @@ class NightlyPipeline:
                 logger.warning(f"No USDT symbols returned from {venue}")
                 return am
 
-            base_date = datetime.now(timezone.utc).replace(tzinfo=None)
+            base_date = datetime.now(UTC).replace(tzinfo=None)
             added = 0
             skipped = 0
             for symbol, market in sorted(markets.items()):
@@ -213,8 +211,8 @@ class NightlyPipeline:
     def _load_stage(
         self,
         days: int,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> None:
         """Load data via backfill runner.
 
@@ -250,7 +248,7 @@ class NightlyPipeline:
         only records the per-dataset roll-up.
         """
         datasets = ["ohlcv_daily", "ohlcv_hourly", "funding_rate", "open_interest"]
-        today = datetime.now(timezone.utc).replace(tzinfo=None)
+        today = datetime.now(UTC).replace(tzinfo=None)
 
         all_passed = True
 
@@ -305,14 +303,16 @@ class NightlyPipeline:
         print()
 
 
-def parse_window_arg(value: Optional[str], label: str) -> Optional[datetime]:
+def parse_window_arg(value: str | None, label: str) -> datetime | None:
     """Parse a --start/--end CLI value (YYYY-MM-DD or full ISO 8601)."""
     if value is None:
         return None
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as e:
-        raise SystemExit(f"--{label} must be YYYY-MM-DD or ISO 8601, got {value!r}: {e}")
+        raise SystemExit(
+            f"--{label} must be YYYY-MM-DD or ISO 8601, got {value!r}: {e}"
+        ) from e
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
@@ -320,8 +320,8 @@ def run_nightly(
     venue: str = "binance",
     dry_run: bool = False,
     days: int = 1,
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     ignore_checkpoint: bool = False,
 ) -> None:
     """Run the nightly pipeline end-to-end.
