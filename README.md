@@ -263,7 +263,12 @@ Two workflows in `.github/workflows/`:
   full suite, and mypy (advisory). Make it a required check on `main` and a
   red suite stops
   being mergeable. It also fails a PR whose commit messages carry tool
-  attribution, per `CLAUDE.md`.
+  attribution, per `CLAUDE.md` — using the same rule as the three `PreToolUse`
+  hooks in `.claude/settings.json`, so a message the hooks accept cannot be
+  rejected by CI or vice versa. The rule strips the two repo paths
+  (`CLAUDE.md`, `.claude/`) before matching, because naming a file you are
+  changing is not attribution, and it skips merge commits, whose subjects
+  GitHub generates from `claude/<topic>` branch names.
 - **`deploy.yml`** — when a PR merges into `main`, on the self-hosted
   `trading-machine` runner. It **tests before it pulls**: `git fetch` (which
   touches nothing), check the incoming commit out into a throwaway worktree,
