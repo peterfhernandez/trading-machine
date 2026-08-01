@@ -21,6 +21,7 @@ No network, no store writes: a temporary log directory and synthetic records.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from log_demo import start_demo_run
 # isort: on
 
 import logging_config
-from config import PAPER, PROJECT_ROOT, LogConfig
+from config import LOG_CONFIG, PAPER, PROJECT_ROOT, LogConfig
 
 
 def section(title: str) -> None:
@@ -158,6 +159,34 @@ def demo_rotation_collision(tmp: Path) -> None:
     print(f"expired under a 0-day window:   {len(stale)}  <- the pruner's glob matches")
 
 
+def release_temp_log_handlers() -> None:
+    """Close every `tm` file handler and put the real `LOG_CONFIG` back.
+
+    Sections 2 and 3 point log files at a temporary directory, and a
+    `RotatingFileHandler` holds its file open. Windows refuses to delete a file
+    another handle has open, so the leak turned `TemporaryDirectory`'s cleanup
+    into `PermissionError: [WinError 32]` *after* every section had printed —
+    the demo looked like it worked and the interpreter looked like it failed.
+    POSIX unlinks an open file without complaint, so no local run and no
+    GitHub-hosted CI job could see it; the self-hosted deploy gate did.
+
+    The handlers are not only the ones this file creates. `configure_logging`
+    in section 2 replaces the module-level *active* config, so every
+    `get_logger` after it opens its component file under the temp directory
+    too — which is how `datastore.log`, from nothing more than
+    `import signals`, ended up being the handle that blocked the cleanup.
+    """
+    names = ["tm", *(n for n in logging.root.manager.loggerDict if n.startswith("tm."))]
+    for name in names:
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                logger.removeHandler(handler)
+                handler.close()
+
+    logging_config.configure_logging(LOG_CONFIG, force=True)
+
+
 def demo_signal_status() -> None:
     section("5. Which signals actually have evidence?")
 
@@ -185,10 +214,19 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        ok = demo_module_invocation(tmp)
-        demo_level_override(tmp)
-        demo_rotation_collision(tmp)
-        demo_signal_status()
+        try:
+            ok = demo_module_invocation(tmp)
+            demo_level_override(tmp)
+            demo_rotation_collision(tmp)
+        finally:
+            # Before the directory is removed, and before anything else can
+            # open a component file inside it.
+            release_temp_log_handlers()
+
+    # Outside the temp directory on purpose: this section imports `signals`,
+    # which logs, and those records belong in the real component files the way
+    # every other demo's do.
+    demo_signal_status()
 
     return 0 if ok else 1
 

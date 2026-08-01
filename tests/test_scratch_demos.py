@@ -18,6 +18,7 @@ reachable through neither entry. That is the Phase 5.6 lesson about
 the code path that is broken.
 """
 
+import logging
 import os
 import subprocess
 import sys
@@ -186,6 +187,119 @@ class TestTheEnvironmentAChildDemoGets:
         """The pipeline's report prints `✓`; a captured stdout would otherwise
         take the locale encoding, which on Windows cannot encode it."""
         assert self._env(tmp_path)["PYTHONIOENCODING"] == "utf-8"
+
+
+class TestTheDemoLetsGoOfItsTemporaryLogFiles:
+    """Sections 2 and 3 point log files at a temp directory; a handler holds
+    its file open, and Windows will not delete an open file.
+
+    The demo therefore printed all five sections and then died in
+    `TemporaryDirectory.__exit__` with `PermissionError: [WinError 32]` — it
+    looked like the interpreter had failed rather than the demo. POSIX unlinks
+    an open file happily, so a local run and every GitHub-hosted CI job were
+    green; the self-hosted deploy gate, which is the Windows machine, was not.
+
+    The assertion is the invariant rather than the platform: no `tm` logger may
+    still hold an open handle under the directory that is about to be removed.
+    """
+
+    @staticmethod
+    def _detach_all_tm_file_handlers() -> None:
+        """The fixture's own teardown, written independently of the function
+        under test.
+
+        Not a duplicate for its own sake: `_ensure_component_handler` returns
+        early when a component logger already has a file handler, so one test's
+        leaked handler stops the next test from opening a file at all — and an
+        assertion that no handle is open under `tmp_path` then passes for the
+        wrong reason. Establishing the precondition with the code under test
+        would hide exactly the regression these tests exist to catch.
+        """
+        names = ["tm", *(n for n in logging.root.manager.loggerDict if n.startswith("tm."))]
+        for name in names:
+            logger = logging.getLogger(name)
+            for handler in list(logger.handlers):
+                if isinstance(handler, logging.FileHandler):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+    @pytest.fixture(autouse=True)
+    def _clean_logging_state(self):
+        import logging_config
+        from config import LOG_CONFIG
+
+        self._detach_all_tm_file_handlers()
+        yield
+        self._detach_all_tm_file_handlers()
+        logging_config.configure_logging(LOG_CONFIG, force=True)
+
+    @staticmethod
+    def _open_a_component_file_under(tmp_path: Path):
+        """Reproduce what section 2 does — repoint the *active* config, then
+        log — which is what makes later `get_logger` calls open files there
+        too."""
+        import logging_config
+        from config import LogConfig
+
+        cfg = LogConfig(dir=tmp_path / "levels", level="INFO")
+        logging_config.configure_logging(cfg, force=True)
+        logging_config.get_logger("signals.demo").info("a record")
+        logging_config.get_logger("datastore.demo").info("import signals does this")
+        return cfg
+
+    @staticmethod
+    def _open_handles_under(directory: Path) -> list[logging.Handler]:
+        names = ["tm", *(n for n in logging.root.manager.loggerDict if n.startswith("tm."))]
+        return [
+            handler
+            for name in names
+            for handler in logging.getLogger(name).handlers
+            if isinstance(handler, logging.FileHandler)
+            and directory in Path(handler.baseFilename).parents
+            and handler.stream is not None
+        ]
+
+    def test_the_leak_is_real_before_it_is_released(self, tmp_path):
+        """A negative control: without this the test below could pass by
+        asserting nothing was ever opened."""
+        from scratch.scratch_observability import release_temp_log_handlers
+
+        self._open_a_component_file_under(tmp_path)
+        assert self._open_handles_under(tmp_path), "nothing held the temp files open"
+        release_temp_log_handlers()
+
+    def test_releasing_closes_every_handle_under_the_temp_directory(self, tmp_path):
+        from scratch.scratch_observability import release_temp_log_handlers
+
+        self._open_a_component_file_under(tmp_path)
+        release_temp_log_handlers()
+
+        assert not self._open_handles_under(tmp_path)
+
+    def test_the_directory_can_then_be_removed(self, tmp_path):
+        """The operation that actually failed, run for real. It is a no-op
+        assertion on POSIX and the whole point on Windows."""
+        import shutil
+
+        from scratch.scratch_observability import release_temp_log_handlers
+
+        self._open_a_component_file_under(tmp_path)
+        release_temp_log_handlers()
+
+        shutil.rmtree(tmp_path)
+        assert not tmp_path.exists()
+
+    def test_the_real_config_is_restored(self, tmp_path):
+        """Otherwise the next `get_logger` in the process — including the
+        atexit log tail — would still be writing into a deleted directory."""
+        import logging_config
+        from config import LOG_CONFIG
+        from scratch.scratch_observability import release_temp_log_handlers
+
+        self._open_a_component_file_under(tmp_path)
+        release_temp_log_handlers()
+
+        assert logging_config._active_cfg is LOG_CONFIG
 
 
 @pytest.mark.integration

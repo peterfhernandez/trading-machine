@@ -702,3 +702,34 @@ different answers. Plus the CI that would have caught some of it.
   `PYTHONIOENCODING=cp1252` exits 0, prints its report, logs no CRITICAL, and
   still emits the real glyphs on a UTF-8 console. The cp1252 pair fails without
   the fix, which is the negative control. 613 tests passing.
+- 2026-08-01: **The deploy gate caught what three green CI jobs could not.**
+  The previous entry's fixes let `scratch_observability` reach the end of
+  `main()` for the first time on Windows, where it died in
+  `TemporaryDirectory.__exit__` with `PermissionError: [WinError 32] The
+  process cannot access the file because it is being used by another process`
+  — *after* all five sections had printed, so it read as an interpreter fault
+  rather than a demo fault. Sections 2 and 3 point log files at a temporary
+  directory, a `RotatingFileHandler` holds its file open, and Windows will not
+  delete an open file; POSIX unlinks one without complaint, which is why the
+  local run and all three GitHub-hosted CI jobs (3.11, 3.12, 3.14) were green
+  on the same commit. The leak was not confined to the handlers the demo
+  creates deliberately: section 2 calls `configure_logging(cfg)`, which
+  replaces the module-level *active* config, so every later `get_logger` opens
+  its component file under the temp directory too — the handle that actually
+  blocked the cleanup belonged to `datastore.log`, opened by nothing more than
+  `import signals` in section 5. `release_temp_log_handlers()` closes every
+  `tm` file handler and restores the real `LOG_CONFIG`, called in a `finally`
+  so an exception mid-demo still releases them, and section 5 moved outside the
+  temp directory entirely — its records belong in the real component files the
+  way every other demo's do. 4 new tests, and the interesting part is their own
+  isolation: `_ensure_component_handler` returns early when a component logger
+  already has a file handler, so the first version of these tests left handlers
+  attached and the next test opened no file at all — its "nothing is held open
+  under tmp_path" assertion passed for the wrong reason, and passed against a
+  deliberately broken release function. The autouse fixture detaches handlers
+  with its own code rather than the code under test, which is what makes the
+  negative control (2 of 4 failing) mean anything. 617 tests passing. Worth
+  recording about the gate itself: `deploy.yml` did exactly what it was built
+  for — the suite failed in the throwaway worktree, `git reset --hard` never
+  ran, and the trading machine stayed on the last known-good commit while
+  `main` carried a commit that fails there.

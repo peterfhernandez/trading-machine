@@ -155,6 +155,12 @@ Auditing the applied retrofit asked a different question from building it —
       raised `UnicodeEncodeError` on its own report whenever stdout was
       redirected (cp1252 cannot encode `✓`), which failed the run. Both now
       inherit the parent environment and tolerate a narrow console
+- [x] A third, found by the deploy gate once the first two let the demo run to
+      the end: it left rotating file handlers open on its temporary directory,
+      and Windows will not delete a file another handle has open — so cleanup
+      raised `PermissionError: [WinError 32]` after every section had printed.
+      The demo now closes them and restores the real `LOG_CONFIG` in a
+      `finally`
 
 ## Testing
 
@@ -262,7 +268,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 613 tests, ~40s, no network
+pytest                     # 617 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
