@@ -24,11 +24,29 @@ adopting a commit that actually passed.
 the Windows removal path. These tests pin that shim: that it is installed at
 both call sites, that it still removes what pytest removed and leaves alone what
 pytest left alone, and that it survives an `unlink` that refuses.
+
+**Creating the link is itself a privileged operation on Windows.** `os.symlink`
+needs `SeCreateSymbolicLinkPrivilege`, which an ordinary account only holds
+under Developer Mode or in an elevated shell; without it every test here that
+seeds a link died with `OSError: [WinError 1314] A required privilege is not
+held by the client` — seven red tests on a machine where nothing was wrong. A
+directory junction is not a substitute: `Path.is_symlink()` answers False for
+one, so pytest's cleanup would not look at it and neither would the shim.
+
+Those tests are therefore skipped when the OS refuses to create a symlink, and
+that skip is not a hole in the coverage: the defect starts with pytest's own
+`_force_symlink`, so a box that cannot create `pytest-current` cannot reach the
+failure either. What is left is the shim's decision logic, which does not need
+the filesystem at all — `TestTheDecisionLogicWithoutAFilesystem` pins that
+against stubs and runs everywhere, including on the trading machine, where
+`deploy.yml` is the reason any of this exists.
 """
 
+import functools
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -39,6 +57,35 @@ from tests.conftest import (
     PROJECT_ROOT,
     _remove_dangling_link,
     _tolerant_cleanup_dead_symlinks,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _symlink_creation_is_permitted() -> bool:
+    """Can this account create a symlink at all?
+
+    Probed rather than inferred from `os.name`: the answer varies between two
+    Windows machines, and between an elevated and an ordinary shell on one.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        target.mkdir()
+        try:
+            (root / "link").symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+
+requires_symlink_creation = pytest.mark.skipif(
+    not _symlink_creation_is_permitted(),
+    reason=(
+        "creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows "
+        "(Developer Mode or an elevated shell). Without it pytest's own "
+        "_force_symlink cannot create pytest-current either, so the defect the "
+        "shim guards against cannot arise on this machine"
+    ),
 )
 
 
@@ -86,6 +133,7 @@ class TestTheShimIsInstalled:
 
 
 class TestItStillDoesPytestsJob:
+    @requires_symlink_creation
     def test_a_dangling_link_is_removed(self, link_root):
         link = _dangling_dir_link(link_root)
 
@@ -94,6 +142,7 @@ class TestItStillDoesPytestsJob:
         assert not link.is_symlink()
         assert list(link_root.iterdir()) == []
 
+    @requires_symlink_creation
     def test_a_live_link_is_left_alone(self, link_root):
         target = link_root / "pytest-1"
         target.mkdir()
@@ -120,6 +169,7 @@ class TestItStillDoesPytestsJob:
 
 
 class TestItCannotFailTheRun:
+    @requires_symlink_creation
     def test_a_refused_unlink_falls_back_to_rmdir(self, link_root, monkeypatch):
         """Windows in miniature: DeleteFileW refuses, RemoveDirectoryW works.
 
@@ -145,6 +195,7 @@ class TestItCannotFailTheRun:
         assert rmdir_calls == [link]
         assert list(link_root.iterdir()) == []
 
+    @requires_symlink_creation
     def test_an_undeletable_link_does_not_raise(self, link_root, monkeypatch):
         """A link held open by another process must not take the exit code with it."""
         _dangling_dir_link(link_root)
@@ -157,6 +208,7 @@ class TestItCannotFailTheRun:
 
         _tolerant_cleanup_dead_symlinks(link_root)  # must not raise
 
+    @requires_symlink_creation
     def test_an_unreadable_entry_is_skipped(self, link_root, monkeypatch):
         """`resolve()` can raise too — pytest's version lets that escape as well."""
 
@@ -186,6 +238,124 @@ class TestItCannotFailTheRun:
 
         assert "unlink()" in body, "pytest no longer unlinks here — recheck the shim"
         assert "try" not in body, "pytest now guards this itself — the shim can be removed"
+
+
+# Everything above needs the OS to create a link. Everything below needs
+# nothing: the shim only ever calls `iterdir`, `is_symlink`, `resolve`, `unlink`
+# and `rmdir`, all duck-typed, so its decision logic can be pinned with stubs.
+#
+# That is what keeps the privilege-less machine covered — and it is the machine
+# that matters, because `deploy.yml` runs the suite there and gates
+# `git reset --hard` on the exit code. These assertions are about the shim's
+# control flow, not about Windows link semantics; the tests above own that half
+# and say so by skipping when they cannot have it.
+
+
+class _Resolved:
+    def __init__(self, exists: bool) -> None:
+        self._exists = exists
+
+    def exists(self) -> bool:
+        return self._exists
+
+
+class _Entry:
+    """A directory entry with no filesystem behind it.
+
+    `refuse` names the methods that raise `PermissionError`, which is how
+    Windows answers `os.unlink` on a link to a directory.
+    """
+
+    def __init__(self, name: str, *, symlink: bool = True, target_exists: bool = False, refuse: tuple[str, ...] = ()) -> None:
+        self.name = name
+        self._symlink = symlink
+        self._target_exists = target_exists
+        self._refuse = refuse
+        self.calls: list[str] = []
+
+    def _record(self, method: str) -> None:
+        self.calls.append(method)
+        if method in self._refuse:
+            raise PermissionError(5, "Access is denied")
+
+    def is_symlink(self) -> bool:
+        return self._symlink
+
+    def resolve(self) -> _Resolved:
+        self._record("resolve")
+        return _Resolved(self._target_exists)
+
+    def unlink(self) -> None:
+        self._record("unlink")
+
+    def rmdir(self) -> None:
+        self._record("rmdir")
+
+
+class _Root:
+    def __init__(self, *entries: _Entry, refuse_iterdir: bool = False) -> None:
+        self._entries = entries
+        self._refuse_iterdir = refuse_iterdir
+
+    def iterdir(self) -> list[_Entry]:
+        if self._refuse_iterdir:
+            raise PermissionError(5, "Access is denied")
+        return list(self._entries)
+
+
+class TestTheDecisionLogicWithoutAFilesystem:
+    def test_a_dangling_link_is_unlinked(self):
+        entry = _Entry("pytest-current", target_exists=False)
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))
+
+        assert entry.calls == ["resolve", "unlink"]
+
+    def test_a_live_link_is_left_alone(self):
+        entry = _Entry("pytest-current", target_exists=True)
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))
+
+        assert entry.calls == ["resolve"]
+
+    def test_a_plain_directory_is_never_resolved_or_removed(self):
+        entry = _Entry("pytest-2", symlink=False)
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))
+
+        assert entry.calls == []
+
+    def test_a_refused_unlink_falls_back_to_rmdir(self):
+        entry = _Entry("pytest-current", refuse=("unlink",))
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))
+
+        assert entry.calls == ["resolve", "unlink", "rmdir"]
+
+    def test_both_removals_refusing_does_not_raise(self):
+        entry = _Entry("pytest-current", refuse=("unlink", "rmdir"))
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))  # must not raise
+
+        assert entry.calls == ["resolve", "unlink", "rmdir"]
+
+    def test_a_refused_resolve_skips_the_entry(self):
+        entry = _Entry("pytest-current", refuse=("resolve",))
+
+        _tolerant_cleanup_dead_symlinks(_Root(entry))  # must not raise
+
+        assert entry.calls == ["resolve"]
+
+    def test_one_bad_entry_does_not_stop_the_next(self):
+        bad = _Entry("pytest-current", refuse=("resolve",))
+        good = _Entry("pytest-previous", target_exists=False)
+
+        _tolerant_cleanup_dead_symlinks(_Root(bad, good))
+
+        assert good.calls == ["resolve", "unlink"]
+
+    def test_a_refused_iterdir_does_not_raise(self):
+        _tolerant_cleanup_dead_symlinks(_Root(refuse_iterdir=True))  # must not raise
 
 
 # The failure this file exists for is an *exit code*, and no in-process
@@ -265,6 +435,7 @@ def _run_pytest_over_a_stale_link(tmp_path: Path, conftest: str) -> subprocess.C
 
 
 @pytest.mark.integration
+@requires_symlink_creation
 class TestTheExitCode:
     def test_a_green_run_exits_zero_with_the_shim(self, tmp_path):
         result = _run_pytest_over_a_stale_link(tmp_path, _REFUSE_UNLINK + _INSTALL_SHIM)

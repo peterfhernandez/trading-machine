@@ -321,7 +321,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 617 tests, ~40s, no network
+pytest                     # 644 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -373,6 +373,19 @@ Three things about the suite worth knowing:
   with one that falls back to `rmdir` (how a directory link is removed on
   Windows) and cannot raise; `tests/test_tmpdir_cleanup.py` pins it, exit code
   included.
+- **Seeding that stale link is itself privileged on Windows.** `os.symlink`
+  needs `SeCreateSymbolicLinkPrivilege` — held under Developer Mode or in an
+  elevated shell, and not by an ordinary account — so the seven tests that
+  create one failed with `OSError: [WinError 1314] A required privilege is not
+  held by the client` on the trading machine, red for a reason that had nothing
+  to do with the code. They now skip when a runtime probe finds symlink creation
+  refused, which costs no coverage: the defect begins with pytest's own
+  `_force_symlink`, so a machine that cannot create `pytest-current` cannot
+  reach the failure either. The shim's decision logic — remove a dangling link,
+  fall back to `rmdir`, never raise — is pinned separately against stubs and
+  runs everywhere, including there. A directory junction is not a substitute for
+  the real link: `Path.is_symlink()` answers False for one, so neither pytest's
+  cleanup nor the shim would look at it.
 
 ### Why Windows is in CI
 
