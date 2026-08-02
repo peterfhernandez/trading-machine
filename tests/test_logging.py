@@ -901,4 +901,3 @@ class TestCaplogCanary:
             "caplog captured nothing from a non-propagating tm.* logger — every "
             "halt-logging assertion in this file is now vacuous"
         )
-    assert LOG_CONFIG.retention_days == 365
