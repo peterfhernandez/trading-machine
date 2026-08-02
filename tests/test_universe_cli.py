@@ -174,19 +174,25 @@ class TestBuildHistory:
         assert "universe" not in store_with_bars.list_datasets()
 
     def test_dates_before_any_data_are_empty_not_failures(self, store_with_bars):
-        """A store's first bar is 2024-01-01; 2023 has nothing to rank."""
+        """A store's first bar is 2024-01-01; the days before it have nothing to rank.
+
+        The range has to *reach* the ingestion date, or the preflight (rightly)
+        refuses the run before the loop starts — which is a different finding
+        from "this particular date is too early".
+        """
         written, failed = build_history(
-            start=datetime(2023, 1, 1),
-            end=datetime(2023, 1, 3),
+            start=datetime(2023, 12, 28),
+            end=datetime(2024, 1, 2),
             freq="daily",
             store=store_with_bars,
         )
 
-        assert (written, failed) == (0, 0)
+        # 2024-01-01 and 01-02 rank; the four December dates see nothing.
+        assert (written, failed) == (2, 0)
 
     def test_one_bad_date_does_not_abandon_the_rest(self, store_with_bars, monkeypatch):
         """259 snapshots must not be lost to one raising date."""
-        real_build = builder_module.UniverseBuilder.build_and_store
+        real_build = builder_module.UniverseBuilder.build
         calls = {"n": 0}
 
         def flaky(self, asof=None):
@@ -195,7 +201,7 @@ class TestBuildHistory:
                 raise RuntimeError("transient")
             return real_build(self, asof=asof)
 
-        monkeypatch.setattr(builder_module.UniverseBuilder, "build_and_store", flaky)
+        monkeypatch.setattr(builder_module.UniverseBuilder, "build", flaky)
 
         written, failed = build_history(
             start=datetime(2024, 4, 1),
@@ -216,15 +222,276 @@ class TestBuildHistory:
 
         assert store_with_bars.read("universe")["venue"].unique().to_list() == ["binance"]
 
-    def test_an_unknown_venue_produces_no_snapshots(self, store_with_bars):
-        written, failed = build_history(
+    def test_an_unknown_venue_is_a_preflight_failure(self, store_with_bars):
+        """A venue typo used to be indistinguishable from a successful no-op."""
+        with pytest.raises(builder_module.PreflightError, match="kraken"):
+            build_history(
+                start=datetime(2024, 4, 1),
+                end=datetime(2024, 4, 1),
+                store=store_with_bars,
+                venue="kraken",
+            )
+
+    def test_the_snapshots_are_appended_in_batches(self, store_with_bars, monkeypatch):
+        """One partition file per batch, not per snapshot.
+
+        A bulk build lands every snapshot in one ingestion partition, and
+        `ParquetStore.read` opens every file in a partition — so per-date
+        appends would leave a five-year daily build as ~1,800 files that every
+        later universe read reopens.
+        """
+        monkeypatch.setattr(builder_module, "_APPEND_CHUNK_SNAPSHOTS", 3)
+
+        written, _ = build_history(
             start=datetime(2024, 4, 1),
-            end=datetime(2024, 4, 1),
+            end=datetime(2024, 4, 7),
+            freq="daily",
             store=store_with_bars,
-            venue="kraken",
+        )
+
+        files = list((store_with_bars.root / "universe").glob("date=*/*.parquet"))
+        assert written == 7
+        assert len(files) == 3  # 3 + 3 + 1
+        assert len(store_with_bars.read("universe")["event_ts"].unique()) == 7
+
+
+@pytest.fixture
+def backfilled_store(tmp_path):
+    """What a bulk archive backfill actually leaves behind.
+
+    Bars dated across 2021, every one of them stamped with the `ingested_ts` of
+    the day the backfill ran — which is *after* every snapshot date anyone would
+    want to build over that history.
+    """
+    store = ParquetStore(tmp_path / "store")
+    start = datetime(2021, 1, 1)
+    ingested_ts = datetime(2026, 8, 2, 9, 30)
+    rows = []
+    for asset_id, volume in (("BTC", 50_000.0), ("ETH", 40_000.0)):
+        for offset in range(240):
+            rows.append(
+                (asset_id, "binance", "1d", start + timedelta(days=offset), ingested_ts,
+                 100.0, 100.0, 100.0, 100.0, volume)
+            )
+    frame = pl.DataFrame(
+        rows,
+        schema=[
+            "asset_id", "venue", "timeframe", "event_ts", "ingested_ts",
+            "open", "high", "low", "close", "volume",
+        ],
+        orient="row",
+    ).with_columns(
+        pl.col("event_ts").cast(pl.Datetime("us")),
+        pl.col("ingested_ts").cast(pl.Datetime("us")),
+    )
+    store.append("ohlcv_daily", frame, OHLCV_SCHEMA)
+    return store
+
+
+class TestPitMode:
+    """The reported defect: a strict build over backfilled history writes nothing.
+
+    `ParquetStore.read(asof=...)` filters `ingested_ts`, and a bulk backfill
+    stamps every row with the moment it ran. So a snapshot dated 2021-09-01
+    built from history downloaded in 2026 sees an empty store — for every date
+    in the range, for over an hour, exiting 0 with nothing written.
+    """
+
+    def test_strict_mode_sees_nothing_in_backfilled_history(self, backfilled_store):
+        builder = builder_module.UniverseBuilder(backfilled_store)
+
+        assert len(builder.build(asof=datetime(2021, 9, 1))) == 0
+
+    def test_event_mode_sees_it(self, backfilled_store):
+        builder = builder_module.UniverseBuilder(backfilled_store, pit_mode="event")
+
+        snapshot = builder.build(asof=datetime(2021, 9, 1))
+
+        assert len(snapshot) == 2
+        assert snapshot["in_universe"].to_list() == [True, True]
+
+    def test_event_mode_still_cannot_see_a_later_bar(self, backfilled_store):
+        """Weaker than strict, not absent: `event_ts <= asof` still holds."""
+        builder = builder_module.UniverseBuilder(backfilled_store, pit_mode="event")
+
+        snapshot = builder.build(asof=datetime(2021, 3, 1))
+
+        # 2021-01-01 .. 2021-03-01, not the full 240 bars in the store.
+        assert snapshot["listing_age_days"].max() == 59
+
+    def test_the_history_build_is_refused_in_strict_mode(self, backfilled_store):
+        with pytest.raises(builder_module.PreflightError, match="earliest ingested_ts"):
+            build_history(
+                start=datetime(2021, 9, 1),
+                end=datetime(2021, 12, 1),
+                freq="weekly",
+                store=backfilled_store,
+            )
+
+    def test_the_history_build_works_in_event_mode(self, backfilled_store):
+        written, failed = build_history(
+            start=datetime(2021, 6, 1),
+            end=datetime(2021, 6, 28),
+            freq="weekly",
+            store=backfilled_store,
+            pit_mode="event",
+        )
+
+        # 2021-06-01 is a Tuesday, so its ISO week is short: 06-01, 07, 14, 21, 28.
+        assert (written, failed) == (5, 0)
+        assert len(backfilled_store.read("universe")) == 10
+
+    def test_a_dry_run_reports_the_problem_instead_of_raising(self, backfilled_store, caplog):
+        written, failed = build_history(
+            start=datetime(2021, 9, 1),
+            end=datetime(2021, 12, 1),
+            store=backfilled_store,
+            dry_run=True,
         )
 
         assert (written, failed) == (0, 0)
+        assert any("--pit-mode event" in r.getMessage() for r in caplog.records)
+
+    def test_the_preflight_message_survives_a_narrow_console(self, backfilled_store):
+        """It reaches stderr, which is cp1252 on a default Windows install."""
+        with pytest.raises(builder_module.PreflightError) as excinfo:
+            build_history(
+                start=datetime(2021, 9, 1), end=datetime(2021, 9, 30), store=backfilled_store
+            )
+
+        str(excinfo.value).encode("cp1252")  # raises UnicodeEncodeError if not
+
+    def test_an_unknown_pit_mode_is_rejected(self, backfilled_store):
+        with pytest.raises(ValueError, match="psychic"):
+            builder_module.UniverseBuilder(backfilled_store, pit_mode="psychic")
+
+    def test_the_modes_match_the_backtesters(self):
+        """`universe` restates them rather than importing `backtest`."""
+        from backtest import engine
+
+        assert (builder_module.PIT_INGESTION, builder_module.PIT_EVENT) == (
+            engine.PIT_INGESTION,
+            engine.PIT_EVENT,
+        )
+        assert builder_module.PIT_MODES == engine.PIT_MODES
+
+
+@pytest.fixture
+def store_with_revisions(tmp_path):
+    """Honest ingestion history, including a revised bar and a late arrival.
+
+    The shape strict mode exists for, and the shape a panel that collapsed
+    duplicates before applying the asof filter would get wrong.
+    """
+    store = ParquetStore(tmp_path / "store")
+    rows = []
+    for asset_id, volume in (("BTC", 50_000.0), ("ETH", 40_000.0)):
+        for offset in range(120):
+            event_ts = datetime(2024, 1, 1) + timedelta(days=offset)
+            rows.append((asset_id, "binance", "1d", event_ts, event_ts, 100.0, volume))
+    # 2024-03-01's BTC bar revised on 03-05, and a bar that arrived four days late.
+    rows.append(("BTC", "binance", "1d", datetime(2024, 3, 1), datetime(2024, 3, 5), 100.0, 90_000.0))
+    rows.append(("ETH", "binance", "1d", datetime(2024, 4, 1), datetime(2024, 4, 5), 100.0, 40_000.0))
+    frame = pl.DataFrame(
+        rows,
+        schema=["asset_id", "venue", "timeframe", "event_ts", "ingested_ts", "close", "volume"],
+        orient="row",
+    ).with_columns(
+        pl.col("event_ts").cast(pl.Datetime("us")),
+        pl.col("ingested_ts").cast(pl.Datetime("us")),
+        pl.lit(100.0).alias("open"),
+        pl.lit(100.0).alias("high"),
+        pl.lit(100.0).alias("low"),
+    )
+    store.append("ohlcv_daily", frame, OHLCV_SCHEMA)
+    return store
+
+
+class TestThePanelMatchesTheStore:
+    """One store read, re-filtered per date — an optimization, not a second reader.
+
+    The panel is what makes a five-year daily build finish: the store cannot
+    prune by event date (it partitions by *ingestion* date), so reading per date
+    re-reads the whole dataset every time. Nothing but these tests forces the
+    fast path to agree with the slow one.
+    """
+
+    @pytest.mark.parametrize("pit_mode", ["ingestion", "event"])
+    @pytest.mark.parametrize("asof", [datetime(2024, 3, 1), datetime(2024, 3, 4), datetime(2024, 4, 3)])
+    def test_the_two_paths_build_identical_snapshots(self, store_with_revisions, pit_mode, asof):
+        panel = builder_module.OhlcvPanel(store_with_revisions, pit_mode=pit_mode)
+        via_store = builder_module.UniverseBuilder(store_with_revisions, pit_mode=pit_mode)
+        via_panel = builder_module.UniverseBuilder(
+            store_with_revisions, pit_mode=pit_mode, bars=panel
+        )
+
+        # `ingested_ts` is "now" on both, microseconds apart by construction.
+        slow = via_store.build(asof=asof).drop("ingested_ts")
+        fast = via_panel.build(asof=asof).drop("ingested_ts")
+
+        assert slow.to_dicts() == fast.to_dicts()
+
+    def test_a_revision_does_not_leak_backwards(self, store_with_revisions):
+        """The ordering hazard, on the panel: collapse *after* the asof filter.
+
+        BTC's 2024-03-01 bar is revised on 03-05. A panel that collapsed to the
+        latest ingestion up front would let the revision win the bar and then
+        filter it away, hiding a bar that was knowable on 03-01.
+        """
+        panel = builder_module.OhlcvPanel(store_with_revisions, pit_mode="ingestion")
+
+        bars = panel.asof(datetime(2024, 3, 1))
+        btc = bars.filter(
+            (pl.col("asset_id") == "BTC") & (pl.col("event_ts") == datetime(2024, 3, 1))
+        )
+
+        assert len(btc) == 1
+        assert btc["volume"][0] == 50_000.0  # the original, not the 90,000 revision
+
+    def test_the_revision_is_visible_once_it_has_been_ingested(self, store_with_revisions):
+        panel = builder_module.OhlcvPanel(store_with_revisions, pit_mode="ingestion")
+
+        bars = panel.asof(datetime(2024, 3, 5))
+        btc = bars.filter(
+            (pl.col("asset_id") == "BTC") & (pl.col("event_ts") == datetime(2024, 3, 1))
+        )
+
+        assert len(btc) == 1
+        assert btc["volume"][0] == 90_000.0
+
+    def test_it_reads_the_store_once_for_the_whole_history(self, store_with_bars, monkeypatch):
+        """The point of the change: 2 reads per date became 1 for the whole run."""
+        reads = {"n": 0}
+        real_read = ParquetStore.read
+
+        def counting_read(self, dataset, *args, **kwargs):
+            if dataset == "ohlcv_daily":
+                reads["n"] += 1
+            return real_read(self, dataset, *args, **kwargs)
+
+        monkeypatch.setattr(ParquetStore, "read", counting_read)
+
+        build_history(
+            start=datetime(2024, 4, 1),
+            end=datetime(2024, 4, 30),
+            freq="daily",
+            store=store_with_bars,
+        )
+
+        assert reads["n"] == 1
+
+    def test_a_panel_that_disagrees_with_its_builder_is_rejected(self, store_with_bars):
+        panel = builder_module.OhlcvPanel(store_with_bars, pit_mode="event")
+
+        with pytest.raises(ValueError, match="must agree"):
+            builder_module.UniverseBuilder(store_with_bars, pit_mode="ingestion", bars=panel)
+
+    def test_a_missing_dataset_gives_an_empty_panel(self, tmp_path):
+        panel = builder_module.OhlcvPanel(ParquetStore(tmp_path / "empty"))
+
+        assert panel.is_empty
+        assert panel.min_ingested_ts is None
+        assert len(panel.asof(datetime(2024, 3, 1))) == 0
 
 
 class TestMain:
@@ -256,11 +523,27 @@ class TestMain:
             raise RuntimeError("nope")
 
         monkeypatch.setattr(builder_module, "DATASTORE_PATH", store_with_bars.root, raising=False)
-        monkeypatch.setattr(
-            builder_module.UniverseBuilder, "build_and_store", always_raises
-        )
+        monkeypatch.setattr(builder_module.UniverseBuilder, "build", always_raises)
 
         assert main(["--start", "2024-04-01", "--end", "2024-04-08", "--freq", "weekly"]) == 1
+
+    def test_a_preflight_failure_exits_two(self, store_with_bars, monkeypatch, capsys):
+        """2, not 1: "cannot start" is a different answer from "some dates failed"."""
+        monkeypatch.setattr(builder_module, "DATASTORE_PATH", store_with_bars.root, raising=False)
+
+        code = main(["--start", "2021-09-01", "--end", "2021-09-30", "--freq", "weekly"])
+
+        assert code == 2
+        assert "--pit-mode event" in capsys.readouterr().err
+
+    def test_the_pit_mode_is_reported(self, capsys):
+        main(["--start", "2024-04-01", "--end", "2024-04-03", "--pit-mode", "event", "--dry-run"])
+
+        assert "pit_mode=event" in capsys.readouterr().out
+
+    def test_an_unknown_pit_mode_is_a_usage_error(self):
+        with pytest.raises(SystemExit):
+            main(["--start", "2024-04-01", "--pit-mode", "psychic"])
 
     def test_an_inverted_range_is_a_usage_error(self):
         with pytest.raises(SystemExit):

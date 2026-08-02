@@ -321,7 +321,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 750 tests, ~40s, no network
+pytest                     # 774 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -731,8 +731,9 @@ bulk backfill — is a date loop, and it has a CLI:
 # How many snapshots would this build? Writes nothing.
 python -m universe.builder --start 2021-09-01 --end 2026-08-01 --freq weekly --dry-run
 
-# Build them
-python -m universe.builder --venue binance --start 2021-09-01 --end 2026-08-01 --freq weekly
+# Build them over backfilled history (see --pit-mode below)
+python -m universe.builder --venue binance --pit-mode event \
+    --start 2021-09-01 --end 2026-08-01 --freq weekly
 ```
 
 `--freq` defaults to `UNIVERSE_CONFIG.rebalance_freq` and takes
@@ -742,11 +743,42 @@ must not import `backtest`, so nothing else would). Build at the frequency you
 intend to research at: weekly over five years is ~260 snapshots against ~1,800
 daily ones, and is enough for a weekly rebalance.
 
-Two properties worth knowing. A date that raises is logged and skipped rather
-than abandoning the run — losing 259 snapshots to one bad date is the wrong
-trade — and the command exits non-zero if any date failed, so a partial build
-does not report success. A date before the store's first bar writes nothing and
-is *not* counted as a failure.
+**`--pit-mode`, and why a backfill needs `event`.** The builder reads bars
+point-in-time like everything else, and the strict default filters
+`ingested_ts <= asof`. A bulk backfill stamps every row with the moment it ran,
+whatever the bar's own date — so a strict snapshot dated 2021-09-01 built from
+history downloaded today asks what was knowable in 2021 and correctly answers
+*nothing*. Every date logs `No OHLCV data available`, nothing is written, and
+the command exits 0. Same relaxation the backtester offers, same two modes,
+and it has to be the same mode in both: snapshots built in event mode are only
+visible to a backtest run in event mode.
+
+Rather than discovering that 1,796 times, a **preflight** refuses the run:
+
+```text
+preflight failed: nothing in ohlcv_daily was ingested on or before 2026-08-01
+(the earliest ingested_ts is 2026-08-02), so under pit_mode='ingestion' every
+date in this range sees an empty store ... Re-run with --pit-mode event.
+```
+
+It exits **2** — distinct from the **1** a partial build exits with, so a caller
+can tell "could not start" from "some dates failed". An unknown venue is caught
+the same way, rather than looking like a successful no-op.
+
+Three more properties worth knowing. A date that raises is logged and skipped
+rather than abandoning the run — losing 259 snapshots to one bad date is the
+wrong trade — and the command exits non-zero if any date failed, so a partial
+build does not report success. A date before the store's first bar writes
+nothing and is *not* counted as a failure. And the store is read **once** for
+the whole run, not once per date: it partitions by *ingestion* date, so a
+backfill leaves a single partition that no date range can prune and every
+per-date read opened in full. Snapshots are appended in batches of 50 for the
+same reason in reverse — a per-date append would leave a five-year daily build
+as ~1,800 parquet files that every later universe read reopens.
+
+```bash
+PAPER=true python scratch/scratch_universe_history.py   # all of the above, demonstrated
+```
 
 **The universe dataset is an input, not an output.** `DatastoreUniverse` reads
 these snapshots and the audit's coverage denominator is the latest one, so a
@@ -1052,13 +1084,22 @@ asset-master registration, 81 tests and a live scratch demo, which pulls three
 months of `BTCUSDT` end to end. What has *not* happened is step 5, the run
 itself: no multi-year history is in this repository, so §5 of every methodology
 doc is still empty and all six signals are still `draft`. The remaining work is
-the four numbered steps above, plus `python -m universe.builder --start ...`
-to build the universe snapshots over the new history (`DATA.md` §3 step 5 calls
-that command `universe.build`; it lives on `universe.builder`, the module that
-already held `build_and_store`, rather than in a second module named one letter
-away). The universe dataset is an *input*, not an output: with no snapshots
-every backtest runs on an empty universe and the audit reports coverage as not
-evaluated.
+the four numbered steps above, plus
+`python -m universe.builder --pit-mode event --start ...` to build the universe
+snapshots over the new history (`DATA.md` §3 step 5 calls that command
+`universe.build`; it lives on `universe.builder`, the module that already held
+`build_and_store`, rather than in a second module named one letter away). The
+universe dataset is an *input*, not an output: with no snapshots every backtest
+runs on an empty universe and the audit reports coverage as not evaluated.
+
+**`--pit-mode event` on that command is load-bearing**, and was the first thing
+a real archive backfill found: the builder's strict default filters
+`ingested_ts <= asof`, a backfill stamps every row with the day it ran, and so a
+strict rebuild of five years of snapshots writes nothing at all — one
+`No OHLCV data available` warning per date, for ~1,800 dates, exiting 0. Both
+modes now exist on the builder, the run is refused up front rather than
+discovered date by date, and the mode has to match the one the backtests
+consuming those snapshots run in.
 
 **Also outstanding:** the 10 MB rotation size and 12-month retention window in
 `LOGGING.md` were specified, not measured — no component's real log volume is

@@ -102,8 +102,21 @@ Legend: [ ] todo · [~] in progress · [x] done
       `universe.build` named one letter away in `DATA.md`. Same week and month
       definitions as the backtester's rebalance calendar, pinned by a test
       because `universe` must not import `backtest`
+- [x] **The universe builder's `pit_mode`**, found by running the archive
+      backfill and the universe date loop back to back for the first time: the
+      builder read bars through the store's strict `ingested_ts <= asof`, a bulk
+      load stamps every row with the day it ran, so a five-year rebuild logged
+      `No OHLCV data available` 1,796 times, wrote nothing, and would have
+      exited 0. Same two modes as the backtester, restated not imported; a
+      preflight refuses the futile run in seconds (exit 2) instead of an hour;
+      one store read for the whole history instead of two per date; snapshots
+      appended in batches of 50 so a daily build is not ~1,800 files in one
+      partition. `scratch/scratch_universe_history.py`
 - [ ] **Route A step 5 — run it**, then the acceptance checks in `DATA.md` §3
-      step 6. Every tool it needs now exists; what does not exist is the data
+      step 6. Every tool it needs now exists; what does not exist is the data.
+      Both commands need `--pit-mode event` on backfilled history, and it has to
+      be the *same* mode for the universe build and the backtests that consume
+      those snapshots — neither mismatch errors, both produce empty books
 
 ## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
 
@@ -1017,3 +1030,69 @@ different answers. Plus the CI that would have caught some of it.
   one shared `ingested_ts`, which is both what a bulk backfill produces and what
   keeps the store to a single partition, so each test reads one parquet file
   instead of 120. 750 passing overall; `ruff check .` clean.
+- 2026-08-02: **The universe builder could not see a backfill, and said so 1,796
+  times.** Running `DATA.md` §3 steps 2 and 3 back to back for the first time —
+  `loaders/archive.py`, then `python -m universe.builder --start 2021-09-01
+  --end 2026-08-01` — produced `No OHLCV data available to build universe as of
+  <date>` / `Empty universe; nothing appended` for every one of 1,796 dates, at
+  ~2.3 s each, writing nothing and exiting 0.
+  Neither module was defective; the design had a hole where they meet.
+  `ParquetStore.read(asof=...)` filters `ingested_ts`, which is the look-ahead
+  defence and is right. A bulk archive load stamps every row with the moment it
+  ran, which is the honest record of when the data was learned and is also
+  right. Together: a snapshot dated 2021-09-01 built from history downloaded in
+  2026 asks what was knowable in 2021 and correctly answers *nothing*. Phase 4
+  recorded exactly this for the **backtester** and gave it `pit_mode`; the
+  universe builder was written in Phase 3, never got the same escape hatch, and
+  nothing connected the two because until the archive loader existed there was
+  no way to reach the situation. It is upstream of the backtester's own
+  relaxation, too — `DatastoreUniverse` reads these snapshots, so an empty
+  `universe` dataset hands every backtest an empty book whatever its `pit_mode`
+  says.
+  `UniverseBuilder`, `build_history` and the CLI now take the same two modes,
+  restated rather than imported (`universe` must not import `backtest`), with a
+  test pinning all three copies of the constants — the engine's, the signal
+  panel's and the builder's — together. **The modes have to agree across
+  modules**, and neither mismatch errors: snapshots built strict + a backtest in
+  event mode finds no snapshots, and snapshots built in event mode + a strict
+  backtest cannot see them either, since they carry the rebuild's `ingested_ts`.
+  **A per-date warning cannot say the whole run is futile**, so `build_history`
+  preflights the earliest `ingested_ts` in the store against the last date in
+  the range and refuses the run before the loop starts, naming the fix. The CLI
+  exits **2** for that, distinct from the **1** a partial build exits with,
+  because "could not start" and "some dates failed" are different answers; an
+  unknown venue is caught the same way rather than looking like a successful
+  no-op. The message is ASCII on purpose — it reaches stderr, which takes the
+  locale encoding when redirected, and Phase 5.6 already lost a run to cp1252
+  meeting a `✓`.
+  **The hour itself was the read.** Each build read `ohlcv_daily` twice (dollar
+  volume, then listing age) and the store cannot prune either by event date — it
+  partitions by *ingestion* date, so a backfill leaves one partition every read
+  opens in full. `OhlcvPanel` reads it once for the whole history and re-filters
+  per `asof`; `build()` now reads once rather than twice, which helps the nightly
+  single-snapshot path where a panel would be pointless. The panel is the same
+  idea and the same hazard as `signals/panel.py`, with the same defence: the
+  filtering is per-`asof`, never once up front, and a test asserts the panel and
+  store paths build identical snapshots in both modes. Event mode does collapse
+  duplicate ingestions once at load — sound only because the filter there is a
+  predicate on `event_ts` and `latest_per_bar` groups by `(asset_id, event_ts)`,
+  so it keeps or drops whole groups and the two commute; that argument fails in
+  ingestion mode, where the collapse stays per-date. Fixing the read exposed the
+  mirror-image problem on the write: every snapshot in a rebuild shares one
+  `ingested_ts`, so per-date appends would leave a five-year daily build as
+  ~1,800 parquet files in a single partition that `ParquetStore.read` reopens in
+  full on every rebalance of every backtest. Appends are buffered 50 snapshots
+  at a time — the archive loader's per-symbol trade, in the other direction.
+  `build()` also sorts by `asset_id`: polars' `group_by` promises no output
+  order, so two builds of one date produced the same rows differently ordered,
+  which makes a stored snapshot non-reproducible and made the panel-vs-store
+  comparison a comparison of hash iteration order. 24 new tests
+  (`tests/test_universe_cli.py`), including a `backfilled_store` fixture that
+  reproduces the reported symptom, the cp1252-encodability of the preflight
+  message, a read counter proving the whole history costs one store read, and
+  the collapse-ordering hazard asserted directly against a revised bar. 774
+  passing; `ruff check .` clean; `scratch/scratch_universe_history.py` shows the
+  symptom, the preflight, event mode and the panel end to end.
+  **Not addressed:** the equivalent read in `audit/` and `backtest/engine.py`
+  (`DatastoreUniverse` re-reads the `universe` dataset per rebalance) has the
+  same partition-scan shape and has not been measured against a real store.

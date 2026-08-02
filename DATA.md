@@ -210,7 +210,8 @@ python -m loaders.archive --market um --start 2021-08-01 --end 2026-08-01 \
     --datasets ohlcv_daily,funding_rate --max-symbols 200 --log-level INFO
 
 # 3. build the point-in-time universe over that history
-python -m universe.build --venue binance --start 2021-09-01 --end 2026-08-01
+python -m universe.builder --venue binance --pit-mode event \
+    --start 2021-09-01 --end 2026-08-01 --freq weekly
 ```
 
 Step 3 matters and is easy to forget: **the universe dataset is an input, not an
@@ -220,8 +221,26 @@ runs on an empty universe and the audit reports coverage as *not evaluated*.
 Build snapshots at the rebalance frequency you intend to research at (weekly is
 enough for a weekly rebalance and is ~260 snapshots instead of ~1800).
 
-If `universe.build` has no CLI yet, add one — it is a thin wrapper over
-`UniverseBuilder.build_and_store` in a date loop.
+**`--pit-mode event` is not optional here, and leaving it off is the single
+easiest way to lose an hour.** The universe builder reads bars point-in-time
+like everything else, and `ParquetStore.read(asof=...)` filters `ingested_ts` —
+which step 2 has just stamped with *today* on every row, whatever the bar's own
+date. So a strict build of a snapshot dated 2021-09-01 asks what was known in
+2021 and correctly answers "nothing": every date logs `No OHLCV data available`,
+nothing is written, and the command exits 0. This is the same relaxation §4 step
+1 describes for the backtester, and it has to be made in both places — snapshots
+built in event mode feed backtests run in event mode. The command refuses the
+strict run up front rather than discovering it 1,796 times:
+
+```text
+preflight failed: nothing in ohlcv_daily was ingested on or before 2026-08-01
+(the earliest ingested_ts is 2026-08-02), so under pit_mode='ingestion' every
+date in this range sees an empty store ... Re-run with --pit-mode event.
+```
+
+The command lives on `universe.builder`, not the `universe.build` this document
+originally guessed at — one module named a letter away from an existing one is
+the `data-api.binance.vision` trap in package form.
 
 ### Step 6 — acceptance checks before any research runs
 
@@ -248,6 +267,10 @@ The bar to clear:
 - [ ] `python -m pipeline.nightly --days 1` on the trading machine still resumes
       cleanly on top of the archive rows (checkpoint written with the archive's
       covered interval)
+- [ ] the `universe` dataset holds one snapshot per rebalance date over the whole
+      window, with a plausible member count (`store.read("universe")`, grouped by
+      `event_ts`) — an empty or one-row `universe` is the step-3 failure above,
+      and it surfaces downstream as an empty backtest rather than as an error
 - [ ] `pytest` green, `ruff check .` clean
 
 ---
@@ -264,6 +287,12 @@ already exist.
    methodology docs require the numbers to be labelled *research indications, not
    live-fidelity results*. Live-fidelity numbers only start accruing from the
    day the nightly pipeline begins collecting day by day.
+
+   The mode has to be the **same one §3 step 3 built the universe snapshots
+   under**. A backtest in event mode over snapshots built in ingestion mode
+   reads an empty universe (there are none), and one in ingestion mode over
+   event-mode snapshots cannot see them either — their `ingested_ts` is the day
+   the rebuild ran. Neither combination errors; both produce empty books.
 
 2. **Walk-forward parameter grid, per signal.** Copy the pattern in
    `scratch/scratch_markov_param_grid.py` — it already selects on prior folds
