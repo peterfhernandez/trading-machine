@@ -205,10 +205,12 @@ different answers. Plus the CI that would have caught some of it.
       (PowerShell does not fail a step on a native command's exit code); the
       job reset to `origin/main` whatever branch the PR merged into; and two
       merges in quick succession ran two resets against one directory
-- [x] **pytest ≥ 8.4 pinned.** `caplog` only attaches to non-propagating
-      loggers from 8.4, and `tm` does not propagate — on an older pytest the
-      "a halt leaves a CRITICAL record" assertions fail, and the negative ones
-      pass having captured nothing. Canary test added
+- [x] **pytest floor pinned.** `caplog` only attaches to non-propagating
+      loggers from a certain version, and `tm` does not propagate — below it
+      the "a halt leaves a CRITICAL record" assertions fail, and the negative
+      ones pass having captured nothing. Canary test added.
+      **Corrected 2026-08-02:** the version is 9.1.0, not the 8.4 written here
+      at the time; see the progress-log entry for that date
 - [x] One source of truth for pytest config (`pytest.ini`; the duplicate block
       in `pyproject.toml` was dead and warned on every run), and ruff/mypy
       target the `requires-python` floor rather than a version CI does not pin
@@ -604,7 +606,9 @@ different answers. Plus the CI that would have caught some of it.
   deployed the previous commit, the job reset to `origin/main` regardless of
   which branch the PR merged into, and concurrent merges raced on one directory.
   pytest pinned to ≥ 8.4 (below it `caplog` cannot see the non-propagating `tm`
-  tree and the halt-logging assertions go vacuous), duplicate pytest config
+  tree and the halt-logging assertions go vacuous — the *reasoning* holds, but
+  8.4 was the wrong version and was corrected to 9.1.0 on 2026-08-02),
+  duplicate pytest config
   removed, ruff/mypy pointed at the `requires-python` floor. 578 tests passing;
   `scratch/scratch_observability.py` demonstrates the lot.
 - 2026-08-01: Venue access, recorded because it gates the Phase 5 backfill:
@@ -850,3 +854,50 @@ different answers. Plus the CI that would have caught some of it.
   tree there. That is the canary doing its job, and it means the floor in
   `pyproject.toml` (`>= 8.4`) does not describe the versions this actually works
   on. Pinning it properly needs the range established rather than guessed.
+  *(Resolved 2026-08-02 — the range was measured; see that day's entry.)*
+- 2026-08-02: **The pytest floor was wrong by six minor versions, and nothing
+  could have told us.** Measured the range the previous entry asked for, by
+  installing every pytest from 7.4.4 to 9.1.1 and running the suite against
+  each. The result contradicts the reason the pin was written down: `caplog`
+  does **not** attach to non-propagating loggers from 8.4 — no release before
+  **9.1.0** does it at all. The mechanism is
+  `_pytest/logging.py::catching_logs.__enter__`, which walks
+  `root_logger.manager.loggerDict` and adds the capture handler to every
+  already-existing logger with `propagate = False`; it arrived in 9.1.0.
+  `tests/test_logging.py` gives **11 failed / 61 passed** on 7.4.4, 8.0.2,
+  8.2.2, 8.3.5, 8.4.0, 8.4.2, 9.0.0 and 9.0.3 alike, and **72 passed** on
+  9.1.0 and 9.1.1. So `>= 8.4` admitted only versions that fail, which is why
+  it never went red: it was satisfied by everything and enforced nothing.
+  Three things the measurement turned up beyond the number. **Two tests were
+  passing while capturing nothing** — `test_no_critical_when_nothing_halts` and
+  `test_successful_run_logs_no_critical` sit in the passing 61 on 9.0.3, because
+  `assert not [criticals]` is satisfied just as well by an empty list. The
+  canary catches this only when the canary itself runs; the two tests could not
+  catch it at all. Both now assert a record *was* captured first — the pipeline
+  one on its own stage records, the audit one on a sentinel, since
+  `should_halt_trading()` logs on the halt path and nowhere else. A test that
+  can only pass by capturing something can never pass by capturing nothing, on
+  any pytest. **A second, unrelated dependency lands on the same version:**
+  `tests/test_tmpdir_cleanup.py::TestTheExitCode::test_without_the_shim_the_same_green_run_exits_one`
+  fails on 8.4.0, 9.0.0 and 9.0.3 (`assert 0 == 1` — the seeded run raises the
+  PermissionError but still exits 0) and passes from 9.1.0. So the floor has
+  two causes and fixing the logging side alone would not move it — worth
+  knowing before anyone tries. **And the pin was never exercised by CI:** every
+  job installs `-e ".[dev]"`, which resolves pytest to the newest release, so
+  the floor was a claim no check tested. A `tests (minimum pytest)` job now
+  installs exactly the declared floor and runs the suite at it, on the 3.11
+  `requires-python` floor — lowest interpreter against lowest pytest. It reads
+  the version out of `pyproject.toml` rather than repeating it, so the job
+  cannot drift from the pin it exists to check. That matters most for
+  `deploy.yml`, which installs nothing and runs the suite with the trading
+  machine's own venv: the floor is the only statement anywhere about which
+  pytest that venv may hold, and a claim that gates deployment should be tested
+  rather than asserted. Docs corrected in `README.md`, `LOGGING.md` (§3.6, §8
+  and a new review-log row), `pytest.ini`, `pyproject.toml` and
+  `TestCaplogCanary`'s docstring, all of which repeated the 8.4 figure.
+  Recorded but not acted on: even above the floor pytest attaches at
+  `__enter__` only, so a logger that becomes non-propagating afterwards is
+  missed — verified by setting `propagate = False` inside a test body, where
+  9.1.1 captures nothing. `tm` is configured at import time, so the suite is
+  safe; it is an ordering invariant nothing asserts. Full suite: 644 passed on
+  9.1.0 and on 9.1.1.

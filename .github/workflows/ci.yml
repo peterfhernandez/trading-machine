@@ -71,6 +71,57 @@ jobs:
         continue-on-error: true
         run: mypy datastore/ loaders/ audit/ universe/ backtest/ signals/
 
+  min-pytest:
+    # The declared pytest floor, actually exercised.
+    #
+    # Every other job installs `-e ".[dev]"`, which resolves pytest to the
+    # newest release — so the floor in `pyproject.toml` was never run by
+    # anything, and was wrong by six minor versions for months without a single
+    # red check. It claimed `>= 8.4`; the behaviour it names (caplog attaching
+    # to the non-propagating `tm` tree) arrived in 9.1.0, so every version the
+    # pin admitted fails 11 tests. That only surfaced when a second interpreter
+    # on the same machine happened to carry 9.0.3.
+    #
+    # `deploy.yml` installs nothing and runs the suite with the trading
+    # machine's own venv, so the floor is the only statement anywhere about
+    # which pytest that venv may hold. A claim that gates deployment should be
+    # tested, not asserted.
+    #
+    # The version is read out of `pyproject.toml` rather than written here, so
+    # this job cannot drift from the pin it exists to check.
+    name: tests (minimum pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The requires-python floor: lowest supported interpreter against the
+          # lowest supported pytest is the corner most likely to be broken.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install at the declared pytest floor
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          # One line rather than a heredoc: heredoc bodies must start at column
+          # zero, which terminates the YAML block scalar this step lives in.
+          floor=$(python -c "import re, tomllib; d = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; p = [x for x in d if re.match(r'^pytest\s*>=', x)]; assert len(p) == 1, f'expected exactly one pytest>= pin, found {p!r}'; print(p[0].split('>=', 1)[1].strip())")
+          echo "Declared pytest floor: $floor"
+          pip install "pytest==$floor"
+          python -m pytest --version
+
+      - name: Tests
+        env:
+          PAPER: "true"
+          TM_LOG_DIR: ${{ runner.temp }}/tm-logs
+        run: pytest
+
   test-windows:
     # The trading machine is a Windows box on 3.14, and until now nothing
     # tested that combination before a merge: `ci.yml` is Linux-only, so the

@@ -31,14 +31,32 @@ dependencies = [
     "numpy>=1.26.0",
     "ccxt>=4.0.0",
     "deribit-api>=0.0.1",
-    # 8.4 is a hard floor, not a preference: `configure_logging` sets
-    # propagate=False on the `tm` logger, and only pytest >= 8.4 attaches the
-    # caplog handler to non-propagating loggers. On an older pytest every
-    # caplog assertion in tests/test_logging.py either fails outright or — for
-    # the "assert no CRITICAL was logged" ones — passes while capturing
-    # nothing. tests/test_logging.py::TestCaplogCanary fails loudly if this
-    # ever stops holding.
-    "pytest>=8.4.0",
+    # 9.1.0 is a hard floor, not a preference, and it has TWO independent
+    # causes — fixing either one alone does not let it move:
+    #
+    # 1. `configure_logging` sets propagate=False on the `tm` logger, so its
+    #    records never reach the root logger where pytest installs the caplog
+    #    handler. `_pytest/logging.py::catching_logs.__enter__` walks
+    #    `loggerDict` and attaches the handler to already-existing
+    #    non-propagating loggers too — added in 9.1.0, and in no release
+    #    before it. Measured against tests/test_logging.py: 7.4.4 through
+    #    9.0.3 (8.4.x and 9.0.x included) give 11 failed / 61 passed; 9.1.0
+    #    and 9.1.1 give 72 passed.
+    # 2. tests/test_tmpdir_cleanup.py's negative control only reproduces the
+    #    crash it guards against on >= 9.1.0. Below that the seeded run exits
+    #    0 and the control fails — nothing to do with logging.
+    #
+    # This said ">= 8.4" until 2026-08-02, on the belief that 8.4 introduced
+    # (1). It did not: every version the old pin admitted fails. The floor was
+    # never load-bearing, which is why a repo venv on 9.1.1 was green while the
+    # system interpreter's 9.0.3 failed 11 tests on the same commit.
+    #
+    # Two tests fail *silently* below the floor rather than loudly — the
+    # "assert no CRITICAL was logged" ones pass while capturing nothing — so
+    # they carry positive controls, and TestCaplogCanary fails loudly if (1)
+    # ever stops holding. The `min-pytest` job in ci.yml installs exactly this
+    # version, so the floor is checked rather than asserted.
+    "pytest>=9.1.0",
     "requests>=2.31.0",
     "python-dateutil>=2.8.2",
     "pydantic>=2.0.0",

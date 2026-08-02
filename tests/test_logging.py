@@ -185,6 +185,34 @@ def failing_audit(store: ParquetStore) -> DataAudit:
     return audit
 
 
+def assert_capture_is_live(caplog, component: str) -> None:
+    """Positive control for an `assert no CRITICAL was logged` test.
+
+    Those assertions are satisfied just as well by capturing nothing at all,
+    which is exactly what happens below the pytest floor: `tm` does not
+    propagate, so on a pytest that does not attach the caplog handler to
+    non-propagating loggers the record list is empty and the test passes for
+    the wrong reason. Measured on pytest 9.0.3, the two tests using this helper
+    were the only two in this file that stayed green while the mechanism they
+    rest on was dead — the other eleven failed loudly.
+
+    So: push a sentinel through the real logger inside the capture block and
+    require it to come back. A test that can only pass by capturing something
+    can never pass by capturing nothing, on any pytest.
+
+    Used only where the code under test emits no record of its own on the happy
+    path (`should_halt_trading()` logs on the halt path and nowhere else). Where
+    there are real records to point at, assert on those instead.
+    """
+    sentinel = f"capture-is-live:{component}"
+    logging_config.get_logger(f"{component}.capture_probe").warning(sentinel)
+    assert any(sentinel in r.getMessage() for r in caplog.records), (
+        f"caplog captured nothing from the non-propagating tm.{component} tree, "
+        "so the 'no CRITICAL was logged' assertion below proves nothing — see "
+        "the pytest floor in pyproject.toml"
+    )
+
+
 class TestCriticalOnHalt:
     """A halt always leaves a CRITICAL record, independent of the alert."""
 
@@ -207,6 +235,7 @@ class TestCriticalOnHalt:
 
         with caplog.at_level(logging.DEBUG, logger="tm.audit"):
             assert audit.should_halt_trading() is False
+            assert_capture_is_live(caplog, "audit")
 
         assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]
 
@@ -303,6 +332,15 @@ class TestCriticalOnPipelineFailure:
         with caplog.at_level(logging.DEBUG, logger="tm.pipeline"):
             assert pipeline.run(days=1) is True
 
+        # Positive control, so "no CRITICAL" cannot be satisfied by an empty
+        # record list (see assert_capture_is_live). No sentinel needed here:
+        # a run logs its own stage entry/exit, so there are real records to
+        # require — and requiring them also pins that the run stayed logged.
+        assert caplog.records, (
+            "caplog captured nothing from the non-propagating tm.pipeline tree, "
+            "so the 'no CRITICAL was logged' assertion below proves nothing — "
+            "see the pytest floor in pyproject.toml"
+        )
         assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]
 
     def test_run_sets_a_run_id(self):
@@ -834,11 +872,24 @@ class TestRotation:
 class TestCaplogCanary:
     """`tm` does not propagate, so pytest must attach to it directly.
 
-    pytest gained that behaviour for non-propagating loggers in 8.x; on an
-    older pytest every `caplog` assertion in this file either fails or — worse,
-    for the `assert not [criticals]` ones — passes without capturing anything.
-    `pyproject.toml` pins the floor; this is the canary that fires if the
-    mechanism ever stops working.
+    pytest gained that behaviour in **9.1.0**, not 8.x as this docstring and
+    the pin in `pyproject.toml` both claimed until 2026-08-02:
+    `_pytest/logging.py::catching_logs.__enter__` walks `loggerDict` and adds
+    the capture handler to every already-existing non-propagating logger.
+    Measured across 7.4.4 → 9.1.1, this file gives 11 failed / 61 passed on
+    everything up to and including 9.0.3, and 72 passed from 9.1.0 — so the old
+    floor admitted only versions that fail.
+
+    Below the floor the eleven positive assertions fail loudly and two
+    `assert not [criticals]` ones pass without capturing anything; those two now
+    carry positive controls (`assert_capture_is_live`) so the silent mode is
+    closed on any pytest. This canary covers the rest.
+
+    One property worth knowing even above the floor: pytest attaches at
+    `__enter__`, so a logger that becomes non-propagating *later* is missed
+    (its own source comment says so). `tm` is configured at import time, hence
+    before collection ends, so the suite is safe — but it is an ordering
+    invariant nothing else asserts.
     """
 
     def test_caplog_actually_captures_tm_records(self, caplog):
@@ -850,4 +901,3 @@ class TestCaplogCanary:
             "caplog captured nothing from a non-propagating tm.* logger — every "
             "halt-logging assertion in this file is now vacuous"
         )
-    assert LOG_CONFIG.retention_days == 365

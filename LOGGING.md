@@ -179,12 +179,22 @@ logger. Two consequences worth writing down, both of which bit:
   the root logger, which no `tm.*` record ever reaches. Removed
   (2026-08-01) — console verbosity is `LOG_CONFIG.console_level`.
 - **`caplog` needs a pytest that attaches to non-propagating loggers.** pytest
-  installs its capture handler on the root logger; only from 8.4 does it also
-  attach to loggers with `propagate = False` that already exist. On anything
-  older, every `caplog` assertion in `tests/test_logging.py` either fails or —
-  for the "assert no CRITICAL was logged" ones — passes having captured
-  nothing. `pyproject.toml` and `pytest.ini` pin the floor, and
-  `TestCaplogCanary` fails loudly if the mechanism ever stops working. §8.
+  installs its capture handler on the root logger; only from **9.1.0** does it
+  also attach to loggers with `propagate = False` that already exist
+  (`_pytest/logging.py::catching_logs.__enter__`, which walks `loggerDict`).
+  On anything older, every `caplog` assertion in `tests/test_logging.py` either
+  fails or — for the "assert no CRITICAL was logged" ones — passes having
+  captured nothing. Measured across 7.4.4 → 9.1.1: 11 failed / 61 passed on
+  everything up to 9.0.3, 72 passed from 9.1.0. This was documented as 8.4
+  until 2026-08-02, which admitted only versions that fail.
+  `pyproject.toml` and `pytest.ini` pin the floor, the `tests (minimum pytest)`
+  CI job runs the suite at exactly that version, the two silent tests carry
+  positive controls, and `TestCaplogCanary` covers the rest. §8.
+
+  Above the floor it still attaches at `__enter__` only, so a logger that
+  becomes non-propagating *afterwards* is missed — pytest's own source says so.
+  `tm` is configured at import time, so the suite is safe; it is an ordering
+  invariant nothing asserts.
 
 `get_logger` also resolves `__name__ == "__main__"` back to the module's real
 dotted name via `__main__.__spec__.name` — see §6, where the reason is a bug
@@ -370,11 +380,16 @@ Three more earned their place after the audit above (2026-08-01):
 - **Rotate twice in one second and count what survives.** With the clock
   frozen, three rotations must leave three distinct backups and lose no
   record.
-- **A canary for `caplog` itself.** `tm` does not propagate to the root
-  logger, so capture depends on pytest ≥ 8.4 behaviour (§3.6). Without the
-  canary, an environment with an older pytest turns the halt-logging
-  assertions vacuous rather than red — the failure mode a test suite is least
-  able to report on itself.
+- **A canary for `caplog` itself, plus positive controls.** `tm` does not
+  propagate to the root logger, so capture depends on pytest ≥ 9.1.0 behaviour
+  (§3.6). Without the canary, an environment with an older pytest turns the
+  halt-logging assertions vacuous rather than red — the failure mode a test
+  suite is least able to report on itself. The canary is necessary but was not
+  sufficient: it only fires when it is *run*, and the two "assert no CRITICAL"
+  tests stayed green on their own below the floor. They now require a record to
+  have been captured before asserting none of them is CRITICAL
+  (`assert_capture_is_live`), so they cannot pass on an empty list whatever
+  pytest does.
 
 ## 9. Open items
 
@@ -394,4 +409,5 @@ Three more earned their place after the audit above (2026-08-01):
 | --- | --- | --- |
 | 2026-07-31 | peter | Created (design only; `logging_config.py` written and smoke-tested, nothing wired in). |
 | 2026-08-01 | peter | Audited the applied retrofit end to end, which found four defects in the mechanism itself rather than in its coverage: the pipeline's own records never reached `pipeline.log` under `python -m` (§6.1), DEBUG was unreachable without editing `config.py` (§3.5), a same-second rotation destroyed a backup and a 100k `backupCount` cost ~320 ms per rotation (§3.2), and file handlers were created for components that do not exist yet (§6.1). Also recorded: `logging.basicConfig` in the pipeline's `__main__` had never affected a single record, and `caplog` capture rests on a pytest ≥ 8.4 behaviour that is now pinned and canaried (§3.6, §8). |
+| 2026-08-02 | peter | Corrected the pytest floor the row above got wrong. The `caplog`-on-non-propagating-loggers behaviour arrived in **9.1.0**, not 8.4, so the pin admitted only versions on which 11 tests in `tests/test_logging.py` fail — measured across 7.4.4 → 9.1.1. A second, unrelated dependency lands on the same number: `tests/test_tmpdir_cleanup.py`'s negative control only reproduces from 9.1.0. Floor moved to 9.1.0 in `pyproject.toml` and `pytest.ini`; a `tests (minimum pytest)` CI job now runs the suite at the declared floor (read from `pyproject.toml`, so it cannot drift), because every other job resolves pytest to latest and therefore never exercised the pin. The two "assert no CRITICAL" tests gained positive controls — below the floor they were passing on an empty record list rather than failing. |
 | 2026-07-31 | peter | Phase 5.5 applied across Phases 1-5 source. Two deviations recorded in §6: the "no-overwrite guard" does not exist as a raising check, and `resolve_symbol` needed a `warn_if_unresolved` opt-out for the pipeline's membership probe. Added `expired_log_backups()` for `--dry-run`, and a test asserting the namer and the pruner agree on the backup filename format. §9's open item — 10 MB / 12 months were specified, not measured — still stands: no real backfill has run, so no component's real rotation frequency is known yet. |

@@ -350,11 +350,19 @@ Two workflows in `.github/workflows/`:
 
 Three things about the suite worth knowing:
 
-- **pytest ≥ 8.4 is a floor, not a preference.** The `tm` logger tree does not
-  propagate to the root logger, and only 8.4+ attaches `caplog` to
-  non-propagating loggers. On anything older the assertions that a halt leaves
-  a CRITICAL record stop working — the negative ones silently. A canary test
-  fails loudly if that ever changes.
+- **pytest ≥ 9.1.0 is a floor, not a preference — for two unrelated reasons.**
+  The `tm` logger tree does not propagate to the root logger, and 9.1.0 is the
+  first release that attaches `caplog` to non-propagating loggers
+  (`catching_logs.__enter__` walks `loggerDict`). Separately,
+  `tests/test_tmpdir_cleanup.py`'s negative control only reproduces the crash
+  it guards against from 9.1.0 on. Below the floor, eleven tests in
+  `tests/test_logging.py` fail and two pass *having captured nothing*; those
+  two carry positive controls so the silent mode is closed on any pytest, and
+  `TestCaplogCanary` covers the rest. This said `≥ 8.4` until 2026-08-02, on
+  the belief that 8.4 introduced the behaviour — it did not, so every version
+  the pin admitted was broken. The `tests (minimum pytest)` CI job now installs
+  the declared floor and runs the suite against it, reading the version out of
+  `pyproject.toml` so the job cannot drift from the pin.
 - **No test may touch the real datastore.** An autouse fixture
   (`tests/conftest.py::isolate_production_datastore`) redirects every module's
   `DATASTORE_PATH` default to a per-test directory. Without it a loader built
