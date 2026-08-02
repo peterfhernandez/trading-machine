@@ -114,6 +114,7 @@ _PRODUCTION_PATH_MODULES = (
     "config",
     "audit.auditor",
     "backtest.engine",
+    "loaders.archive",
     "loaders.backfill",
     "loaders.base",
     "loaders.funding_rate",

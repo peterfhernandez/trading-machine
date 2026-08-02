@@ -321,7 +321,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 644 tests, ~40s, no network
+pytest                     # 750 tests, ~40s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -589,6 +589,84 @@ that is already covered.
 PAPER=true python scratch/scratch_windowed_fetch.py   # demo
 ```
 
+### Archive loader (bulk history)
+
+The three loaders above are the *incremental* path and go through ccxt. History
+comes from somewhere else: `loaders/archive.py` reads Binance's public data
+archive (`data.binance.vision`), which answers 200 from the address where
+`api.binance.com` answers 451, needs no key, has no rate limit, publishes a
+SHA-256 beside every file, and covers 2020-01 → present. It is Route A of
+`DATA.md` and it imports no ccxt — being unable to reach the API is the reason
+it exists.
+
+```python
+from loaders import BinanceVisionLoader
+from loaders.window import FetchWindow
+from datetime import datetime
+
+loader = BinanceVisionLoader(market="um", symbols=["BTCUSDT", "ETHUSDT"])
+window = FetchWindow(datetime(2021, 8, 1), datetime(2026, 8, 1))
+loader.run_daily(window=window)      # -> ohlcv_daily
+loader.run_funding(window=window)    # -> funding_rate
+```
+
+```bash
+python -m loaders.archive --market um --start 2021-08-01 --end 2026-08-01 \
+    --datasets ohlcv_daily,funding_rate --max-symbols 200 --log-level INFO
+```
+
+Rows are indistinguishable from the ccxt loaders' downstream: same
+`venue="binance"`, same schemas, same `event_ts`/`ingested_ts` discipline. Six
+things are worth knowing before running it.
+
+- **Enumerate, do not probe.** Symbols and months come from the bucket's S3
+  listing, walked through its `IsTruncated`/`marker` continuation. Guessing
+  months and reading 404 as "not listed" wastes half the requests and cannot
+  tell "the asset did not exist yet" from "the archive has a hole" — and the
+  first month a symbol appears is the **listing date** the universe builder's
+  `min_listing_age_days` rule needs, which is what the asset master mapping's
+  validity start is set to.
+- **The asset master is populated without ccxt.** `NightlyPipeline` builds it
+  from `exchange.load_markets()`, the one call that is unreachable here, so
+  `register_symbols` maps the exact archive string (`BTCUSDT`, no slash) to a
+  canonical `asset_id`. **Multiplier contracts collapse to the underlying** —
+  `1000BONKUSDT → BONK`, `1MBABYDOGEUSDT → BABYDOGE` — because returns are
+  invariant to a constant multiplier and two `asset_id`s for one asset would be
+  a pair of perfectly correlated "independent" bets. `1INCHUSDT` stays `1INCH`.
+  Only `*USDT` is kept: `BTCUSDC` and dated futures (`BTCUSDT_240329`) are
+  separate listings that would double-count against one asset.
+- **Four format details are pinned by tests**, because each one produces a
+  plausible frame rather than an error when it is wrong: futures klines carry a
+  CSV header row and spot klines do not (the first line is sniffed); `volume` is
+  *base* volume, which is what `universe/builder.py` multiplies by close;
+  epoch timestamps are milliseconds except in some 2025+ files that switched to
+  microseconds, detected by magnitude per row; and funding files carry the rate
+  alone, so `mark_price`/`index_price` stay **null** — exactly what
+  `AUDIT_CONFIG.nullable_columns_by_dataset` already tolerates.
+- **Every file is checksum-verified** against its published `.CHECKSUM` (one
+  extra tiny GET). A corrupt or missing month is logged and skipped, not
+  ingested and not fatal — one bad file out of twelve thousand must not abandon
+  the run.
+- **Appends are chunked per symbol** (`chunk="month"` for one file per month).
+  Five years of one symbol is ~1,800 rows, so nothing large is held in memory,
+  and the store gets ~200 parquet files per dataset instead of ~12,000 — which
+  matters because a bulk backfill lands in a *single* partition and
+  `ParquetStore.read` opens every file in it.
+- **`ingested_ts` is today, not 2021.** The store partitions by ingestion, so
+  the whole backfill lands under `date=<the day you ran it>` — the honest record
+  of when the data was learned. Backtests over it therefore need
+  `pit_mode="event"`, and their numbers are research indications rather than
+  live-fidelity results (`DATA.md` §4).
+
+Symbol selection: pass `symbols=[...]`. With none given the loader enumerates
+the bucket and caps at `LOADER_CONFIG.max_symbols_per_run` **alphabetically** —
+the archive carries no liquidity to rank by, so at 938 symbols that quietly
+favours the front of the alphabet. It logs a warning saying so.
+
+```bash
+PAPER=true python scratch/scratch_archive_backfill.py   # one symbol, three months, live
+```
+
 ### Audit
 
 Data quality audit with 6 checks: coverage (% of universe), null rates per column,
@@ -645,6 +723,35 @@ members = snapshot.filter(snapshot["in_universe"])["asset_id"].to_list()
 # Turnover between two snapshots (for monitoring universe stability)
 turnover = compute_turnover(previous_snapshot, snapshot)
 ```
+
+That builds **one** snapshot. Building a history of them — what you do after a
+bulk backfill — is a date loop, and it has a CLI:
+
+```bash
+# How many snapshots would this build? Writes nothing.
+python -m universe.builder --start 2021-09-01 --end 2026-08-01 --freq weekly --dry-run
+
+# Build them
+python -m universe.builder --venue binance --start 2021-09-01 --end 2026-08-01 --freq weekly
+```
+
+`--freq` defaults to `UNIVERSE_CONFIG.rebalance_freq` and takes
+`daily`/`weekly`/`monthly`, using the same definition of a week and a month as
+the backtester's rebalance calendar (a test pins the two together — `universe`
+must not import `backtest`, so nothing else would). Build at the frequency you
+intend to research at: weekly over five years is ~260 snapshots against ~1,800
+daily ones, and is enough for a weekly rebalance.
+
+Two properties worth knowing. A date that raises is logged and skipped rather
+than abandoning the run — losing 259 snapshots to one bad date is the wrong
+trade — and the command exits non-zero if any date failed, so a partial build
+does not report success. A date before the store's first bar writes nothing and
+is *not* counted as a failure.
+
+**The universe dataset is an input, not an output.** `DatastoreUniverse` reads
+these snapshots and the audit's coverage denominator is the latest one, so a
+store with none hands every backtest an empty universe and reports coverage as
+*not evaluated* — which looks like a broken strategy rather than a missing step.
 
 ### Nightly Pipeline
 
@@ -938,6 +1045,20 @@ REST mirror named one hyphen apart, which really is spot-only.) So the backfill
 does not have to run on the trading machine; it needs a bulk loader instead of
 ccxt. Route, file formats, acceptance checks and the research steps that follow
 are in **`DATA.md`**.
+
+**That loader now exists** — `loaders/archive.py`, `DATA.md` Route A steps 1-4
+(see [Archive loader](#archive-loader-bulk-history) above): the module, its
+asset-master registration, 81 tests and a live scratch demo, which pulls three
+months of `BTCUSDT` end to end. What has *not* happened is step 5, the run
+itself: no multi-year history is in this repository, so §5 of every methodology
+doc is still empty and all six signals are still `draft`. The remaining work is
+the four numbered steps above, plus `python -m universe.builder --start ...`
+to build the universe snapshots over the new history (`DATA.md` §3 step 5 calls
+that command `universe.build`; it lives on `universe.builder`, the module that
+already held `build_and_store`, rather than in a second module named one letter
+away). The universe dataset is an *input*, not an output: with no snapshots
+every backtest runs on an empty universe and the audit reports coverage as not
+evaluated.
 
 **Also outstanding:** the 10 MB rotation size and 12-month retention window in
 `LOGGING.md` were specified, not measured — no component's real log volume is
