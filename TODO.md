@@ -243,6 +243,17 @@ different answers. Plus the CI that would have caught some of it.
       `tests/test_tmpdir_cleanup.py` runs pytest in a subprocess over a seeded
       stale link and asserts the exit code, with a negative control that fails
       if the harness ever stops reproducing the crash
+- [x] **…and then those tests themselves went red on the trading machine**, with
+      `OSError: [WinError 1314] A required privilege is not held by the client`:
+      seeding a `pytest-current` link needs `SeCreateSymbolicLinkPrivilege`,
+      which an ordinary Windows account does not hold. The seven tests that
+      create one now skip on a runtime probe (the answer differs per machine and
+      per shell, so `os.name` cannot decide it), and that costs no coverage —
+      pytest's `_force_symlink` cannot create the link there either, so the
+      failure being guarded against cannot arise. The shim's decision logic is
+      pinned separately against stubs and runs everywhere, `deploy.yml`'s
+      verification run included. A junction is not a substitute: `is_symlink()`
+      is False for one, so nothing would look at it
 - [x] **`python -m scratch.<demo>` died on its first import.** Phase 5.5 gave
       every demo `from log_demo import start_demo_run`, which resolves only
       when the demo's own directory leads `sys.path` — i.e. when it is run as a
@@ -804,3 +815,38 @@ different answers. Plus the CI that would have caught some of it.
   alert is now deterministic rather than editor-dependent, and it will also
   fire from `deploy.yml`'s verification run. The alert has no test seam — it
   goes straight to `requests.post` — so giving it one is its own change.
+- 2026-08-02: **Seven red tests on the trading machine, none of them about the
+  code.** `python -m pytest -q` failed every test in
+  `tests/test_tmpdir_cleanup.py` that seeds a `pytest-current` link, with
+  `OSError: [WinError 1314] A required privilege is not held by the client`.
+  Creating a symlink on Windows needs `SeCreateSymbolicLinkPrivilege`, which an
+  ordinary account holds only under Developer Mode or in an elevated shell — so
+  the *setup* of those tests was unavailable, and the shim they exist to pin was
+  never reached. The tests now skip on a **runtime probe** (try to create one in
+  a temp directory) rather than on `os.name`, because the answer differs between
+  two Windows machines and between an elevated and an ordinary shell on one; the
+  skip reason names the privilege, so it reads as a machine capability rather
+  than a mystery.
+  The skip costs no coverage, and that is the part worth recording: the defect
+  *starts* with pytest's own `_force_symlink` failing to re-point the link, so a
+  box that cannot create `pytest-current` cannot dangle one either — there is
+  nothing on this machine for `cleanup_dead_symlinks` to trip over. What the
+  machine can still verify is the shim's decision logic, which touches the
+  filesystem only through `iterdir`/`is_symlink`/`resolve`/`unlink`/`rmdir`, all
+  duck-typed: 8 new stub-based tests pin remove-the-dangling-one,
+  leave-the-live-one, fall-back-to-`rmdir`, skip-an-unreadable-entry, and never
+  raise — and they run everywhere, including inside `deploy.yml`'s verification
+  run, which is the whole reason the exit code matters.
+  A directory junction was the obvious substitute and is not one: measured on
+  3.14, `Path.is_symlink()` answers **False** for a junction and `unlink()`
+  removes it without complaint, so pytest's cleanup would never look at it and
+  the test would pass while exercising nothing. Negative control: deleting the
+  `rmdir` fallback from `_remove_dangling_link` fails 2 of the 8 new tests.
+  637 passed, 7 skipped, exit 0.
+  **Noticed on the way, not fixed here:** the suite's result depends on which
+  interpreter runs it. In the repo venv (pytest 9.1.1) `tests/test_logging.py`
+  is green; under the system 3.14 (pytest 9.0.3) 11 of its tests fail, led by
+  `TestCaplogCanary` — `caplog` captures nothing from the non-propagating `tm`
+  tree there. That is the canary doing its job, and it means the floor in
+  `pyproject.toml` (`>= 8.4`) does not describe the versions this actually works
+  on. Pinning it properly needs the range established rather than guessed.
