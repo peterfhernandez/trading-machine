@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a real backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied**
+**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending the acceptance gate's verdict on a real backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied · Phase 5.7 (universe over backfilled history) — applied · Phase 5.8 (backfill acceptance gate) — applied**
 
 ## Quick Start
 
@@ -113,7 +113,7 @@ PAPER=true python scratch/scratch_dotenv.py   # what was loaded, masked
 ```text
 datastore/     — Parquet store + asset master
 loaders/       — Data loaders (OHLCV, funding rates, etc.)
-audit/         — Data quality checks
+audit/         — Data quality checks + the backfill acceptance gate
 universe/      — Universe membership rules
 backtest/      — Walk-forward backtester
 signals/       — Alpha signals (momentum, carry, etc.)
@@ -321,7 +321,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 774 tests, ~40s, no network
+pytest                     # 817 tests, ~50s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -704,6 +704,68 @@ outside the universe cannot inflate coverage. Pass
 `DataAudit(store, universe_size=N)` to set the denominator explicitly when the
 expected asset count is known from elsewhere.
 
+### Backfill acceptance gate
+
+`DataAudit` runs every night over a bounded lookback window and can halt
+trading. The acceptance gate runs **once, after a bulk backfill**, over the
+whole history, and gates *research* — it is `DATA.md` §3 step 6 made
+executable:
+
+```bash
+python -m audit.acceptance --venue binance    # 0 accepted, 1 blocked, 2 could not start
+python -m audit.acceptance --json             # same, machine-readable
+```
+
+```python
+from audit import run_acceptance_checks
+
+report = run_acceptance_checks(store, venue="binance")
+report.passed              # False if any blocking check failed
+print(report.to_text())
+```
+
+Seven checks: OHLCV span and asset count, funding breadth plus its span against
+the klines, duplicate bars per dataset, per-asset gaps, universe snapshot
+cadence and member counts, and what the nightly would resume from. Thresholds
+are `DATA.md`'s numbers and are arguments — `--min-years`, `--min-assets`,
+`--min-funding-assets`, `--max-gap-days` — so a deliberately smaller pull says
+so on the command line instead of being told it failed.
+
+Four things worth knowing:
+
+- **Every check names an outcome the tool that produces it exits 0 on.** That
+  is the whole reason the gate exists. `loaders.archive` reports success having
+  skipped a corrupt month; `universe.builder` reports success having written one
+  snapshot; the store reports success having stored a bar twice, because storing
+  it twice is what append-only means. Each surfaces downstream as a *quiet*
+  result — a shorter signal history, a thinner cross-section, a book that never
+  changes — rather than as an error.
+- **It is deliberately not point-in-time**, the one place in this project where
+  that is right: it asks what is on disk *now*, which is a question about the
+  load rather than about a decision. Duplicates are still collapsed through
+  `latest_per_bar` before anything is counted — and the duplicate checks take
+  the *raw* frames, since the repeat is exactly what they mean. Measured after
+  the collapse, that check could only ever report zero.
+- **The gap check is the one nothing else performs.** `signals/bars.py` trims
+  each asset to its most recent gap-free stretch, so a hole in the middle of an
+  asset's history silently shortens every price signal's usable window — and a
+  signal that then rejects the asset for insufficient history looks exactly like
+  a signal working as designed. The range is per asset (an asset listed in 2023
+  is not missing 2021), and the threshold counts *missing days*, so three
+  consecutive absent bars passes and four fails.
+- **`nightly_resume` warns rather than blocks, on purpose.** `DATA.md` expected
+  the checkpoint to carry "the archive's covered interval"; it does not, because
+  checkpoints belong to `BackfillRunner` and `BinanceVisionLoader` does not use
+  it. With no coverage recorded `resume_window` returns the request unchanged,
+  so `python -m pipeline.nightly --days 1` fetches its day and appends beside
+  the archive's rows. What a missing checkpoint costs is a wide `--start`
+  re-run re-fetching history the store already holds — budget and duplicate
+  bars, not correctness.
+
+```bash
+PAPER=true python scratch/scratch_acceptance.py   # four stores, each broken one way
+```
+
 ### Universe
 
 Point-in-time daily universe membership from `ohlcv_daily`: rolling median dollar
@@ -1081,16 +1143,21 @@ are in **`DATA.md`**.
 **That loader now exists** — `loaders/archive.py`, `DATA.md` Route A steps 1-4
 (see [Archive loader](#archive-loader-bulk-history) above): the module, its
 asset-master registration, 81 tests and a live scratch demo, which pulls three
-months of `BTCUSDT` end to end. What has *not* happened is step 5, the run
-itself: no multi-year history is in this repository, so §5 of every methodology
-doc is still empty and all six signals are still `draft`. The remaining work is
-the four numbered steps above, plus
-`python -m universe.builder --pit-mode event --start ...` to build the universe
-snapshots over the new history (`DATA.md` §3 step 5 calls that command
-`universe.build`; it lives on `universe.builder`, the module that already held
-`build_and_store`, rather than in a second module named one letter away). The
-universe dataset is an *input*, not an output: with no snapshots every backtest
-runs on an empty universe and the audit reports coverage as not evaluated.
+months of `BTCUSDT` end to end. **Step 5 — the run itself — has happened on the
+trading machine** (`loaders.archive`, then
+`python -m universe.builder --pit-mode event`), and **step 6, the acceptance
+gate, now exists as a command**
+(`python -m audit.acceptance`; see [Backfill acceptance gate](#backfill-acceptance-gate)).
+
+Two things follow from that, and they are different in kind. **This repository
+still has no history in it** — `data/` is git-ignored and the store lives on the
+machine that ran the pull — so nothing here can report what the gate says; that
+verdict has to be produced where the data is. And §5 of every methodology doc is
+still empty with all six signals still `draft`, because the research steps in
+`DATA.md` §4 come *after* an accepted backfill, not alongside it. The universe
+dataset is an *input*, not an output: with no snapshots every backtest runs on an
+empty universe and the audit reports coverage as not evaluated, which is one of
+the seven things the gate checks.
 
 **`--pit-mode event` on that command is load-bearing**, and was the first thing
 a real archive backfill found: the builder's strict default filters
@@ -1118,6 +1185,7 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: collect backtest evidence for the six signals against a real
-backfill (see [What is not done](#what-is-not-done)), then Phase 6 — the factor
-risk model (see `TODO.md`)
+**Next Phase**: run `python -m audit.acceptance` against the machine that holds
+the backfill, fix whatever it blocks on, then collect backtest evidence for the
+six signals (see [What is not done](#what-is-not-done)) — and then Phase 6, the
+factor risk model (see `TODO.md`)

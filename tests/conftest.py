@@ -112,6 +112,7 @@ _PATCHED_SYMLINK_CLEANUP_MODULES = _install_tolerant_symlink_cleanup()
 # reach them — the name has to be replaced in each module's own namespace.
 _PRODUCTION_PATH_MODULES = (
     "config",
+    "audit.acceptance",
     "audit.auditor",
     "backtest.engine",
     "loaders.archive",

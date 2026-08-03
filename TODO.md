@@ -112,11 +112,39 @@ Legend: [ ] todo · [~] in progress · [x] done
       one store read for the whole history instead of two per date; snapshots
       appended in batches of 50 so a daily build is not ~1,800 files in one
       partition. `scratch/scratch_universe_history.py`
-- [ ] **Route A step 5 — run it**, then the acceptance checks in `DATA.md` §3
-      step 6. Every tool it needs now exists; what does not exist is the data.
-      Both commands need `--pit-mode event` on backfilled history, and it has to
-      be the *same* mode for the universe build and the backtests that consume
-      those snapshots — neither mismatch errors, both produce empty books
+- [x] **Route A step 5 — run it.** `python -m loaders.archive` and
+      `python -m universe.builder --pit-mode event` both run on the trading
+      machine (2026-08-03). Both need `--pit-mode event` on backfilled history,
+      and it has to be the *same* mode for the universe build and the backtests
+      that consume those snapshots — neither mismatch errors, both produce
+      empty books
+- [x] **Route A step 6 — the acceptance gate.** `audit/acceptance.py`
+      (`python -m audit.acceptance`): every bullet of `DATA.md` §3 step 6 as an
+      executable check, because each one names an outcome the command that
+      produces it exits 0 on. Seven checks — OHLCV span/breadth, funding
+      breadth and span against it, duplicate bars per dataset, per-asset gaps
+      inside each asset's own listed range, universe snapshot cadence and
+      member counts, and what the nightly would resume from. Exit 0/1/2 for
+      accepted / blocked / could-not-start, matching `universe.builder`.
+      43 tests in `tests/test_acceptance.py`;
+      `scratch/scratch_acceptance.py` demonstrates each failure it catches.
+      **The gap check is the one nothing else performs**: `signals/bars.py`
+      trims to the most recent gap-free stretch, so a hole in the middle of an
+      asset's history silently shortens every price signal's usable window and
+      then looks like a signal correctly rejecting a thin asset
+- [ ] **Run the gate against the real store** — `python -m audit.acceptance
+      --venue binance` on the machine that holds the backfill. The tool is
+      hermetic and tested; what it has not seen is the actual archive pull, and
+      no environment here has one (`data/` is git-ignored)
+- [ ] **`DATA.md` §3 step 6 expects a checkpoint the archive loader never
+      writes.** Checkpoints belong to `BackfillRunner`, which `BinanceVisionLoader`
+      does not use, so there is no "archive's covered interval" for
+      `python -m pipeline.nightly` to resume from. It is not a correctness
+      problem — with no coverage recorded `resume_window` returns the request
+      unchanged, so `--days 1` fetches its day and appends beside the archive's
+      rows — but a wide `--start` re-run would re-fetch years the store already
+      holds. The gate reports it as a warning rather than a block. Deciding
+      whether the archive loader should record coverage is its own change
 
 ## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
 
@@ -308,10 +336,10 @@ different answers. Plus the CI that would have caught some of it.
       that a Python-version matrix cannot reach. A separate job, not an `os`
       dimension: a dimension renames the three existing checks, and those names
       are what branch protection requires on `main`
-- [ ] Add **`tests (windows, python 3.14)`** to the required status checks on
+- [x] Add **`tests (windows, python 3.14)`** to the required status checks on
       `main`. Same category as the item above it — a GitHub setting, not
-      something a file in the repo can do — and until it is taken the Windows
-      job reports without blocking a merge
+      something a file in the repo can do. Taken 2026-08-03; the Windows job
+      now blocks a merge like the three Linux ones
 - [x] **`python -m scratch.scratch_observability` died on Windows** with a
       `FileNotFoundError` on the log file it had just asked a child pipeline to
       write. The child had exited 1 without writing anything: the demo built
@@ -1096,3 +1124,70 @@ different answers. Plus the CI that would have caught some of it.
   **Not addressed:** the equivalent read in `audit/` and `backtest/engine.py`
   (`DatastoreUniverse` re-reads the `universe` dataset per rebalance) has the
   same partition-scan shape and has not been measured against a real store.
+- 2026-08-03: **Route A step 6 — the acceptance gate.** With the archive
+  backfill and the universe rebuild both run on the trading machine, the thing
+  standing between the store and the research was a seven-line checklist in
+  `DATA.md` §3 step 6 that nobody could execute. `audit/acceptance.py` makes it
+  a command (`python -m audit.acceptance`), and the reason it deserves to be
+  one is the property every bullet shares: each names an outcome the tool that
+  produces it **exits 0 on**. `loaders/archive.py` reports success having
+  skipped a corrupt month; `universe.builder` reports success having written one
+  snapshot; the store reports success having stored the same bar twice, because
+  storing it twice is what append-only means. None of those raise, and every one
+  of them surfaces downstream as a *quiet* result — a shorter signal history, a
+  thinner cross-section, a book that never changes — which is the worst shape a
+  data defect can have in a system whose output is a number that looks
+  plausible either way.
+  Seven checks, one per bullet: OHLCV span and breadth, funding breadth plus its
+  span against the klines, duplicate bars per dataset, per-asset gaps, universe
+  snapshot cadence and member counts, and what the nightly would resume from.
+  Four decisions worth recording. (1) **It is not point-in-time, and that is the
+  one place in this project where that is right.** Every other reader filters
+  `ingested_ts <= asof` or `event_ts <= asof` because it is answering "what was
+  knowable then?"; this asks "what is on disk now?", which is a question about
+  the load rather than about a decision. Duplicates are still collapsed through
+  `latest_per_bar` before anything is counted, and the duplicate checks take the
+  raw frames, since the repeat is precisely what they mean — a test pins that
+  ordering, because measuring duplicates after the collapse can only ever report
+  zero. (2) **The gap check is the one nothing else in the project performs, and
+  the one most worth having.** `signals/bars.py` trims each asset to its most
+  recent gap-free stretch, so a hole in the middle of an asset's history
+  silently shortens every price signal's usable window — and a signal that then
+  rejects the asset for insufficient history looks exactly like a signal working
+  as designed. "Inside its own listed range" is what makes it answerable: an
+  asset listed in 2023 is not missing 2021, so the range is per asset. The
+  threshold is *missing days*, not spacing, and a test pins both sides of the
+  boundary because "a gap > 3 days" reads either way. (3) **The universe
+  cadence is inferred, not re-derived.** Comparing against `snapshot_dates`
+  would mean either importing `universe` from `audit` (a sideways import) or
+  making the caller remember which `--freq` the rebuild used; taking the modal
+  spacing of the snapshots that are there needs neither, and a missing date
+  shows up as a spacing wider than the mode, which is the thing actually worth
+  detecting. (4) **Exit codes match `universe.builder`** — 0 accepted, 1
+  blocked, 2 could-not-start — so a wrong `--datastore` path cannot be read as
+  a backfill that produced nothing, which from inside the checks looks
+  identical.
+  **A finding, not a fix:** `DATA.md` §3 step 6 asks for a checkpoint "written
+  with the archive's covered interval", and the archive loader writes none —
+  checkpoints belong to `BackfillRunner`, which `BinanceVisionLoader` does not
+  use. The consequence is narrower than it sounds and the check says so rather
+  than blocking: with no coverage recorded `resume_window` returns the request
+  unchanged, so `python -m pipeline.nightly --days 1` fetches its day and the
+  rows land beside the archive's under the same `venue` and `asset_id`. What it
+  costs is a wide `--start` re-run, which would re-fetch history the store
+  already holds — API budget and duplicate bars, not correctness. Whether the
+  archive loader should record coverage is its own change.
+  43 tests (`tests/test_acceptance.py`), and they are mostly about the failing
+  side: a store with a hole in one asset, a universe with one snapshot in it, a
+  double-counted boundary month. A check that cannot go red on the thing it
+  names is not a check. One test is marked `slow` and is the only one that runs
+  against the *default* thresholds — 150 assets over 4 years is ~250k bars
+  however it is built, and no fixture trick makes that smaller without also
+  making the claim smaller; every other test lowers the bar explicitly and runs
+  in milliseconds. 817 passing; `ruff check .` clean; mypy clean on the new
+  module. `scratch/scratch_acceptance.py` builds four stores, each broken one
+  specific way, and shows what the gate says about each.
+  **Not done:** running it against the real store. The tool is hermetic and no
+  environment here holds a backfill (`data/` is git-ignored), so the numbers in
+  `DATA.md` §3 step 6 — 4 years, 150 assets, 100 with funding — have been
+  encoded, not confirmed.
