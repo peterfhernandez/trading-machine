@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending the acceptance gate's verdict on a real backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied · Phase 5.7 (universe over backfilled history) — applied · Phase 5.8 (backfill acceptance gate) — applied**
+**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending the acceptance gate's verdict on a real backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied · Phase 5.7 (universe over backfilled history) — applied · Phase 5.8 (backfill acceptance gate) — applied, and run against the real backfill on 2026-08-03: BLOCKED, 3 of 7 checks passed (see [What is not done](#what-is-not-done))**
 
 ## Quick Start
 
@@ -321,7 +321,7 @@ the per-module map and the places the retrofit deviated from it — is in
 ## Testing and CI
 
 ```bash
-pytest                     # 817 tests, ~50s, no network
+pytest                     # 843 tests, ~50s, no network
 ruff check .               # clean; CI fails on any finding
 ```
 
@@ -766,6 +766,46 @@ Four things worth knowing:
 PAPER=true python scratch/scratch_acceptance.py   # four stores, each broken one way
 ```
 
+#### When it blocks: `scratch/scratch_backfill_forensics.py`
+
+The gate names what is wrong and deliberately stops there. Two of its checks say
+so in their own message: the duplicate check cannot tell "a deliberate re-run of
+a window already loaded" from "a month loop double-counting a boundary", and the
+gap check cannot tell a venue delisting from a month the loader skipped. One
+member of each pair is harmless and the other is a defect, so the gate's counts
+alone do not say whether to act.
+
+Both distinctions are answerable from the store, and the forensics script asks:
+
+```bash
+PAPER=true python scratch/scratch_backfill_forensics.py
+PAPER=true python scratch/scratch_backfill_forensics.py --list-archive   # network
+```
+
+- **Duplicates: one run or two?** `ingested_ts` is stamped per file parsed, so
+  one `python -m loaders.archive` invocation leaves a tight cluster of ingestion
+  timestamps and two invocations are minutes or hours apart. Copies in
+  *different* clusters mean the window was loaded twice — expected under
+  append-only storage, collapsed by `latest_per_bar` on every read. Copies in the
+  *same* cluster mean one run emitted the bar twice, which is the loader bug.
+- **Duplicates: do the copies agree?** Two rows for one `(asset_id, event_ts)`
+  carrying different closes are not a re-run of anything. The likely cause is two
+  archive symbols collapsing onto one `asset_id` — `asset_id_for` strips
+  `1000`/`1M` multipliers, so a re-denominated or renamed contract can collide
+  with its own predecessor — and that one *is* a correctness problem, because
+  `latest_per_bar` picks the latest ingestion, which between two price scales is
+  an arbitrary choice. The ratio between the two copies is the tell: a clean
+  factor of ten or a thousand is a collision, a fraction of a percent is a
+  revision.
+- **Gaps: did the archive publish those months?** `--list-archive` asks the
+  bucket, for the offending symbols only. A hole over months that were never
+  published is a delisting, and the only decision is whether to keep the asset. A
+  hole inside months that *are* published is a file the loader skipped — it logs
+  and continues on a corrupt or missing file, by design — and re-running that
+  window fixes it.
+- **Universe: which rule emptied a snapshot?** Every snapshot row carries its own
+  `exclusion_reason`, so an empty snapshot says why it is empty.
+
 ### Universe
 
 Point-in-time daily universe membership from `ohlcv_daily`: rolling median dollar
@@ -1149,15 +1189,41 @@ trading machine** (`loaders.archive`, then
 gate, now exists as a command**
 (`python -m audit.acceptance`; see [Backfill acceptance gate](#backfill-acceptance-gate)).
 
-Two things follow from that, and they are different in kind. **This repository
-still has no history in it** — `data/` is git-ignored and the store lives on the
-machine that ran the pull — so nothing here can report what the gate says; that
-verdict has to be produced where the data is. And §5 of every methodology doc is
-still empty with all six signals still `draft`, because the research steps in
-`DATA.md` §4 come *after* an accepted backfill, not alongside it. The universe
-dataset is an *input*, not an output: with no snapshots every backtest runs on an
-empty universe and the audit reports coverage as not evaluated, which is one of
-the seven things the gate checks.
+**The gate has now been run against the real store, and it blocks: 3 of 7.**
+On 2026-08-03, against 144,122 bars over 228 assets and 2021-08-01..2026-07-31,
+`python -m audit.acceptance --venue binance` passed the two coverage checks and
+`nightly_resume`, and failed four:
+
+| Check | What it said | What that is |
+| --- | --- | --- |
+| `ohlcv_daily_duplicates` | 122,650 of 266,772 rows (45.98%) | 85% of bars stored twice — the shape of the window having been loaded twice, not of a boundary double-count |
+| `funding_rate_duplicates` | 969 of 585,835 rows (0.17%) | localised; consistent with one run stopping early in `funding_rate` |
+| `bar_gaps` | AUDIO 733d, BNX 21d, 2 of 228 assets | one contiguous hole each — the shape of a delisting, not of skipped files |
+| `universe_snapshots` | 6 snapshots with no members, first 2021-08-01 | **confirmed**: `min_listing_age_days = 30` warm-up |
+
+The universe one is reproduced exactly and needs no store to explain. The
+snapshot history was built from 2021-08-01, the same date as the first bar, so
+for the first 30 days every asset's listing age is below the rule and every asset
+is excluded — six weekly snapshots (08-01, 08-02, 08-09, 08-16, 08-23, 08-30)
+with the whole cross-section marked `listing_age`, and the first populated one on
+09-06. `DATA.md` §3 step 5 says `--start 2021-09-01` for exactly this reason.
+`tests/test_backfill_forensics.py` and the fixture behind it reproduce the count.
+
+The other three are shapes rather than verdicts, because the counts alone cannot
+distinguish the harmless cause from the defect — see
+[When it blocks](#when-it-blocks-scratchscratch_backfill_forensicspy) for the
+script that settles each from the store's own `ingested_ts`.
+
+One consequence of append-only storage is worth stating: **the six empty
+snapshots cannot be un-written.** Rebuilding from a later `--start` adds correct
+snapshots beside them and leaves the old ones in place, so this check stays red
+until either the `universe` dataset is rebuilt from scratch or the check learns
+that leading empties are warm-up rather than the step-3 failure it is looking
+for. That is a decision about the gate, not about the data.
+
+And §5 of every methodology doc is still empty with all six signals still
+`draft`, because the research steps in `DATA.md` §4 come *after* an accepted
+backfill, not alongside it.
 
 **`--pit-mode event` on that command is load-bearing**, and was the first thing
 a real archive backfill found: the builder's strict default filters
@@ -1185,7 +1251,10 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next Phase**: run `python -m audit.acceptance` against the machine that holds
-the backfill, fix whatever it blocks on, then collect backtest evidence for the
-six signals (see [What is not done](#what-is-not-done)) — and then Phase 6, the
-factor risk model (see `TODO.md`)
+**Next Phase**: the gate has been run and blocks on four checks. Settle the three
+that are shapes rather than verdicts with
+`PAPER=true python scratch/scratch_backfill_forensics.py --list-archive` on the
+machine that holds the backfill, act on what it finds, rebuild the universe
+snapshots from a start date past the listing-age warm-up, then collect backtest
+evidence for the six signals (see [What is not done](#what-is-not-done)) — and
+then Phase 6, the factor risk model (see `TODO.md`)

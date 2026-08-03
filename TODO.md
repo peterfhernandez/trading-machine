@@ -132,10 +132,42 @@ Legend: [ ] todo · [~] in progress · [x] done
       trims to the most recent gap-free stretch, so a hole in the middle of an
       asset's history silently shortens every price signal's usable window and
       then looks like a signal correctly rejecting a thin asset
-- [ ] **Run the gate against the real store** — `python -m audit.acceptance
-      --venue binance` on the machine that holds the backfill. The tool is
-      hermetic and tested; what it has not seen is the actual archive pull, and
-      no environment here has one (`data/` is git-ignored)
+- [x] **Run the gate against the real store** — done 2026-08-03 on the trading
+      machine. **BLOCKED: 3 of 7 passed.** `ohlcv_daily_coverage` (144,122 bars,
+      228 assets, 2021-08-01..2026-07-31, 5.00y), `funding_rate_coverage`
+      (584,866 settlements, 225 assets) and `nightly_resume` passed; duplicates
+      on both datasets, `bar_gaps` (AUDIO, BNX) and `universe_snapshots` (6 with
+      no members) failed. See the progress-log entry for that date
+- [ ] **Settle the three failures the gate cannot diagnose** —
+      `PAPER=true python scratch/scratch_backfill_forensics.py --list-archive`
+      on the machine that holds the store. The gate's own message says it cannot
+      tell a re-run from a month-boundary double-count, and its gap check cannot
+      tell a delisting from a month the loader skipped; the store's `ingested_ts`
+      and the bucket's listing answer both. Then act on the answer: a cross-run
+      duplicate whose copies agree is nothing to fix, one inside a single run is
+      a loader bug, and copies that *disagree* on `close` mean two archive
+      symbols share one `asset_id` — which `latest_per_bar` resolves by
+      ingestion time, i.e. arbitrarily between two price scales
+- [ ] **Rebuild the universe snapshots past the listing-age warm-up.** Confirmed
+      cause of the `universe_snapshots` failure: the history was built from
+      2021-08-01, the same date as the first bar, so for 30 days every asset
+      fails `min_listing_age_days` and six weekly snapshots (08-01, 08-02, 08-09,
+      08-16, 08-23, 08-30) have the whole cross-section marked `listing_age`.
+      `DATA.md` §3 step 5 says `--start 2021-09-01` for exactly this reason.
+      **The store is append-only, so a rebuild cannot un-write the six** — they
+      stay, and the check stays red, unless the `universe` dataset is rebuilt
+      from scratch or the check learns that empties *before the first populated
+      snapshot* are warm-up rather than the step-3 failure it is looking for.
+      That second option is the better one and is a change to the gate
+- [ ] **The universe is thinner than the target and nothing flags it.** Member
+      counts came back min/median/max 0/64/139 against `target_size = 150`. The
+      gate's `min_median_universe_members` floor is 20, so 64 passes — but a
+      64-name cross-section is a materially smaller breadth machine than the one
+      the config describes. Root cause is upstream: the archive backfill selects
+      symbols **alphabetically** (`loaders/archive.py` warns about it), so the
+      200-odd symbols pulled are not the 200 most liquid. Decide whether to
+      re-pull against a liquidity-ranked `--symbols` list before the research
+      steps run on this store
 - [ ] **`DATA.md` §3 step 6 expects a checkpoint the archive loader never
       writes.** Checkpoints belong to `BackfillRunner`, which `BinanceVisionLoader`
       does not use, so there is no "archive's covered interval" for
@@ -1191,3 +1223,74 @@ different answers. Plus the CI that would have caught some of it.
   environment here holds a backfill (`data/` is git-ignored), so the numbers in
   `DATA.md` §3 step 6 — 4 years, 150 assets, 100 with funding — have been
   encoded, not confirmed.
+- 2026-08-03: **The gate ran against the real backfill and blocked: 3 of 7.**
+  First contact with a real store, and the useful part is what the four failures
+  turned out to be — one confirmed, three that the gate is honest about not
+  being able to diagnose. The passing three say the pull itself worked: 144,122
+  bars over 228 assets spanning 2021-08-01..2026-07-31 (5.00y), 584,866 funding
+  settlements over 225 assets, and a nightly that would resume cleanly.
+  **`universe_snapshots` is fully explained and needed no store to explain it.**
+  Six snapshots with no members, first 2021-08-01, and the cause is arithmetic:
+  the history was built from 2021-08-01, which is also the date of the first bar,
+  so for the first 30 days every asset's listing age is below
+  `UNIVERSE_CONFIG.min_listing_age_days` and every asset is excluded. The six
+  are the weekly dates inside that window — 08-01, 08-02, 08-09, 08-16, 08-23,
+  08-30 — each carrying the whole cross-section marked `listing_age`, with the
+  first populated snapshot on 09-06. Reproduced exactly against a synthetic
+  backfilled store: 6 empty of 58. `DATA.md` §3 step 5 recommends
+  `--start 2021-09-01`, and that 31-day offset is not decoration.
+  Two things follow that are worth more than the fix. **Append-only means the
+  six cannot be un-written** — rebuilding from a later start adds correct
+  snapshots beside them, so the check stays red until either the dataset is
+  rebuilt from scratch or the check distinguishes *leading* empties (a warm-up,
+  and unavoidable on any store whose universe history starts where its bars do)
+  from empties after the universe has become non-empty (the step-3 failure it
+  was written for). The second is the better change and belongs to the gate.
+  And the member counts, 0/64/139 against a `target_size` of 150, pass the
+  gate's median floor of 20 while describing a materially thinner breadth
+  machine than the config claims: the archive loader picks symbols
+  **alphabetically**, so the 200-odd pulled are not the 200 most liquid. It
+  warns about that at the point of selection; nothing downstream checks it.
+  **The other three are shapes, not verdicts, and the gate says so itself.** Its
+  duplicate check cannot tell "a deliberate re-run of a window already loaded"
+  from "a month loop double-counting a boundary", and its gap check cannot tell
+  a delisting from a month the loader skipped — in each pair one is harmless and
+  the other is a defect, so the counts alone do not say whether to act. What the
+  numbers do say: 122,650 of 266,772 `ohlcv_daily` rows repeat, which is ~85% of
+  bars stored exactly twice against ~15% stored once, the shape of the same
+  window loaded twice over a symbol set that grew between the runs rather than
+  of a boundary artefact (that would touch two bars per symbol-month, not five
+  years of them); `funding_rate`'s 969 of 585,835 is localised, consistent with
+  one run stopping early in that dataset; and `bar_gaps` reports one contiguous
+  hole per offending asset (AUDIO 733 days, BNX 21 of 26 missing), which is the
+  shape of a contract not trading rather than of files failing to download.
+  Both distinctions are answerable from the store, which is what
+  `scratch/scratch_backfill_forensics.py` is for. `ingested_ts` is stamped per
+  file parsed, so one `loaders.archive` invocation leaves a tight cluster of
+  ingestion timestamps and two invocations sit hours apart: copies in different
+  clusters are a re-run (expected, collapsed by `latest_per_bar` on read),
+  copies in one cluster are the loader bug. Orthogonal to both, and the finding
+  that would matter most: copies that **disagree on `close`** are not a re-run
+  of anything — the likely cause is two archive symbols collapsing onto one
+  `asset_id`, since `asset_id_for` strips `1000`/`1M` multipliers and a
+  re-denominated or renamed contract can collide with its own predecessor — and
+  that is a correctness problem, because `latest_per_bar` picks the latest
+  ingestion, which between two price scales is an arbitrary choice. The ratio
+  between the copies is the tell: a clean factor of ten or a thousand is a
+  collision, a fraction of a percent is a revision. For the gaps,
+  `--list-archive` asks the bucket which months exist for the offending symbols
+  only — months never published mean a delisting and nothing to refetch, a hole
+  inside published months means a file the loader skipped and logged.
+  26 tests (`tests/test_backfill_forensics.py`), weighted at the classification
+  rather than the printing: the same duplicated bars, the same values and the
+  same counts are fabricated twice and differ only in how far apart their
+  ingestion timestamps are, and the verdict has to flip. That is the negative
+  control for the whole tool — on the counts the gate reports, the three causes
+  are indistinguishable. Also both sides of the gap boundary, a late listing not
+  read as a gap, and a bar stored twice not read as a zero-day spacing.
+  843 passing; `ruff check .` clean.
+  **Not done here:** nothing has been changed in the loader, the gate or the
+  store. The three open failures need the forensics run where the data is, and
+  the two decisions that follow — whether the gate should tolerate a warm-up,
+  and whether the pull should be re-selected by liquidity — are decisions, not
+  fixes.
