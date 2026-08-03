@@ -1220,3 +1220,116 @@ the panel-versus-store equivalence test a comparison of hash iteration order.
   count
 - `scratch/scratch_universe_history.py` demonstrates the symptom, the preflight,
   event mode and the panel end to end
+
+---
+
+## Phase 5.8 Implementation Notes (the backfill acceptance gate)
+
+### Why this exists
+
+`DATA.md` §3 step 6 was a seven-line checklist ending in two `store.dataset_info`
+calls and the instruction to eyeball the result. Every earlier step in that
+document had become a command; this one had not, and it is the step that decides
+whether the four research steps after it are measuring a signal or measuring a
+broken load.
+
+The property that makes it worth a module rather than a paragraph is one the
+bullets share: **each names an outcome the tool that produces it exits 0 on.**
+`loaders/archive.py` logs and skips a corrupt month, by design — one bad file in
+twelve thousand must not abandon a twenty-minute run. `universe/builder.py`
+writes what it can and reports success. `ParquetStore.append` stores a bar that
+is already there, because that is what append-only means and it is the whole
+point of the `latest_per_bar` read-side collapse. None of these raise, and each
+one surfaces downstream not as an error but as a *plausible number*: a slightly
+shorter backtest, a slightly thinner cross-section, an IR computed over a book
+that never changed. That is the worst shape a data defect can take in a system
+whose output is a number.
+
+### The one place point-in-time discipline correctly does not apply
+
+Every other reader in this project filters `ingested_ts <= asof` or
+`event_ts <= asof`, because every other reader is reconstructing a decision and
+must not see what the decision could not. `audit/acceptance.py` is not
+reconstructing a decision — it is inspecting a load — and "what is on disk now"
+is the only question that answers "did the backfill work?". So it reads raw.
+
+The discipline that *does* survive is the duplicate collapse, and its ordering
+is the subtle half. `run_acceptance_checks` collapses with `latest_per_bar`
+before anything is counted (a bar stored twice is one bar for a span, an asset
+count, a gap), and hands the **raw** frames to the duplicate checks, because the
+repeat is precisely what those mean. A test pins that, and it earns its place:
+measured after the collapse, `count_duplicate_bars` can only ever return zero,
+so the check would pass on every store forever and nothing would look wrong.
+
+### The gap check, which nothing else performs
+
+`signals/bars.py` trims each asset to its most recent *gap-free* stretch. That
+is correct — a hole makes a "5-day return" something other than a five-day
+return — but it means a single missing week in the middle of an asset's history
+silently truncates that asset's usable window for every price signal, and a
+signal that then rejects the asset for insufficient history is indistinguishable
+from a signal working exactly as designed. Nothing logs it, nothing raises, and
+the backtest simply has fewer assets than the store implies.
+
+Two definitions make the check answerable rather than noisy. **Per asset, inside
+its own listed range**: an asset listed in 2023 is not missing 2021, so the
+range is first-bar-to-last-bar for that asset. And the threshold counts *missing
+days*, not the spacing between bars — consecutive days is a gap of zero — so
+`max_gap_days=3` permits a three-day hole and fails a four-day one. Both sides of
+that boundary are pinned by a test, because "a gap > 3 days" reads either way and
+the two readings differ by one bar.
+
+### Inferring the universe cadence instead of re-deriving it
+
+"One snapshot per rebalance date" needs to know what the rebalance dates were.
+Two routes were available and both are worse than the third: import
+`universe.snapshot_dates` (a sideways import — `audit` must not depend on
+`universe`), or take a `--freq` argument (which requires the operator to
+remember which frequency the rebuild used, months later, correctly).
+
+Taking the **modal spacing of the snapshots that are actually there** needs
+neither, and detects the thing worth detecting: a missing date shows up as a
+spacing wider than the mode. It also reports the cadence back, so a store built
+weekly when the operator believed it was daily says so in the passing message
+rather than only in the failing one.
+
+### Exit codes, and a finding that is not a fix
+
+0 accepted, 1 blocked, 2 could-not-start — the same three-way split
+`universe.builder` uses, for the same reason: a wrong `--datastore` path and a
+backfill that produced nothing look identical from inside the checks, and
+conflating them would turn a typo into a diagnosis of the data.
+
+One bullet in `DATA.md` could not be satisfied as written. It asks that the
+nightly resume "on top of the archive rows (checkpoint written with the
+archive's covered interval)", and no such checkpoint is written: checkpoints
+belong to `BackfillRunner`, and `BinanceVisionLoader` does not use it. The
+consequence is narrower than the phrasing suggests, which is why the check warns
+rather than blocks — with no coverage recorded `resume_window` returns the
+request unchanged, so `--days 1` fetches its day and appends beside the archive's
+rows under the same `venue` and `asset_id`. What is actually lost is the ability
+to resume a *wide* window: a `--start 2021-08-01` re-run would re-fetch years the
+store already holds, costing API budget and duplicate bars. Whether the archive
+loader should record coverage is a real decision about which component owns the
+checkpoint, and it belongs in its own change rather than as a side effect of
+writing the checks.
+
+### Testing Coverage (Phase 5.8)
+
+- `tests/test_acceptance.py`: 43 tests, and deliberately weighted toward the
+  failing side — a store with a hole in one asset's range, a universe with one
+  snapshot in it, a double-counted boundary month, funding that stops years
+  early. A check that cannot go red on the thing it names is not a check.
+  Also: that duplicates are measured before the collapse, that a late listing is
+  not read as a gap, that a duplicated bar is not read as a zero-day spacing,
+  both sides of the missing-days boundary, and that the report encodes to cp1252
+  (a redirected stdout on Windows, which the nightly pipeline lost a run to
+  once already)
+- One test is marked `slow` and is the only one that exercises the **default**
+  thresholds: 150 assets over four years is ~250k bars however it is built, and
+  no fixture trick shrinks that without also shrinking the claim. Every other
+  test lowers the bar explicitly, through `AcceptanceThresholds` or the CLI's
+  flags, and runs in milliseconds
+- `scratch/scratch_acceptance.py` builds four stores, each broken exactly one
+  way, and prints what the gate says about each — then runs against the real
+  store if there is one

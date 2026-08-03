@@ -244,34 +244,64 @@ the `data-api.binance.vision` trap in package form.
 
 ### Step 6 — acceptance checks before any research runs
 
-```python
-from datastore import ParquetStore, latest_per_bar, count_duplicate_bars
-from config import DATASTORE_PATH
-store = ParquetStore(DATASTORE_PATH)
-
-store.dataset_info("ohlcv_daily")     # expect ~200 assets x ~1800 bars
-store.dataset_info("funding_rate")    # expect ~3 settlements/day/asset
+```bash
+python -m audit.acceptance --venue binance          # 0 accepted, 1 blocked, 2 could not start
+python -m audit.acceptance --json                   # same, machine-readable
+pytest && ruff check .
 ```
 
-The bar to clear:
+`audit/acceptance.py` is this checklist made executable, one check per bullet.
+It earns being a command rather than a paragraph because of the property every
+bullet shares: **each names an outcome the tool that produces it exits 0 on.**
+`loaders.archive` reports success having skipped a corrupt month;
+`universe.builder` reports success having written one snapshot; the store
+reports success having stored the same bar twice, because storing it twice is
+what append-only means. None of them raise, and each surfaces downstream as a
+*quiet* result — a shorter signal history, a thinner cross-section, a book that
+never changes — rather than as an error.
+
+The bar to clear (thresholds are the defaults; `--min-years`, `--min-assets`,
+`--min-funding-assets` and `--max-gap-days` move them for a deliberately
+smaller pull):
 
 - [ ] `ohlcv_daily` spans ≥ 4 years and holds ≥ 150 distinct `asset_id`s
 - [ ] `funding_rate` spans the same window for ≥ 100 of them (fewer is expected
       and fine — not every spot listing has a perp, which is exactly `carry`'s
       documented breadth limitation)
 - [ ] `count_duplicate_bars(df)` is 0 on a first archive run (the archive has no
-      overlap; a non-zero count means the month loop double-counted a boundary)
+      overlap; a non-zero count means the month loop double-counted a boundary).
+      Measured on the **raw** frame, before the `latest_per_bar` collapse every
+      other check runs behind — after it, this can only ever report zero
 - [ ] no asset has a gap > 3 days inside its own listed range —
       `signals/bars.py` trims to the gap-free tail, so an unnoticed hole
-      silently shortens every signal's history
+      silently shortens every signal's history. Nothing else in the project
+      performs this check, and a signal that then rejects the asset for
+      insufficient history looks exactly like a signal working as designed.
+      "Inside its own listed range" is what makes it answerable: an asset listed
+      in 2023 is not missing 2021. The threshold is *missing days*, so three
+      consecutive absent bars passes and four fails
 - [ ] `python -m pipeline.nightly --days 1` on the trading machine still resumes
-      cleanly on top of the archive rows (checkpoint written with the archive's
-      covered interval)
+      cleanly on top of the archive rows. **This document expected a checkpoint
+      "written with the archive's covered interval" and there is none** —
+      checkpoints belong to `BackfillRunner`, which `BinanceVisionLoader` does
+      not use. The consequence is narrower than it sounds, which is why the
+      check *warns* rather than blocks: with no coverage recorded
+      `resume_window` returns the request unchanged, so `--days 1` fetches its
+      day and appends beside the archive's rows under the same `venue` and
+      `asset_id`. What it costs is a wide `--start` re-run, which would re-fetch
+      years the store already holds — API budget and duplicate bars, not
+      correctness
 - [ ] the `universe` dataset holds one snapshot per rebalance date over the whole
-      window, with a plausible member count (`store.read("universe")`, grouped by
-      `event_ts`) — an empty or one-row `universe` is the step-3 failure above,
-      and it surfaces downstream as an empty backtest rather than as an error
+      window, with a plausible member count — an empty or one-row `universe` is
+      the step-3 failure above, and it surfaces downstream as an empty backtest
+      rather than as an error. The cadence is *inferred* from the modal spacing
+      of the snapshots present, so nothing has to remember which `--freq` the
+      rebuild used, and a missing date shows up as a spacing wider than the mode
 - [ ] `pytest` green, `ruff check .` clean
+
+```bash
+PAPER=true python scratch/scratch_acceptance.py   # four stores, each broken one way
+```
 
 ---
 
