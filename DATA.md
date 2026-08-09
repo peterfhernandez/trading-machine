@@ -164,15 +164,27 @@ the validity start.
 
 Two decisions to make explicitly and write into the code comment:
 
-- **Multiplier contracts.** `1000BONKUSDT`, `1000SHIBUSDT`, `1MBABYDOGEUSDT` are
-  the same underlying at a scaled contract size. Returns are invariant to a
-  constant multiplier, so **strip the leading `1000`/`1M` and map to the
-  underlying base** (`BONK`, `SHIB`) — otherwise `carry` and the price signals
-  score what looks like two different assets that are perfectly correlated,
-  which quietly halves the breadth report's honesty.
+- **Multiplier contracts.** ~~`1000BONKUSDT`, `1000SHIBUSDT`, `1MBABYDOGEUSDT`
+  are the same underlying at a scaled contract size. Returns are invariant to a
+  constant multiplier, so strip the leading `1000`/`1M` and map to the underlying
+  base.~~ **This was wrong, and it is the defect §9 documents.** Keep the
+  venue's own base: `1000SHIBUSDT → 1000SHIB`, `1MBABYDOGEUSDT → 1MBABYDOGE`.
+  The stripping rule assumes a multiplier prefix always denotes the *same*
+  asset at a different contract size. It does not: Binance also uses the prefix
+  to disambiguate **two different tokens that share a ticker**, and it lists
+  both at once — `1000CATUSDT` (2024-10..2026-07) beside `CATUSDT` (2026-07),
+  `1000000BOBUSDT` (2025-06..2026-07) beside `BOBUSDT` (2025-11..2026-07).
+  Stripping merges two unrelated price series into one `asset_id`, and
+  `latest_per_bar` then picks between them by ingestion time — arbitrarily.
+  Not stripping cannot merge anything, because the venue never gives two live
+  contracts one name.
 - **Quote filter.** Keep `*USDT` only. `BTCUSDC`, `BTCBUSD` and dated futures
   (`BTCUSDT_240329`) are separate listings of the same asset and would duplicate
   rows against one `asset_id`.
+- **Collision guard.** Whatever the identity rule, assert it: two venue symbols
+  resolving to one `asset_id` must refuse to ingest and name both symbols. That
+  guard is also the detector for the two cases that *do* need price adjustment
+  (a genuine redenomination, a reused equity ticker) — see §10.
 
 ### Step 3 — tests (`tests/test_archive_loader.py`)
 
@@ -213,6 +225,14 @@ python -m loaders.archive --market um --start 2021-08-01 --end 2026-08-01 \
 python -m universe.builder --venue binance --pit-mode event \
     --start 2021-09-01 --end 2026-08-01 --freq weekly
 ```
+
+**Run one invocation at a time, and let it finish.** The first real run did not
+(§9): two `loaders.archive` processes overlapped, which duplicated ~95,000 bars
+and left the second pass truncated part-way through the alphabet. Nothing
+prevents this today — `ParquetStore.append` numbers its output file from the
+count already in the partition, so two *processes* race for one filename the
+same way two threads would. Until the guard in §9 lands, the protection is
+operational: start it, watch `logs/loaders.log`, do not start another.
 
 Step 3 matters and is easy to forget: **the universe dataset is an input, not an
 output.** `DatastoreUniverse` reads `universe` snapshots, and the audit's
@@ -271,7 +291,20 @@ smaller pull):
 - [ ] `count_duplicate_bars(df)` is 0 on a first archive run (the archive has no
       overlap; a non-zero count means the month loop double-counted a boundary).
       Measured on the **raw** frame, before the `latest_per_bar` collapse every
-      other check runs behind — after it, this can only ever report zero
+      other check runs behind — after it, this can only ever report zero.
+      A raw count alone cannot say *which* cause it is, so the check classifies
+      by ingestion cluster and by whether the copies agree on value: copies
+      spanning runs that agree are a re-run (a warning — append-only storage
+      working as designed), copies inside one run or copies that **disagree**
+      are defects and block
+- [ ] no two venue symbols resolve to one `asset_id`, and no `(asset_id,
+      event_ts)` carries two materially different prices. A disagreement larger
+      than a vendor revision means either a ticker collision (§9) or two
+      instruments — spot and perp — written into one series
+- [ ] every `ohlcv_daily` row for a venue comes from **one market type**. The
+      archive pulls `futures/um` while the ccxt `OHLCVLoader` historically read
+      spot, and the two land under the same `venue` and `asset_id` with no
+      column recording which is which (§9)
 - [ ] no asset has a gap > 3 days inside its own listed range —
       `signals/bars.py` trims to the gap-free tail, so an unnoticed hole
       silently shortens every signal's history. Nothing else in the project
@@ -422,11 +455,17 @@ them arrives.
 
 ## 8. Open decisions for the operator
 
-1. **Spot or futures klines for `ohlcv_daily`?** Futures (`futures/um`) matches
-   the venue the funding rate comes from and is what a perp strategy would
-   actually trade; spot has longer history for older assets. **Recommendation:
-   futures/um**, and record the choice in the methodology docs' §2 data-inputs
-   section, because it changes what the backtest is a backtest *of*.
+1. **Spot or futures klines for `ohlcv_daily`?** **Decided 2026-08-09: futures
+   (`futures/um`), everywhere.** It matches the venue the funding rate comes
+   from and is what a perp strategy would actually trade. The part this
+   originally left implicit is what caused half of §9: the decision binds the
+   **ccxt `OHLCVLoader` too**, which had been reading the venue's default spot
+   markets since Phase 2. Two market types under one `venue` and one `asset_id`
+   is not a preference, it is two different instruments in one price series.
+   `OHLCVLoader` moves onto `LOADER_CONFIG.perp_market_type`, joining the
+   funding-rate and open-interest loaders, and the choice is recorded in the
+   methodology docs' §2 data-inputs section because it changes what the backtest
+   is a backtest *of*.
 2. **Backfill start date.** 2021-08-01 gives 5 years and avoids the thin,
    unrepresentative 2020 perp listings. Going back to 2020-01 adds a regime
    (the COVID crash, the 2020 bull run) at the cost of a much smaller universe.
@@ -434,3 +473,184 @@ them arrives.
    anywhere — but the nightly job and the deploy gate live on the trading
    machine, and `data/` is git-ignored. Either run the backfill *there*, or plan
    how the parquet store gets copied across.
+
+---
+
+## 9. What the first real backfill found (2026-08-03 → 08-09)
+
+The pull ran, the universe was rebuilt, and `python -m audit.acceptance` blocked
+at **3 of 7**. `scratch/scratch_backfill_forensics.py` and a listing of the
+bucket settled every one of the four failures. Three distinct defects were
+underneath them, and the counts the gate printed do not separate them — which is
+the point of writing this down rather than only fixing it.
+
+### 9.1 Two canonicalisations of `asset_id`, in one codebase
+
+`loaders/archive.py` stripped multiplier prefixes (`1000SHIBUSDT → SHIB`);
+`pipeline/nightly.py::_populate_asset_master` used ccxt's `market["base"]`,
+which keeps them (`1000SHIB/USDT:USDT → 1000SHIB`). `register_symbols` has a
+guard against re-registering, but it matches the **literal symbol string**, and
+`1000SHIBUSDT` is not `1000SHIB/USDT:USDT` — so it never fired. The store ended
+up holding `1000000BOB`, `1000CAT`, `1000SHIB` *and* `BOB`, `CAT`, `SHIB` as
+separate `asset_id`s.
+
+The stripping rule rested on a premise that is false: that a multiplier prefix
+always denotes the same asset at a different contract size. Measured against the
+bucket on 2026-08-09 — 986 published `futures/um` kline symbols, 832 supported
+after the USDT/dated filter, 830 distinct `asset_id`s under the strip rule, and
+**exactly two collisions**:
+
+| `asset_id` | Symbols merged into it | Published months | Overlap |
+| --- | --- | --- | --- |
+| `BOB` | `1000000BOBUSDT` / `BOBUSDT` | 2025-06..2026-07 / 2025-11..2026-07 | **9 months** |
+| `CAT` | `1000CATUSDT` / `CATUSDT` | 2024-10..2026-07 / 2026-07 | **1 month** |
+
+Both pairs traded **simultaneously**, which is what settles it. A redenomination
+*replaces* one contract with another; it does not run both side by side for nine
+months. These are two different tokens sharing a ticker, disambiguated by
+Binance with a contract-size prefix, and the strip destroys the distinction.
+
+Three independent confirmations, worth recording because each rules out a
+different innocent explanation:
+
+- **The ratios are not powers of ten.** `CAT` shows `0.001336` against `950.37`
+  (7.1e5×) and `BOB` shows 2.86×. A scale difference would be exactly 1,000× or
+  1,000,000×.
+- **Funding disagrees, and funding is dimensionless.** The same underlying at two
+  contract sizes has *identical* funding. `BOB`'s two series differ by 42–56×,
+  one pinned at Binance's 5e-05 base rate and the other floating. `funding_rate`
+  has no spot equivalent and no vendor revisions, so a disagreement there can
+  only be two contracts.
+- **The counts match the overlaps.** `BOB`'s 9-month kline overlap is ~273 days;
+  the forensics reported **253** disagreeing `BOB` bars. Every `CAT` sample falls
+  in 2026-07, its only overlapping month.
+
+**Fix:** one shared canonicalisation, no stripping, used by every loader; plus a
+collision guard that refuses to ingest two symbols under one `asset_id`. Note
+what this costs and does not cost — under the new rule `1000SHIB` is simply the
+name of the thing Binance lists, and the "two perfectly correlated asset_ids"
+worry the strip was written to prevent requires both contracts to be listed at
+once, which for a genuine multiplier pair does not happen.
+
+### 9.2 Spot and perpetual prices spliced into one series
+
+~112 assets showed ~61 disagreeing `ohlcv_daily` bars each and **zero**
+disagreeing funding bars. 61 days is exactly 2026-06-01..2026-07-31, the window
+where the ccxt runs overlap the archive run. The `OHLCVLoader` read the venue's
+default **spot** markets; the archive was pulled with `--market um`
+(**futures**). Same `venue`, same `asset_id`, two instruments, nothing recording
+which — and `latest_per_bar` resolves it by ingestion time, so the series
+silently switches instrument at the join.
+
+This hides where §9.1 does not: spot and perp closes agree to a fraction of a
+percent, so the ratio is ~1.00× and only the *count* of disagreements gives it
+away. See §8 decision 1, now decided.
+
+It also explains the `bar_gaps` failure. `AUDIO`'s 733-day hole
+(2024-05-28..2026-06-01) begins after `AUDIOUSDT`'s last published archive month
+(**2024-05**) — the perp was delisted, and the 2026 bars exist only because
+ccxt's spot `AUDIO/USDT` supplied them. `BNX` is the genuinely different case:
+its hole (2023-01-31..2023-02-22) sits *inside* published months 2022-04..2026-07,
+so that one is a file the loader skipped and a re-pull recovers it.
+
+### 9.3 Two loader invocations running at once
+
+`funding_rate`'s largest ingestion cluster is stamped starting 13:49, *inside*
+`ohlcv_daily`'s 13:39 + 19.7 min cluster: at least two `loaders.archive`
+processes were live together. That accounts for the bulk of the duplication —
+~95,000 bars, including assets with their entire 1,826-day history stored twice.
+
+The forensics classified these as "one run emitted the bar twice", which is a
+limitation of its own heuristic rather than a finding: `RUN_GAP_MINUTES = 30`
+cannot separate invocations that *overlap*. Two things say otherwise. The
+duplicated assets are alphabetically early (`BAND`, `BAT`, `BCH`, `BEL`) while
+the 60 assets with no duplicate at all sort after "BL" (`BLUR`, `BMNR`, `BNB`,
+`BNX`, `BOME`, `BRETT`) — a run that double-emits has no reason to stop at BL, an
+interrupted second pass does. And the bucket listing shows `SHIB`, `BEL`,
+`BAND`, `BAT` and `BCH` have **no** colliding symbol, so §9.1 cannot explain
+them.
+
+**Fix:** a collision-proof output filename (or a partition claim) in
+`ParquetStore.append`, so two processes cannot race for `data_0007.parquet`;
+`--skip-loaded` on the archive loader so a resumed run is cheap; and a wider,
+better-founded clustering signal in the forensics.
+
+### 9.4 The universe warm-up, which was never a defect
+
+Six leading snapshots with no members, all carrying `listing_age` on the entire
+cross-section, first populated snapshot 2021-09-01. The history was built from
+2021-08-01 — the same date as the first bar — so for 30 days every asset fails
+`UNIVERSE_CONFIG.min_listing_age_days`. **Zero** empty snapshots after that date.
+This is why §3 step 5 says `--start 2021-09-01`, and the gate should treat
+empties *before* the first populated snapshot as warm-up rather than as the
+step-3 failure it is looking for.
+
+Separately: member counts came back min/median/max **0/64/139** against
+`target_size = 150`, and nothing flagged it because the gate's floor is a median
+of 20. The cause is upstream — the archive selects symbols **alphabetically**
+when no `--symbols` list is given, so the 200 pulled are not the 200 most liquid.
+A liquidity-ranked selection belongs in the re-pull.
+
+### 9.5 The re-pull
+
+Given three overlapping defects in one dataset, repairing in place would mean
+reasoning about which defect produced each row, with no column recording the
+answer. The decision is a clean re-pull once the fixes land:
+
+```bash
+# 1. keep the old store until the new one is accepted -- the factors,
+#    symbol sets and ingestion clusters can only be read from it
+mv data/parquet data/parquet.pre-5.9
+
+# 2. re-pull, perps only, symbols chosen by liquidity rather than alphabet
+python -m loaders.archive --market um --start 2021-08-01 --end <today> \
+    --datasets ohlcv_daily,funding_rate --symbols <liquidity-ranked list> \
+    --log-level INFO
+
+# 3. universe from past the listing-age warm-up
+python -m universe.builder --venue binance --pit-mode event \
+    --start 2021-09-01 --end <today> --freq weekly
+
+# 4. only then
+python -m audit.acceptance --venue binance
+```
+
+Do not delete `data/parquet.pre-5.9` until step 4 is green.
+
+---
+
+## 10. Price adjustments — deliberately not built yet
+
+An earlier draft of the §9 remediation was going to treat `BOB` and `CAT` as
+redenominations and build split-style adjustment factors to splice the two price
+scales together. The listing evidence killed that: they are not redenominations,
+no factor exists for them, and across all 832 supported symbols there is **not
+one** genuine redenomination to exercise such a mechanism on.
+
+It is still coming, because equities guarantee it — hundreds of splits a year,
+plus dividends for total return, plus tickers that get reused by different
+companies (the §9.1 problem at scale). `PLAN.md`'s Phase 10 already commits to
+"a real security master (tickers change, mergers — true security matching)".
+
+**It is scheduled as Phase 10a with an explicit trigger rather than built
+speculatively**, for two reasons. There is nothing in the data for it to do
+today, so it would ship untested against any real case. And its shape depends on
+a decision not yet made: equity vendors differ in whether they ship
+already-adjusted prices (convenient, but the series rewrites itself on every
+split, which breaks append-only and makes yesterday's backtest unreproducible)
+or raw prices plus a factor table (point-in-time honest, more work). Choosing
+between those is not possible before the vendor is chosen.
+
+**The trigger is the §9.1 collision guard**, which is the same query in all three
+cases — two symbols resolving to one `asset_id` — distinguished only by whether
+the validity windows overlap or abut:
+
+| Guard fires on | Windows | Meaning | Action |
+| --- | --- | --- | --- |
+| `1000CATUSDT` / `CATUSDT` | overlap | two tokens, one ticker | keep separate — the Phase 5.9 rule |
+| `1000XUSDT` / `1000000XUSDT` | abut | genuine redenomination | **build Phase 10a** |
+| `GM` pre/post-2009 | abut | reused equity ticker | **build Phase 10a** |
+
+So the guard built for crypto in Phase 5.9 is the thing that tells you when the
+adjustment engine is needed, and equities inherits it rather than rediscovering
+it.
