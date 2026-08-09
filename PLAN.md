@@ -94,6 +94,11 @@ full design, rotation/retention mechanism, and per-module retrofit map are in
 - Read API returns Polars frames; write API enforces schema + no-overwrite.
 - **Asset master**: canonical `asset_id`, per-venue symbol maps with validity
   date ranges (the crypto version of security matching / point-in-time IDs).
+  The canonicalisation rule is **one shared function**, used by every loader —
+  two loaders answering "what is this symbol called internally?" differently is
+  how the same asset acquires two `asset_id`s and two different assets acquire
+  one (see the Phase 5.9 notes). A **collision guard** enforces it: two venue
+  symbols resolving to one `asset_id` refuses the ingest and names both.
 - Every dataset row carries `event_ts` and `ingested_ts` (knowledge date) so
   backtests can ask "what did I know then?" — the look-ahead-bias defence.
 
@@ -102,6 +107,10 @@ full design, rotation/retention mechanism, and per-module retrofit map are in
 - v1 targets (all free): daily+hourly OHLCV for top ~100 perps (ccxt),
   funding rates, open interest; Deribit options summary (reuse calendar-bot
   knowledge later).
+- **One market type per venue.** All four datasets read perpetuals
+  (`LOADER_CONFIG.perp_market_type`). OHLCV read the venue's *default* (spot)
+  markets until Phase 5.9, which put spot closes and futures closes into one
+  `asset_id` with no column recording which — see `DATA.md` §9.2.
 - Each loader: fetch → validate → transform → append to datastore. Idempotent,
   resumable, unique per vendor cadence — exactly the video's "data loader".
 
@@ -183,6 +192,11 @@ full design, rotation/retention mechanism, and per-module retrofit map are in
   signals take `(datastore, date, universe)`). Equities means: new loaders
   (e.g. EOD data), a real security master (tickers change, mergers — true
   security matching), borrow costs in the cost model. No core module changes.
+- **The security-master half of that is Phase 10a** (`DATA.md` §10): split and
+  reverse-split price adjustment, dividends for total return, and reused-ticker
+  identity. Not built speculatively — an unadjusted 2:1 split is a −50% one-day
+  return, so it is unavoidable for equities, but crypto currently supplies no
+  case to test it against. Phase 5.9's collision guard is its trigger.
 
 ## 5. Technology choices
 
@@ -1333,3 +1347,121 @@ writing the checks.
 - `scratch/scratch_acceptance.py` builds four stores, each broken exactly one
   way, and prints what the gate says about each — then runs against the real
   store if there is one
+
+---
+
+## Phase 5.9 Implementation Notes (asset identity, and the clean re-pull)
+
+### Why this phase exists
+
+Phase 5.8 built the acceptance gate; running it against the real backfill
+blocked at 3 of 7. The forensics and a listing of the archive bucket turned
+those four failures into **three defects**, none of which the gate's counts
+could separate on their own. `DATA.md` §9 is the evidence; this is what it means
+for the design.
+
+The through-line is that all three are failures of *agreement between modules
+that never call each other*. Two loaders disagreed about what an asset is
+called. Two loaders disagreed about which instrument they were reading. Two
+processes disagreed about which file they were writing. Every one produced a
+plausible number rather than an error, which is the failure shape this project
+exists to be afraid of.
+
+### One canonicalisation, and why the obvious rule was wrong
+
+`loaders/archive.py` stripped multiplier prefixes (`1000SHIBUSDT → SHIB`) on the
+reasoning that returns are invariant to a constant contract multiplier, so two
+`asset_id`s for one underlying would be a pair of perfectly correlated
+"independent" bets — exactly the lie the breadth report exists to prevent. The
+reasoning is sound and the premise is false. Binance also uses the prefix to
+disambiguate **two different tokens that share a ticker**, and lists both at
+once: `1000CATUSDT` beside `CATUSDT`, `1000000BOBUSDT` beside `BOBUSDT`, with
+nine months of overlap in the `BOB` case. Stripping merged two unrelated price
+series under one `asset_id`, where `latest_per_bar` then chose between them by
+ingestion time — arbitrarily, between prices 711,000× apart.
+
+Meanwhile `pipeline/nightly.py` used ccxt's `market["base"]`, which keeps the
+prefix. So the store held `1000CAT` *and* `CAT`, `1000000BOB` *and* `BOB`. The
+existing "already mapped?" guard could not catch it because it matches the
+literal symbol string, and `1000CATUSDT` is not `1000CAT/USDT:USDT`.
+
+The rule is now: **keep the venue's own base, and never strip.** Two live
+contracts cannot collide, because a venue never gives two live contracts one
+name. What it costs is that a genuine redenomination would produce two
+sequential `asset_id`s rather than one spliced series — and splicing two price
+scales without an adjustment factor manufactures a return that never happened,
+which is strictly worse than a short history. Measured against the bucket, there
+are currently **zero** genuine redenominations in 832 supported symbols, so that
+cost is theoretical and the merge risk was not.
+
+Two structural consequences, and they are the durable part:
+
+- **One function, shared.** Every loader canonicalises through the same call.
+  Two modules answering the same question differently is what this phase is
+  about, so a second copy of the rule is the defect, not the symptom.
+- **The collision guard is a detector, not just a guard.** Two symbols resolving
+  to one `asset_id` means a ticker collision (keep them apart), a redenomination
+  (needs Phase 10a), or a reused equity ticker (needs Phase 10a) — the same
+  query, distinguished by whether the validity windows overlap or abut. Building
+  it for crypto is what tells equities when the adjustment engine is required,
+  rather than that being discovered from a backtest that looked fine.
+
+### Price adjustments, deliberately deferred
+
+The first plan for this phase was to build split-style adjustment factors and
+splice `BOB` and `CAT` back together. The listing evidence removed the
+justification: they are not redenominations, no factor exists for them, and
+nothing else in the data needs one. Building it anyway would ship an engine with
+no live case to verify against — and its own failure mode is a smooth,
+believable, wrong price series, which is precisely the class of defect it would
+be built to prevent.
+
+It becomes **Phase 10a**, triggered by the collision guard or by the first
+equity loader, whichever comes first. `DATA.md` §10 records the trigger table and
+the reason the design cannot be settled before an equity vendor is chosen:
+already-adjusted prices rewrite history on every split (breaking append-only and
+making yesterday's backtest unreproducible), raw-plus-factors does not. That is a
+real fork, and it belongs to the phase that has the information to decide it.
+
+### One market type per venue
+
+The archive pulled `futures/um`; the ccxt `OHLCVLoader` had read the venue's
+default **spot** markets since Phase 2. Both write `ohlcv_daily` under
+`venue="binance"` and the same `asset_id`, and no column records which
+instrument a row came from — so the price series switches instrument at the
+join, and `carry` (perp funding) was being paired with spot closes. It hides
+where the identity defect does not: spot and perp closes agree to a fraction of
+a percent, so only the *count* of disagreeing bars gave it away (~112 assets,
+~61 bars each, exactly the overlap window).
+
+`OHLCVLoader` moves onto `LOADER_CONFIG.perp_market_type`, joining the other two
+loaders. `DATA.md` §8 had recommended futures for the archive and simply never
+said the recommendation bound the ccxt path too.
+
+### The append race
+
+`ParquetStore.append` numbers its output file from the count already in the
+partition. `loaders/archive.py` documents this as the reason frames are appended
+on the calling thread rather than the download workers — but the same argument
+applies to *processes*, and nothing enforced it. Two overlapping
+`python -m loaders.archive` invocations duplicated ~95,000 bars and raced for
+one filename, which risks a lost write rather than merely a duplicated one.
+
+Worth recording about the diagnosis: the forensics reported these as "one run
+emitted the bar twice", which was its clustering heuristic's limit rather than a
+finding — `RUN_GAP_MINUTES = 30` cannot separate invocations that overlap in
+time. Two things contradicted it, both cheap: the duplicated assets stop dead at
+"BL" in the alphabet (an interrupted second pass, not a double-emit), and the
+bucket listing shows the worst-affected assets have no colliding symbol at all.
+**A diagnostic's own assumptions are part of what a diagnosis has to check.**
+
+### Why the store is re-pulled rather than repaired
+
+Three defects overlap in one dataset and no column records which produced a
+given row. Repair would mean inferring provenance from ingestion timestamps that
+are themselves ambiguous (§9.3). A clean re-pull after the fixes is cheaper,
+verifiable by the gate, and gives the store single-run provenance — and it is
+the natural moment to fix the *fourth*, non-blocking finding: symbol selection
+is alphabetical, so the universe came back at a median of 64 members against a
+`target_size` of 150. The old store is kept until the new one passes the gate,
+because the symbol sets and ingestion clusters can only be read from it.

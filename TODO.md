@@ -138,36 +138,26 @@ Legend: [ ] todo · [~] in progress · [x] done
       (584,866 settlements, 225 assets) and `nightly_resume` passed; duplicates
       on both datasets, `bar_gaps` (AUDIO, BNX) and `universe_snapshots` (6 with
       no members) failed. See the progress-log entry for that date
-- [ ] **Settle the three failures the gate cannot diagnose** —
-      `PAPER=true python scratch/scratch_backfill_forensics.py --list-archive`
-      on the machine that holds the store. The gate's own message says it cannot
-      tell a re-run from a month-boundary double-count, and its gap check cannot
-      tell a delisting from a month the loader skipped; the store's `ingested_ts`
-      and the bucket's listing answer both. Then act on the answer: a cross-run
-      duplicate whose copies agree is nothing to fix, one inside a single run is
-      a loader bug, and copies that *disagree* on `close` mean two archive
-      symbols share one `asset_id` — which `latest_per_bar` resolves by
-      ingestion time, i.e. arbitrarily between two price scales
-- [ ] **Rebuild the universe snapshots past the listing-age warm-up.** Confirmed
-      cause of the `universe_snapshots` failure: the history was built from
-      2021-08-01, the same date as the first bar, so for 30 days every asset
-      fails `min_listing_age_days` and six weekly snapshots (08-01, 08-02, 08-09,
-      08-16, 08-23, 08-30) have the whole cross-section marked `listing_age`.
-      `DATA.md` §3 step 5 says `--start 2021-09-01` for exactly this reason.
-      **The store is append-only, so a rebuild cannot un-write the six** — they
-      stay, and the check stays red, unless the `universe` dataset is rebuilt
-      from scratch or the check learns that empties *before the first populated
-      snapshot* are warm-up rather than the step-3 failure it is looking for.
-      That second option is the better one and is a change to the gate
-- [ ] **The universe is thinner than the target and nothing flags it.** Member
-      counts came back min/median/max 0/64/139 against `target_size = 150`. The
-      gate's `min_median_universe_members` floor is 20, so 64 passes — but a
-      64-name cross-section is a materially smaller breadth machine than the one
-      the config describes. Root cause is upstream: the archive backfill selects
-      symbols **alphabetically** (`loaders/archive.py` warns about it), so the
-      200-odd symbols pulled are not the 200 most liquid. Decide whether to
-      re-pull against a liquidity-ranked `--symbols` list before the research
-      steps run on this store
+- [x] **Settled all four gate failures** (2026-08-09), with
+      `scratch/scratch_backfill_forensics.py --list-archive` plus a listing of
+      the archive bucket. They are **three defects**, not four failures, and none
+      of them is what the gate's counts suggested — see `DATA.md` §9 for the
+      evidence and the Phase 5.9 checklist below for the fixes:
+      (1) two canonicalisations of `asset_id` in one codebase, and the archive's
+      multiplier strip merging two *different* tokens that share a ticker
+      (`1000CATUSDT`/`CATUSDT`, `1000000BOBUSDT`/`BOBUSDT` — both pairs listed
+      **simultaneously**, so neither is a redenomination);
+      (2) spot and perpetual closes written into one `asset_id`, because the
+      ccxt `OHLCVLoader` reads spot while the archive pulled `futures/um` — which
+      also explains the `AUDIO` gap, whose 2026 bars are spot rows for a perp
+      delisted in 2024-05 (`BNX` is the real skipped file);
+      (3) two `loaders.archive` processes running concurrently, which is most of
+      the duplication and which the forensics misread as a within-run
+      double-emit because `RUN_GAP_MINUTES = 30` cannot separate overlapping
+      invocations.
+      The `universe_snapshots` failure was the `min_listing_age_days` warm-up
+      and was never a defect: 6 leading empties, **0** after the first populated
+      snapshot on 2021-09-01
 - [ ] **`DATA.md` §3 step 6 expects a checkpoint the archive loader never
       writes.** Checkpoints belong to `BackfillRunner`, which `BinanceVisionLoader`
       does not use, so there is no "archive's covered interval" for
@@ -177,6 +167,71 @@ Legend: [ ] todo · [~] in progress · [x] done
       rows — but a wide `--start` re-run would re-fetch years the store already
       holds. The gate reports it as a warning rather than a block. Deciding
       whether the archive loader should record coverage is its own change
+
+## Phase 5.9 — Asset identity, and the clean re-pull
+
+The acceptance gate blocked at 3 of 7 against the real backfill; the forensics
+turned that into three defects, all of them disagreements between modules that
+never call each other, and all of them producing a plausible number rather than
+an error. Evidence in `DATA.md` §9, design rationale in the Phase 5.9
+Implementation Notes in `PLAN.md`. **Nothing here is a gate change dressed up as
+a fix — the gate was right to block.**
+
+- [ ] **One canonicalisation of `asset_id`, shared by every loader.** Stop
+      stripping multiplier prefixes: keep the venue's own base, so
+      `1000SHIBUSDT → 1000SHIB` and `1000CATUSDT`/`CATUSDT` stay two assets.
+      The strip assumed a prefix always means the same asset at a different
+      contract size; Binance also uses it to disambiguate two tokens sharing a
+      ticker, and lists both at once. A test asserts `loaders/archive.py` and
+      `pipeline/nightly.py::_populate_asset_master` agree over a fixture of real
+      symbol strings — the existing "already mapped?" guard could not catch the
+      disagreement because it matches the literal symbol, and `1000CATUSDT` is
+      not `1000CAT/USDT:USDT`
+- [ ] **Collision guard.** Two venue symbols resolving to one `asset_id` refuses
+      the ingest and names both. It is also the detector for the two cases that
+      *do* need Phase 10a: overlapping validity windows mean a ticker collision
+      (keep them apart), abutting windows mean a redenomination or a reused
+      equity ticker (build the adjustment engine)
+- [ ] **One market type per venue.** `OHLCVLoader` moves onto
+      `LOADER_CONFIG.perp_market_type`, joining the funding-rate and
+      open-interest loaders. Spot and perp closes agree to a fraction of a
+      percent, so this hides where the identity defect does not — only the
+      *count* of disagreeing bars (~112 assets × ~61 days, exactly the overlap
+      window) gave it away
+- [ ] **The append race.** `ParquetStore.append` numbers its output file from
+      the count already in the partition, so two *processes* race for one
+      filename exactly as two threads would — `loaders/archive.py` documents the
+      thread case and nothing enforced the process case. Collision-proof
+      filename or a partition claim, plus `--skip-loaded` on the archive loader
+      so a resumed run is cheap rather than duplicating what is already stored
+- [ ] **The gate reports verdicts, not shapes.** Promote `classify_duplicates`
+      out of `scratch/scratch_backfill_forensics.py` into `audit/duplicates.py`
+      so the gate blocks specifically on same-run and value-disagreeing
+      duplicates and warns on cross-run agreeing ones; add a check that no
+      `(asset_id, event_ts)` carries two materially different prices; treat
+      universe empties *before* the first populated snapshot as warm-up rather
+      than the step-3 failure; warn when median members fall far below
+      `UNIVERSE_CONFIG.target_size` (0/64/139 against 150 currently passes
+      silently); and `--allow-gapped-assets` to record a settled delisting like
+      `AUDIO` as an explicit operator decision
+- [ ] **Fix the forensics' own blind spots**, found by using it: the run
+      clustering cannot separate invocations that overlap in time, and
+      `_compare_against_archive` only checks that `[first..last]` published
+      months are contiguous — it never compares against the *gap's* dates, so it
+      told us "the hole is ours" for `AUDIO`, whose hole starts after the last
+      month the archive ever published. A diagnostic's own assumptions are part
+      of what a diagnosis has to check
+- [ ] **Re-pull the store clean.** Three defects overlap in one dataset and no
+      column records which produced a row, so repair would mean inferring
+      provenance from ambiguous timestamps. `mv data/parquet
+      data/parquet.pre-5.9`, re-pull perps only with a **liquidity-ranked**
+      symbol list (fixing the median-64-against-150 universe), rebuild the
+      universe from 2021-09-01, then re-run the gate. **Do not delete the old
+      store until the gate is green** — the symbol sets and ingestion clusters
+      can only be read from it
+- [ ] Update the methodology docs' §2 data-inputs sections to record that
+      `ohlcv_daily` is perpetual, not spot: it changes what the backtest is a
+      backtest *of*
 
 ## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
 
@@ -446,6 +501,37 @@ different answers. Plus the CI that would have caught some of it.
       If no — iterate signals, that is normal; the machine is still the asset
 - [ ] Equities extension: EOD equity loader + real security master (point-in-
       time tickers), borrow costs in cost model, re-run same pipeline
+
+### Phase 10a — Corporate actions and point-in-time identity
+
+Split/reverse-split price adjustment (prices × factor, **quantities ÷ factor**,
+rates untouched — `universe/builder.py` computes dollar volume as
+`close * volume`, so adjusting one and not the other rewrites universe
+membership), dividends for total return, and reused-ticker identity in the asset
+master.
+
+**Deliberately not built in Phase 5.9, and triggered rather than scheduled.**
+Measured 2026-08-09: 832 supported Binance UM symbols produce 830 `asset_id`s
+with exactly 2 collisions, and both are simultaneous ticker collisions rather
+than redenominations — so there is currently nothing in the data for an
+adjustment engine to do, and it would ship unverified against any real case. Its
+own failure mode is a smooth, believable, wrong price series. `DATA.md` §10 has
+the trigger table and the reasoning.
+
+- [ ] **Trigger:** the Phase 5.9 collision guard fires on a symbol pair whose
+      validity windows *abut* rather than overlap (a genuine redenomination), or
+      the first equity loader lands — whichever comes first
+- [ ] Decide raw-prices-plus-factor-table versus vendor-adjusted prices. Not
+      settleable before an equity vendor is chosen: adjusted prices rewrite
+      history on every split, which breaks append-only and makes yesterday's
+      backtest unreproducible; raw-plus-factors is point-in-time honest and more
+      work
+- [ ] Apply on **read**, in one place beside `latest_per_bar`, so the
+      collapse-then-adjust ordering is owned centrally and every reader inherits
+      it — with a completeness test in the shape of `tests/test_isolation.py`,
+      which fails when a new module reads bars outside the adjusted path
+- [ ] Detect and propose, never auto-apply: a measured seam ratio that is not
+      within tolerance of a power of ten is a human's problem, not a factor
 
 ## Progress log
 
@@ -1294,3 +1380,90 @@ different answers. Plus the CI that would have caught some of it.
   the two decisions that follow — whether the gate should tolerate a warm-up,
   and whether the pull should be re-selected by liquidity — are decisions, not
   fixes.
+- 2026-08-09: **The gate's four failures were three defects, and none of them
+  was what the counts suggested.** `scratch/scratch_backfill_forensics.py
+  --list-archive` plus a listing of the archive bucket settled every open
+  question from the 08-03 run. Full evidence in `DATA.md` §9; the design
+  consequences are the Phase 5.9 notes in `PLAN.md`. The short version, in the
+  order the reasoning actually went:
+  **The duplicates were not a benign re-run.** 102,434 of 144,122 bars stored
+  more than once, and 3,199 `ohlcv_daily` bars plus 717 `funding_rate` bars had
+  copies that *disagree on value* — `CAT` at `0.001336` against `950.37`
+  (7.1e5x), `BOB` at 2.86x. The mechanism was two canonicalisations of
+  `asset_id` living in one codebase: `loaders/archive.py` stripped multiplier
+  prefixes (`1000SHIBUSDT -> SHIB`) while `pipeline/nightly.py` used ccxt's
+  `market["base"]`, which keeps them — and `register_symbols`' "already mapped?"
+  guard could not notice, because it matches the literal symbol string and
+  `1000CATUSDT` is not `1000CAT/USDT:USDT`. So the store held `1000CAT` *and*
+  `CAT`, `1000000BOB` *and* `BOB`.
+  **The strip rested on a false premise.** Returns really are invariant to a
+  constant contract multiplier, but Binance also uses the prefix to
+  disambiguate **two different tokens sharing a ticker**. Enumerating the bucket
+  settled it: 986 published `futures/um` kline symbols, 832 supported, 830
+  distinct `asset_id`s under the strip rule, and exactly two collisions —
+  `1000000BOBUSDT`/`BOBUSDT` and `1000CATUSDT`/`CATUSDT`. Both pairs published
+  **simultaneously** (9 months of overlap for `BOB`, 1 for `CAT`), and a
+  redenomination replaces a contract rather than running both side by side.
+  Three independent confirmations: the ratios are not powers of ten; the
+  overlaps match the disagreement counts (`BOB`'s 9-month kline overlap is ~273
+  days against 253 disagreeing bars); and funding, which is *dimensionless* and
+  would be identical for one underlying at two contract sizes, differs by 42-56x
+  with one series pinned at Binance's 5e-05 base rate. Rule is now: keep the
+  venue's own base, never strip, and assert it with a collision guard.
+  **A second defect the gate never asked about: `ohlcv_daily` mixes spot and
+  perpetual prices.** ~112 assets with ~61 disagreeing bars each and *zero*
+  disagreeing funding bars — 61 days being exactly the window where the ccxt
+  runs overlap the archive run. `OHLCVLoader` has read the venue's default spot
+  markets since Phase 2; the archive pulled `futures/um`. Same `venue`, same
+  `asset_id`, two instruments, no column recording which, and `latest_per_bar`
+  resolving it by ingestion time — so the series switches instrument at the join
+  and `carry` was being paired with spot closes. It hides where the identity
+  defect does not: spot and perp closes agree to a fraction of a percent, so
+  only the *count* gave it away. It also explains `bar_gaps`: `AUDIO`'s 733-day
+  hole starts *after* `AUDIOUSDT`'s last published archive month (2024-05) — the
+  perp was delisted and the 2026 bars are spot rows — while `BNX`'s hole sits
+  inside published months and is the one genuinely skipped file.
+  **A third: two loader invocations ran at once.** `funding_rate`'s largest
+  ingestion cluster starts 13:49, *inside* `ohlcv_daily`'s 13:39 + 19.7min
+  cluster. That is most of the duplication, and `ParquetStore.append` numbers
+  its output file from the count already in the partition — so two processes
+  race for one filename exactly as two threads would, which risks a lost write
+  rather than merely a duplicated one. The forensics called these a within-run
+  double-emit, which was its own heuristic's limit rather than a finding:
+  `RUN_GAP_MINUTES = 30` cannot separate invocations that *overlap*. Two things
+  contradicted it — the duplicated assets stop dead at "BL" in the alphabet (an
+  interrupted second pass; a double-emit has no reason to stop there), and the
+  worst-affected assets (`BEL`, `BAND`, `BAT`, `BCH`, `SHIB`) have no colliding
+  symbol at all. **A diagnostic's own assumptions are part of what a diagnosis
+  has to check**, and this is the second time a tool written here has needed
+  checking against the thing it was built to check.
+  **`universe_snapshots` was never a defect.** Six leading empties, whole
+  cross-section marked `listing_age`, first populated snapshot 2021-09-01, and
+  **zero** empties after it — the `min_listing_age_days` warm-up, exactly as
+  `DATA.md` §3 step 5 predicts. The gate should learn that leading empties are
+  warm-up. Noted alongside it and not blocking: member counts of 0/64/139
+  against `target_size = 150` pass a median floor of 20 while describing a
+  materially thinner breadth machine, because the archive picks symbols
+  alphabetically.
+  **A plan reversed on the evidence, which is worth recording as such.** The
+  first remediation was going to treat `BOB` and `CAT` as redenominations and
+  build split-style price adjustment — a real security-master mechanism, and the
+  right long-run answer for equities. The listing evidence removed the
+  justification: they are not redenominations, no factor exists for them, and
+  across 832 symbols there is not one genuine redenomination to verify such an
+  engine against. It would have shipped untested against any real case, and its
+  failure mode is a smooth, believable, wrong price series. It becomes **Phase
+  10a**, triggered by the collision guard (abutting validity windows) or by the
+  first equity loader — where splits, dividends and reused tickers are
+  guaranteed rather than hypothetical, and where the raw-plus-factors versus
+  vendor-adjusted decision can actually be made, because it depends on a vendor
+  nobody has chosen yet.
+  **Decisions taken:** perpetuals everywhere (`DATA.md` §8.1 recommended futures
+  for the archive and never said it bound the ccxt path too); one shared
+  canonicalisation with no stripping; and a clean re-pull rather than an
+  in-place repair, since three defects overlap in one dataset and no column
+  records which produced a given row. The old store is kept until the new one
+  passes the gate. Docs only in this change — `DATA.md` §9/§10, `PLAN.md` M1/M2
+  and the Phase 5.9 notes, this file's Phase 5.9 and 10a checklists, and
+  `README.md`. **No code has changed yet**, and the gate still blocks at 3 of 7,
+  correctly.
