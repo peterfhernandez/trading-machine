@@ -44,6 +44,17 @@ prior is "real but small and crowded".
 | --- | --- | --- | --- |
 | Daily closes | `ohlcv_daily` | `close` | yes — venues revise recent bars, which is why the loaders re-fetch an overlap and readers collapse to the latest ingestion |
 
+**Instrument: perpetual futures, not spot.** `ohlcv_daily` carries Binance
+USDT-margined **perpetual** closes (Phase 5.9; `DATA.md` §8 decision 1 and §9.2).
+That is recorded here because it changes what a backtest of this signal is a
+backtest *of*: the perp is the instrument a book built on this score would
+actually trade, its price embeds a basis to spot, and it is the same instrument
+whose funding `carry` reads. Until Phase 5.9 the ccxt `OHLCVLoader` read the
+venue's default **spot** markets while the archive backfill pulled `futures/um`,
+so the series switched instrument wherever the two overlapped — same `venue`,
+same `asset_id`, no column recording which. Any result measured on a store built
+before that fix is measured on a spliced series.
+
 **Point-in-time contract:** the signal reads only through `RebalanceContext`
 (`signals.bars.close_series` → `ctx.ohlcv(...)`), so `event_ts <= asof` always
 holds and `ingested_ts <= asof` holds under the default `pit_mode="ingestion"`.

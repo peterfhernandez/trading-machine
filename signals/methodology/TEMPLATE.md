@@ -44,6 +44,14 @@ crypto signal, 0.20 is a bug or look-ahead).
 | --- | --- | --- | --- |
 | | `ohlcv_daily` | `close` | no |
 
+> **Name the instrument, not just the dataset.** `ohlcv_daily` carries
+> USDT-margined **perpetual** closes (`DATA.md` §8 decision 1); every loader
+> reads one market type per venue. It belongs here because it changes what a
+> backtest is a backtest *of* — and because the phase that fixed it found spot
+> closes and perp closes spliced into one series, agreeing to a fraction of a
+> percent and therefore invisible to everything except a check that looked
+> (§9.2).
+
 **Point-in-time contract:** the signal reads only through `RebalanceContext`
 (`ctx.ohlcv(...)`, `ctx.read(...)`), so `event_ts <= asof` always holds and
 `ingested_ts <= asof` holds under the default `pit_mode="ingestion"`. Confirm

@@ -18,9 +18,14 @@ from pathlib import Path
 
 import polars as pl
 
+from datastore.identity import symbol_key
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# A mapping with no end date is active forever; comparing against a sentinel is
+# simpler than special-casing None at four points in the overlap arithmetic.
+_FOREVER = datetime.max
 
 
 @dataclass
@@ -33,6 +38,61 @@ class AssetSymbolMapping:
     validity_start: datetime
     validity_end: datetime | None = None  # None = currently active
     is_primary: bool = True  # Primary symbol for this asset on this venue
+
+
+@dataclass(frozen=True)
+class AssetIdCollision:
+    """Two venue symbols that are not spellings of each other, under one asset_id.
+
+    This is the security-matching failure `DATA.md` §9.1 describes, caught at
+    the point of ingest rather than inferred from a price series 711,000x out.
+    Notational variants of one listing (`BTCUSDT`, `BTC/USDT`, `BTC/USDT:USDT`)
+    are *not* a collision — that is exactly what the asset master is for — so
+    the test is `datastore.identity.symbol_key`, not string equality.
+
+    `relation` is the Phase 10a trigger, and the same query answers both cases:
+
+    - **overlap** — both listings were live at once, so they cannot be the same
+      thing under two names. Two tokens sharing a ticker; keep them apart.
+    - **abut** — one ended where the other began. A genuine redenomination, or
+      a reused equity ticker, and the point at which the price-adjustment
+      engine (`DATA.md` §10) stops being hypothetical.
+    """
+
+    asset_id: str
+    venue: str
+    symbol: str
+    existing_symbol: str
+    relation: str  # "overlap" | "abut"
+
+    @property
+    def is_redenomination_candidate(self) -> bool:
+        return self.relation == "abut"
+
+    def describe(self) -> str:
+        if self.relation == "overlap":
+            meaning = (
+                "both listed at the same time, so they are two different assets "
+                "sharing a ticker -- keep them apart"
+            )
+        else:
+            meaning = (
+                "one listing ends where the other begins, which is a "
+                "redenomination or a reused ticker -- see DATA.md section 10 "
+                "(Phase 10a)"
+            )
+        return (
+            f"asset_id {self.asset_id!r} on {self.venue} would map both "
+            f"{self.existing_symbol!r} and {self.symbol!r} ({meaning})"
+        )
+
+
+class AssetIdCollisionError(ValueError):
+    """Refusing a mapping that would merge two listings into one asset_id."""
+
+    def __init__(self, collision: AssetIdCollision):
+        self.collision = collision
+        super().__init__(collision.describe())
 
 
 class AssetMaster:
@@ -67,6 +127,88 @@ class AssetMaster:
             )
             logger.info("Created new (empty) asset master")
 
+    def check_collision(
+        self,
+        asset_id: str,
+        venue: str,
+        symbol: str,
+        validity_start: datetime,
+        validity_end: datetime | None = None,
+    ) -> AssetIdCollision | None:
+        """Would this mapping put two different listings under one `asset_id`?
+
+        Returns the collision, or None when the mapping is safe. A symbol whose
+        notation this project does not recognise (Deribit's bare `BTC`, say)
+        cannot be compared, so it is allowed through rather than guessed at:
+        the guard exists to catch one specific known failure, and a guard that
+        fires on everything unfamiliar is a guard somebody turns off.
+        """
+        key = symbol_key(symbol)
+        if key is None:
+            return None
+
+        existing = self._cache.filter(
+            (pl.col("asset_id") == asset_id)
+            & (pl.col("venue") == venue)
+            & (pl.col("symbol") != symbol)
+        )
+        if not len(existing):
+            return None
+
+        end = validity_end or _FOREVER
+        for row in existing.iter_rows(named=True):
+            other_key = symbol_key(row["symbol"])
+            if other_key is None or other_key == key:
+                continue
+            other_end = row["validity_end"] or _FOREVER
+            overlaps = validity_start < other_end and row["validity_start"] < end
+            return AssetIdCollision(
+                asset_id=asset_id,
+                venue=venue,
+                symbol=symbol,
+                existing_symbol=row["symbol"],
+                relation="overlap" if overlaps else "abut",
+            )
+        return None
+
+    def find_collisions(self) -> list[AssetIdCollision]:
+        """Every collision already recorded in the master.
+
+        `check_collision` stops new ones; this reports what a master built under
+        the old canonicalisation is already carrying, which is what the
+        acceptance gate needs to ask before any research runs.
+        """
+        collisions: list[AssetIdCollision] = []
+
+        for (asset_id, venue), group in self._cache.group_by(
+            ["asset_id", "venue"], maintain_order=True
+        ):
+            # One representative row per distinct listing: repeated mappings of
+            # the same symbol are the ordinary state of an append-only master.
+            listings: dict[tuple[str, str], dict] = {}
+            for row in group.sort("validity_start").iter_rows(named=True):
+                key = symbol_key(row["symbol"])
+                if key is not None:
+                    listings.setdefault(key, row)
+
+            rows = list(listings.values())
+            for i, row in enumerate(rows):
+                for other in rows[i + 1 :]:
+                    overlaps = (
+                        row["validity_start"] < (other["validity_end"] or _FOREVER)
+                        and other["validity_start"] < (row["validity_end"] or _FOREVER)
+                    )
+                    collisions.append(
+                        AssetIdCollision(
+                            asset_id=str(asset_id),
+                            venue=str(venue),
+                            symbol=other["symbol"],
+                            existing_symbol=row["symbol"],
+                            relation="overlap" if overlaps else "abut",
+                        )
+                    )
+        return collisions
+
     def add_mapping(
         self,
         asset_id: str,
@@ -75,6 +217,7 @@ class AssetMaster:
         validity_start: datetime,
         validity_end: datetime | None = None,
         is_primary: bool = True,
+        allow_collision: bool = False,
     ) -> None:
         """
         Add or update an asset-venue-symbol mapping.
@@ -86,7 +229,47 @@ class AssetMaster:
             validity_start: When this mapping became active
             validity_end: When this mapping ended (None = still active)
             is_primary: Whether this is the primary symbol for this asset on this venue
+            allow_collision: Record the mapping even though it merges two
+                listings under one `asset_id`. For a caller that has looked at
+                the collision and decided; never a default.
+
+        Raises:
+            AssetIdCollisionError: if this mapping would put a second listing
+                under `asset_id` on this venue **while the first is still
+                live**. Two contracts trading at once cannot be one asset under
+                two names, so the ingest is refused rather than resolved --
+                resolving it means choosing between two price series by
+                ingestion time, which is the defect this guard exists for
+                (`DATA.md` section 9.1).
+
+                Windows that *abut* are recorded with a warning instead: a
+                symbol that ends where another begins is a rename, which
+                point-in-time validity ranges exist to express. It is also the
+                shape of a redenomination and of a reused equity ticker, and
+                those need Phase 10a -- so it is surfaced rather than blocked.
         """
+        collision = (
+            None
+            if allow_collision
+            else self.check_collision(
+                asset_id, venue, symbol, validity_start, validity_end
+            )
+        )
+        if collision is not None:
+            if collision.relation == "overlap":
+                logger.error(f"Refusing mapping: {collision.describe()}")
+                raise AssetIdCollisionError(collision)
+            # Abutting windows are a *rename* as far as the store is concerned,
+            # and expressing one is what the validity ranges are for — Phase 1
+            # shipped that deliberately. So it is recorded, and flagged: the
+            # same shape is also a redenomination or a reused equity ticker,
+            # and those need the price adjustment `DATA.md` §10 defers to Phase
+            # 10a. Nothing here can tell the three apart; a human can, and
+            # `find_collisions()` puts it in front of them.
+            logger.warning(
+                f"Sequential listings under one asset_id: {collision.describe()}"
+            )
+
         new_row = pl.DataFrame(
             {
                 "asset_id": [asset_id],

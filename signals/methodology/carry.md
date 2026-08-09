@@ -52,6 +52,14 @@ endpoint carries the rate alone (both are null on historical rows, recorded in
 `AUDIT_CONFIG.nullable_columns_by_dataset`), so a signal that used them would
 work on snapshot data and silently score nothing on backfilled history.
 
+**Instrument: perpetual futures, on both sides.** Funding has always been a
+perpetual-only concept, so this signal was never exposed to the spot/perp splice
+in `ohlcv_daily` that Phase 5.9 removed (`DATA.md` §9.2) — but the signals it is
+combined with were, and `alpha = vol x IC x z` takes its volatility from prices.
+From Phase 5.9 every loader reads one market type per venue
+(`LOADER_CONFIG.perp_market_type`), so the funding rate here and the closes
+every other signal reads now describe the same instrument.
+
 **Point-in-time contract:** reads only through `RebalanceContext`
 (`signals.bars.dataset_series` → `ctx.read("funding_rate", ...)`).
 

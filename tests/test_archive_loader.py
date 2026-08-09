@@ -25,7 +25,12 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
-from datastore import AssetMaster, ParquetStore, count_duplicate_bars
+from datastore import (
+    AssetMaster,
+    ParquetStore,
+    canonical_asset_id_for_market,
+    count_duplicate_bars,
+)
 from loaders.archive import (
     ARCHIVE_HOST,
     FUNDING_RATE,
@@ -38,6 +43,7 @@ from loaders.archive import (
     ChecksumMismatchError,
     asset_id_for,
     is_supported_symbol,
+    month_end,
     months_in,
     parse_checksum,
     parse_funding,
@@ -60,6 +66,10 @@ KLINE_HEADER = (
 # 2021-01-01 and 2021-01-02, 00:00 UTC, in epoch milliseconds.
 JAN_1_MS = 1_609_459_200_000
 JAN_2_MS = 1_609_545_600_000
+# 2021-02-01 and 2021-03-01, for the tests where a month's file has to carry
+# bars from that month rather than a stand-in timestamp.
+FEB_1_MS = 1_612_137_600_000
+MAR_1_MS = 1_614_556_800_000
 # 2025-01-01 00:00 UTC in microseconds — above MICROSECOND_THRESHOLD.
 JAN_1_2025_US = 1_735_689_600_000_000
 
@@ -556,18 +566,57 @@ class TestSymbolMapping:
         [
             ("BTCUSDT", "BTC"),
             ("ETHUSDT", "ETH"),
-            # Multiplier contracts are the same underlying at a scaled contract
-            # size, and returns are invariant to a constant multiplier.
-            ("1000BONKUSDT", "BONK"),
-            ("1000SHIBUSDT", "SHIB"),
-            ("1MBABYDOGEUSDT", "BABYDOGE"),
-            ("1000000MOGUSDT", "MOG"),
-            # ...but a token whose name merely starts with a digit is not one.
+            # The venue's own base, prefix included. Stripping the multiplier
+            # assumed it always means one underlying at a scaled contract size;
+            # Binance also uses it to disambiguate two tokens sharing a ticker,
+            # and lists both at once (`1000CATUSDT` beside `CATUSDT`).
+            ("1000BONKUSDT", "1000BONK"),
+            ("1000SHIBUSDT", "1000SHIB"),
+            ("1MBABYDOGEUSDT", "1MBABYDOGE"),
+            ("1000000MOGUSDT", "1000000MOG"),
             ("1INCHUSDT", "1INCH"),
         ],
     )
-    def test_multipliers_map_to_the_underlying(self, symbol, expected):
+    def test_the_venues_own_base_is_the_asset_id(self, symbol, expected):
         assert asset_id_for(symbol) == expected
+
+    @pytest.mark.parametrize(
+        ("prefixed", "bare"),
+        [("1000CATUSDT", "CATUSDT"), ("1000000BOBUSDT", "BOBUSDT")],
+    )
+    def test_a_prefixed_and_a_bare_ticker_stay_two_assets(self, prefixed, bare):
+        """The pair that made the rule. Both were published simultaneously —
+        nine months of overlap for BOB — so they are two different tokens, and
+        merging them put `CAT` at 0.001336 and 950.37 on the same day with
+        `latest_per_bar` choosing between them by ingestion time."""
+        assert asset_id_for(prefixed) != asset_id_for(bare)
+
+    def test_the_archive_and_the_nightly_agree(self):
+        """The defect underneath §9.1 was not either rule: it was two of them.
+        `register_symbols`' "already mapped?" guard could not catch the
+        disagreement because it matches the literal symbol, and `1000CATUSDT`
+        is not `1000CAT/USDT:USDT`. So the two paths are asserted equal here
+        over real symbol strings, in both notations."""
+        pairs = [
+            ("BTCUSDT", "BTC/USDT:USDT", "BTC"),
+            ("ETHUSDT", "ETH/USDT:USDT", "ETH"),
+            ("1000SHIBUSDT", "1000SHIB/USDT:USDT", "1000SHIB"),
+            ("1000CATUSDT", "1000CAT/USDT:USDT", "1000CAT"),
+            ("CATUSDT", "CAT/USDT:USDT", "CAT"),
+            ("1000000BOBUSDT", "1000000BOB/USDT:USDT", "1000000BOB"),
+            ("BOBUSDT", "BOB/USDT:USDT", "BOB"),
+            ("1MBABYDOGEUSDT", "1MBABYDOGE/USDT:USDT", "1MBABYDOGE"),
+            ("1INCHUSDT", "1INCH/USDT:USDT", "1INCH"),
+        ]
+        for archive_symbol, ccxt_symbol, expected in pairs:
+            assert asset_id_for(archive_symbol) == expected
+            # What `pipeline/nightly.py::_populate_asset_master` computes.
+            assert (
+                canonical_asset_id_for_market(
+                    ccxt_symbol, {"base": ccxt_symbol.split("/")[0]}
+                )
+                == expected
+            )
 
     @pytest.mark.parametrize(
         "symbol",
@@ -626,20 +675,58 @@ class TestAssetMasterRegistration:
             is None
         )
 
-    def test_a_multiplier_symbol_resolves_to_the_underlying(self, loader, asset_master):
+    def test_a_multiplier_symbol_keeps_its_prefix(self, loader, asset_master):
         loader.register_symbols({"1000BONKUSDT": "2023-11"})
 
-        assert asset_master.resolve_symbol("1000BONKUSDT", "binance") == "BONK"
+        assert asset_master.resolve_symbol("1000BONKUSDT", "binance") == "1000BONK"
 
     def test_registering_twice_adds_one_mapping(self, loader, asset_master):
         """The master is append-only, so a re-run must not grow it without bound."""
-        assert loader.register_symbols({"BTCUSDT": "2020-01"}) == 1
-        assert loader.register_symbols({"BTCUSDT": "2020-01"}) == 0
+        assert loader.register_symbols({"BTCUSDT": "2020-01"}) == set()
+        assert loader.register_symbols({"BTCUSDT": "2020-01"}) == set()
         assert len(asset_master._cache) == 1
 
     def test_unsupported_symbols_are_not_registered(self, loader, asset_master):
-        assert loader.register_symbols({"BTCUSDT_240329": "2023-11"}) == 0
+        assert loader.register_symbols({"BTCUSDT_240329": "2023-11"}) == {
+            "BTCUSDT_240329"
+        }
         assert asset_master.list_assets() == []
+
+    def test_a_colliding_symbol_is_refused_and_its_rows_are_not_ingested(
+        self, loader, archive, store, asset_master
+    ):
+        """A master carrying the pre-5.9 merge refuses the second symbol rather
+        than writing its bars under the same asset_id. The run continues: one
+        refused symbol must not abandon the other 199."""
+        asset_master.add_mapping("CAT", "binance", "1000CATUSDT", datetime(2024, 10, 1))
+        for symbol in ("CATUSDT", "BTCUSDT"):
+            archive.add_kline_month(symbol, "2021-01", [kline_row(JAN_1_MS)])
+
+        refused = loader.register_symbols({"CATUSDT": "2026-07", "BTCUSDT": "2020-01"})
+
+        assert refused == {"CATUSDT"}
+        assert asset_master.resolve_symbol("CATUSDT", "binance") is None
+        assert asset_master.resolve_symbol("BTCUSDT", "binance") == "BTC"
+
+    def test_a_refused_symbol_is_dropped_from_the_fetch_plan(
+        self, archive, store, asset_master
+    ):
+        """The refusal has to reach the plan, not just the master: rows with no
+        honest asset_id must not be written under a borrowed one."""
+        asset_master.add_mapping("CAT", "binance", "1000CATUSDT", datetime(2020, 1, 1))
+        for symbol in ("CATUSDT", "BTCUSDT"):
+            archive.add_kline_month(symbol, "2021-01", [kline_row(JAN_1_MS)])
+        loader = BinanceVisionLoader(
+            symbols=["CATUSDT", "BTCUSDT"],
+            store=store,
+            asset_master=asset_master,
+            http=archive,
+            workers=2,
+        )
+
+        loader.run_daily(window=JANUARY_2021)
+
+        assert store.read("ohlcv_daily")["asset_id"].unique().to_list() == ["BTC"]
 
     def test_a_run_registers_what_it_fetches(self, loader, archive, asset_master):
         archive.add_kline_month("BTCUSDT", "2021-01", [kline_row(JAN_1_MS)])
@@ -743,7 +830,7 @@ class TestRunDaily:
         loader.run_daily(window=JANUARY_2021)
 
         assert sorted(store.read("ohlcv_daily")["asset_id"].unique().to_list()) == [
-            "BONK",
+            "1000BONK",
             "BTC",
             "ETH",
         ]
@@ -943,3 +1030,193 @@ class TestIsolation:
         }
 
         assert "ccxt" not in imported
+
+
+# ---------------------------------------------------------------------------
+# Resuming, and choosing symbols by something other than the alphabet
+# ---------------------------------------------------------------------------
+
+
+class TestSkipLoaded:
+    """A resumed run should be cheap, not a second copy of the history.
+
+    The archive has no overlap of its own, so every duplicate in the store came
+    from a window being fetched twice. `--skip-loaded` asks the store rather
+    than a checkpoint file, which cannot then go stale against it.
+    """
+
+    def _loader(self, archive, store, asset_master, **kwargs):
+        return BinanceVisionLoader(
+            symbols=["BTCUSDT"],
+            store=store,
+            asset_master=asset_master,
+            http=archive,
+            workers=1,
+            **kwargs,
+        )
+
+    def test_a_second_run_fetches_nothing_and_stores_nothing_new(
+        self, archive, store, asset_master
+    ):
+        # Each month's file carries a bar from that month: presence is judged on
+        # the bar's own month, not the filename, so a run that stored the file
+        # is what makes it skippable.
+        archive.add_kline_month("BTCUSDT", "2021-01", [kline_row(JAN_1_MS)])
+        archive.add_kline_month("BTCUSDT", "2021-02", [kline_row(FEB_1_MS)])
+        # Month-aligned: a window ending mid-month leaves a trimmed month, and
+        # the next test is about that case refusing to be skipped.
+        window = FetchWindow(datetime(2021, 1, 1), datetime(2021, 3, 1))
+
+        first = self._loader(archive, store, asset_master, skip_loaded=True)
+        assert first.run_daily(window=window) > 0
+        before = len(store.read("ohlcv_daily"))
+
+        second = self._loader(archive, store, asset_master, skip_loaded=True)
+        assert second.run_daily(window=window) == 0
+        assert len(store.read("ohlcv_daily")) == before
+
+    def test_without_the_flag_the_window_is_fetched_again(
+        self, archive, store, asset_master
+    ):
+        """The default is unchanged: append-only storage plus `latest_per_bar`
+        makes a re-fetch cost disk rather than correctness, and the deliberate
+        overlap the incremental loaders rely on depends on it."""
+        archive.add_kline_month("BTCUSDT", "2021-01", [kline_row(JAN_1_MS)])
+
+        self._loader(archive, store, asset_master).run_daily(window=JANUARY_2021)
+        self._loader(archive, store, asset_master).run_daily(window=JANUARY_2021)
+
+        assert len(store.read("ohlcv_daily")) == 2
+
+    def test_a_month_only_partly_inside_the_window_is_fetched_again(
+        self, archive, store, asset_master
+    ):
+        """The conservatism that matters. A window ending mid-month stores a
+        trimmed month, so a later, wider window must re-fetch it -- skipping it
+        would leave a hole no other check reports as one."""
+        archive.add_kline_month(
+            "BTCUSDT", "2021-01", [kline_row(JAN_1_MS), kline_row(JAN_2_MS)]
+        )
+        narrow = FetchWindow(datetime(2021, 1, 1), datetime(2021, 1, 1, 23, 59))
+        wide = FetchWindow(datetime(2021, 1, 1), datetime(2021, 1, 31, 23, 59))
+
+        loader = self._loader(archive, store, asset_master, skip_loaded=True)
+        assert loader.run_daily(window=narrow) == 1
+        assert loader.run_daily(window=wide) == 2
+
+        bars = store.read("ohlcv_daily")
+        assert bars["event_ts"].n_unique() == 2
+
+    def test_a_month_that_is_missing_is_still_fetched(
+        self, archive, store, asset_master
+    ):
+        archive.add_kline_month("BTCUSDT", "2021-01", [kline_row(JAN_1_MS)])
+        archive.add_kline_month("BTCUSDT", "2021-02", [kline_row(FEB_1_MS)])
+        january = FetchWindow(datetime(2021, 1, 1), month_end("2021-01"))
+        both = FetchWindow(datetime(2021, 1, 1), datetime(2021, 3, 1))
+
+        loader = self._loader(archive, store, asset_master, skip_loaded=True)
+        loader.run_daily(window=january)
+
+        assert loader.run_daily(window=both) == 1  # February only
+
+    def test_an_empty_store_is_not_a_reason_to_skip(self, archive, store, asset_master):
+        archive.add_kline_month("BTCUSDT", "2021-01", [kline_row(JAN_1_MS)])
+
+        loader = self._loader(archive, store, asset_master, skip_loaded=True)
+
+        assert loader.run_daily(window=JANUARY_2021) == 1
+
+
+class TestLiquidityRanking:
+    """The universe came back at a median of 64 against a target of 150.
+
+    Not a universe-builder failure: the archive picks its symbols
+    **alphabetically** when no list is given, so the 200 pulled were not the
+    200 most traded and the builder was ranking the wrong candidates
+    (`DATA.md` §9.4).
+    """
+
+    def _archive_with_volumes(self, archive, volumes: dict[str, float], month="2021-01"):
+        for symbol, volume in volumes.items():
+            archive.add_kline_month(
+                symbol, month, [kline_row(JAN_1_MS, close=1.0, volume=volume)]
+            )
+
+    def test_symbols_are_ordered_by_dollar_volume(self, archive, store, asset_master):
+        self._archive_with_volumes(
+            archive, {"AAAUSDT": 1.0, "BBBUSDT": 1000.0, "CCCUSDT": 10.0}
+        )
+        loader = BinanceVisionLoader(
+            store=store, asset_master=asset_master, http=archive, workers=2
+        )
+
+        ranked = loader.rank_symbols_by_liquidity(
+            ["AAAUSDT", "BBBUSDT", "CCCUSDT"], month="2021-01"
+        )
+
+        assert ranked == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+
+    def test_the_cap_keeps_the_liquid_end_not_the_alphabetical_one(
+        self, archive, store, asset_master
+    ):
+        """The whole point: `ZZZUSDT` trades a thousand times `AAAUSDT` and a
+        cap of one must keep it."""
+        self._archive_with_volumes(archive, {"AAAUSDT": 1.0, "ZZZUSDT": 1000.0})
+        loader = BinanceVisionLoader(
+            store=store,
+            asset_master=asset_master,
+            http=archive,
+            max_symbols=1,
+            rank_by_liquidity=True,
+            rank_month="2021-01",
+            workers=2,
+        )
+
+        assert loader.list_symbols() == ["ZZZUSDT"]
+
+    def test_without_the_flag_the_cap_is_still_alphabetical(
+        self, archive, store, asset_master
+    ):
+        """Unchanged default, and the warning that says what it costs."""
+        self._archive_with_volumes(archive, {"AAAUSDT": 1.0, "ZZZUSDT": 1000.0})
+        loader = BinanceVisionLoader(
+            store=store, asset_master=asset_master, http=archive, max_symbols=1
+        )
+
+        assert loader.list_symbols() == ["AAAUSDT"]
+
+    def test_dollar_volume_is_close_times_volume(self, archive, store, asset_master):
+        """The same definition `universe/builder.py` uses. A symbol list ranked
+        on a different one would cut the candidates along a different line from
+        the universe that then ranks them."""
+        archive.add_kline_month(
+            "AAAUSDT", "2021-01", [kline_row(JAN_1_MS, close=100.0, volume=10.0)]
+        )
+        archive.add_kline_month(
+            "BBBUSDT", "2021-01", [kline_row(JAN_1_MS, close=1.0, volume=500.0)]
+        )
+        loader = BinanceVisionLoader(
+            store=store, asset_master=asset_master, http=archive, workers=2
+        )
+
+        # 100 x 10 = 1,000 against 1 x 500 = 500, though B's base volume is 50x.
+        assert loader.rank_symbols_by_liquidity(
+            ["AAAUSDT", "BBBUSDT"], month="2021-01"
+        ) == ["AAAUSDT", "BBBUSDT"]
+
+    def test_a_symbol_missing_the_probe_month_sorts_last(
+        self, archive, store, asset_master
+    ):
+        """Absence is not evidence of low volume, but it is not evidence of
+        high volume either -- and an arbitrary stable order beats a random one."""
+        self._archive_with_volumes(archive, {"BBBUSDT": 5.0})
+        loader = BinanceVisionLoader(
+            store=store, asset_master=asset_master, http=archive, workers=2
+        )
+
+        ranked = loader.rank_symbols_by_liquidity(
+            ["AAAUSDT", "BBBUSDT", "CCCUSDT"], month="2021-01"
+        )
+
+        assert ranked == ["BBBUSDT", "AAAUSDT", "CCCUSDT"]

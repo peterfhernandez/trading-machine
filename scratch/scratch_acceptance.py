@@ -13,8 +13,12 @@ on, and shows what the gate says about each:
    trim that asset to whatever follows the hole
 3. a universe dataset with one snapshot in it — the `--pit-mode` failure, which
    surfaces downstream as an empty backtest rather than as an error
-4. a month loop that double-counted its boundary — duplicate bars the
-   append-only store keeps by design
+4. duplicate bars, in both the harmless shape (a window loaded twice) and the
+   defective one (the same bar emitted twice inside one run) — the gate blocks
+   on the second and warns on the first
+5. one bar carrying two prices — two listings merged onto one `asset_id`, and
+   the fraction-of-a-percent version of it, spot closes spliced with perpetual
+   closes (`DATA.md` §9)
 
 Then it prints what the gate says about the real store, if there is one.
 """
@@ -34,7 +38,7 @@ from log_demo import start_demo_run
 
 from audit.acceptance import AcceptanceError, AcceptanceThresholds, run_acceptance_checks
 from config import DATASTORE_PATH, PAPER
-from datastore import ParquetStore
+from datastore import AssetMaster, ParquetStore
 from loaders.schemas import FUNDING_RATE_SCHEMA, OHLCV_SCHEMA
 from universe.schema import UNIVERSE_SCHEMA
 
@@ -56,6 +60,11 @@ DEMO_THRESHOLDS = AcceptanceThresholds(
     min_ohlcv_assets=10,
     min_funding_assets=6,
     min_median_universe_members=5,
+    # 12 assets against a target of 150 means every snapshot here is thin by
+    # construction, so the breadth warning would fire in every section and say
+    # nothing about the defect that section is showing. It gets its own
+    # demonstration in section 3 instead, at the real threshold.
+    min_universe_share_of_target=0.0,
 )
 
 
@@ -124,27 +133,73 @@ def build_store(
     skip: dict[str, set[int]] | None = None,
     n_snapshots: int = 110,
     duplicate_months: bool = False,
+    same_run_duplicates: bool = False,
+    second_price_scale: float | None = None,
+    merged_ticker: bool = False,
+    universe_members: int = 8,
 ) -> ParquetStore:
     assets = [f"A{i:02d}" for i in range(N_ASSETS)]
     store = ParquetStore(root)
     store.append("ohlcv_daily", bars(assets, skip=skip), OHLCV_SCHEMA)
     if duplicate_months:
-        # What a month loop that re-reads its own boundary leaves behind: the
-        # same 30 bars again, under a later ingestion. The store keeps both by
-        # design, so nothing upstream of the gate raises.
+        # A window loaded twice: the same 30 bars again, hours later. The store
+        # keeps both by design and every reader collapses them, so the gate
+        # warns rather than blocking.
         again = bars(assets).head(30 * N_ASSETS).with_columns(
             pl.lit(BACKFILL_RAN_AT + timedelta(hours=2)).alias("ingested_ts")
         )
         store.append("ohlcv_daily", again, OHLCV_SCHEMA)
+    if same_run_duplicates:
+        # The same 30 bars again, five seconds later: inside one ingestion run,
+        # which is a loader defect rather than a re-run.
+        again = bars(assets).head(30 * N_ASSETS).with_columns(
+            pl.lit(BACKFILL_RAN_AT + timedelta(seconds=5)).alias("ingested_ts")
+        )
+        store.append("ohlcv_daily", again, OHLCV_SCHEMA)
+    if second_price_scale is not None:
+        # Two listings merged onto one asset_id: the same bars at a different
+        # price scale, which `latest_per_bar` then chooses between by ingestion
+        # time -- arbitrarily.
+        other = (
+            bars(assets[:3])
+            .head(60 * 3)
+            .with_columns(
+                pl.lit(BACKFILL_RAN_AT + timedelta(hours=5)).alias("ingested_ts"),
+                (pl.col("close") * second_price_scale).alias("close"),
+            )
+        )
+        store.append("ohlcv_daily", other, OHLCV_SCHEMA)
     store.append("funding_rate", funding(assets[:8]), FUNDING_RATE_SCHEMA)
-    store.append("universe", universe(n_snapshots), UNIVERSE_SCHEMA)
+    store.append("universe", universe(n_snapshots, members=universe_members), UNIVERSE_SCHEMA)
+    write_asset_master(store, assets, merged_ticker=merged_ticker)
     return store
 
 
-def show(title: str, store: ParquetStore) -> None:
+def write_asset_master(
+    store: ParquetStore, assets: list[str], merged_ticker: bool = False
+) -> None:
+    """The mapping the loaders would have written, so `asset_identity` has
+    something to check rather than reporting an absent master.
+
+    With `merged_ticker`, it carries the pre-5.9 shape: two simultaneously
+    listed symbols under one `asset_id`. `add_mapping` refuses that now, so
+    reproducing it takes `allow_collision=True` — which is the point.
+    """
+    master = AssetMaster(store.root / "asset_master.parquet")
+    for asset in assets:
+        master.add_mapping(asset, "binance", f"{asset}USDT", FIRST_BAR)
+    if merged_ticker:
+        master.add_mapping(
+            assets[0], "binance", f"1000{assets[0]}USDT", FIRST_BAR, allow_collision=True
+        )
+
+
+def show(
+    title: str, store: ParquetStore, thresholds: AcceptanceThresholds | None = None
+) -> None:
     print(f"\n--- {title} " + "-" * max(0, 66 - len(title)))
     report = run_acceptance_checks(
-        store=store, venue="binance", thresholds=DEMO_THRESHOLDS
+        store=store, venue="binance", thresholds=thresholds or DEMO_THRESHOLDS
     )
     print(report.to_text())
 
@@ -189,24 +244,74 @@ def section_3_no_universe(root: Path) -> None:
     )
     show("one snapshot", build_store(root / "thin", n_snapshots=1))
 
+    print(
+        "\nAnd the finding nothing flagged on the first real backfill: member\n"
+        "counts of 0/64/139 against a target_size of 150 cleared the median floor\n"
+        "of 20 and described a breadth machine running at 43%. The cause is\n"
+        "upstream -- the archive picks symbols alphabetically unless told\n"
+        "otherwise -- so this warns rather than blocking, and names it."
+    )
+    show(
+        "a thin universe",
+        build_store(root / "thinuniverse", universe_members=64),
+        thresholds=AcceptanceThresholds(
+            min_years=2.0, min_ohlcv_assets=10, min_funding_assets=6
+        ),
+    )
+
 
 def section_4_duplicates(root: Path) -> None:
     print("\n" + "=" * 70)
-    print("4. A month loop that double-counted its boundary")
+    print("4. Duplicate bars, and the three things they can mean")
     print("=" * 70)
     print(
-        "\nThe archive publishes one file per (symbol, month) with no overlap, so\n"
-        "a first run cannot produce a duplicate. Readers collapse to the latest\n"
-        "ingestion, so this is not a correctness problem -- but on a first run it\n"
-        "is a loader bug, and the gate cannot tell it apart from a deliberate\n"
-        "re-run, so it says so rather than guessing."
+        "\nThe same count, three causes, and until Phase 5.9 the gate reported the\n"
+        "count and said it could not tell them apart -- which left an operator\n"
+        "holding a red check and no decision. `audit/duplicates.py` classifies by\n"
+        "ingestion cluster and by whether the copies agree, and the gate blocks\n"
+        "only on the readings that are defects.\n"
+        "\nFirst: a window loaded twice, hours apart, agreeing on value. Expected\n"
+        "under append-only storage and collapsed on every read -- a WARN."
     )
-    show("duplicates", build_store(root / "dupes", duplicate_months=True))
+    show("re-run (warn)", build_store(root / "dupes", duplicate_months=True))
+    print(
+        "\nSecond: the same bars five seconds apart, inside one ingestion run.\n"
+        "Nothing legitimate emits a bar twice within a run -- a FAIL."
+    )
+    show("within one run (block)", build_store(root / "samerun", same_run_duplicates=True))
 
 
-def section_5_the_real_store() -> None:
+def section_5_two_prices_for_one_bar(root: Path) -> None:
     print("\n" + "=" * 70)
-    print("5. The real store, if there is one")
+    print("5. Two prices for one bar")
+    print("=" * 70)
+    print(
+        "\nThe check nothing performed, and the one that catches both identity\n"
+        "defects the first real backfill hid (DATA.md section 9). A thousandfold\n"
+        "ratio is two listings merged onto one asset_id (`1000CATUSDT` beside\n"
+        "`CATUSDT`); a fraction of a percent is two *instruments* -- spot closes\n"
+        "and perpetual closes -- written into one series, which is why the\n"
+        "tolerance is 0.1% rather than something comfortable."
+    )
+    show(
+        "a merged ticker",
+        build_store(root / "merged", second_price_scale=1000.0, merged_ticker=True),
+    )
+    print(
+        "\nAnd the version that hid for a whole phase: a 40bp basis, which every\n"
+        "dataset-level number survives unchanged. Note that `asset_identity`\n"
+        "passes here -- there is no second symbol to find, because both series\n"
+        "are the same asset on two market types. Only the prices give it away."
+    )
+    show(
+        "spot against perp",
+        build_store(root / "twoinstruments", second_price_scale=1.004),
+    )
+
+
+def section_6_the_real_store() -> None:
+    print("\n" + "=" * 70)
+    print("6. The real store, if there is one")
     print("=" * 70)
     print(f"\n  {DATASTORE_PATH}\n")
     try:
@@ -237,7 +342,8 @@ def main() -> int:
         section_2_a_hole(root)
         section_3_no_universe(root)
         section_4_duplicates(root)
-        section_5_the_real_store()
+        section_5_two_prices_for_one_bar(root)
+        section_6_the_real_store()
     finally:
         # Explicit rather than a context manager: Windows will not delete a file
         # another handle has open, and this demo opens a good few parquet files.
