@@ -249,21 +249,17 @@ a fix — the gate was right to block.**
       published, which is what separates `AUDIO` (delisted) from `BNX` (a file
       we skipped) — `tests/test_backfill_forensics.py` pins both, with the
       negative control that contiguity alone gives opposite answers
-- [ ] **Re-pull the store clean.** Three defects overlap in one dataset and no
-      column records which produced a row, so repair would mean inferring
-      provenance from ambiguous timestamps. `mv data/parquet
-      data/parquet.pre-5.9`, re-pull perps only with a **liquidity-ranked**
-      symbol list (fixing the median-64-against-150 universe), rebuild the
-      universe from 2021-09-01, then re-run the gate. **Do not delete the old
-      store until the gate is green** — the symbol sets and ingestion clusters
-      can only be read from it.
-      **The only item on this list that is not code, and it has not been run:**
-      it needs the trading machine's store and a twenty-minute network pull, and
-      neither exists in the environment the fixes were written in. Everything it
-      depends on is now in place — `--rank-by-liquidity` (with `--rank-month`)
-      replaces the alphabetical selection, `--skip-loaded` makes an interrupted
-      run cheap to resume, and the gate has the checks to tell whether the
-      result is clean:
+- [x] **Re-pulled the store clean, and the gate accepts it** (2026-08-16 on the
+      trading machine). Three defects overlapped in one dataset and no column
+      recorded which produced a row, so repair would have meant inferring
+      provenance from ambiguous timestamps; the answer was a clean re-pull.
+      **Result: ACCEPTED, 9 of 10, one non-blocking warning** — 128,357 bars and
+      514,247 settlements over 200 assets, 2021-08-01..2026-07-31 (5.00y), **one
+      ingestion run**, zero duplicates on both datasets, `price_agreement` and
+      `asset_identity` clean, 259 weekly universe snapshots with no empties after
+      the warm-up. The three defects are gone from the data, not just from the
+      code. Two items settled on the way, both below. The old store can now be
+      deleted:
 
       ```bash
       mv data/parquet data/parquet.pre-5.9
@@ -271,8 +267,30 @@ a fix — the gate was right to block.**
           --datasets ohlcv_daily,funding_rate --rank-by-liquidity --log-level INFO
       python -m universe.builder --venue binance --pit-mode event \
           --start 2021-09-01 --end <today> --freq weekly
-      python -m audit.acceptance --venue binance
+      python -m audit.acceptance --venue binance --allow-gapped-assets TLM,ICP
       ```
+
+      **`bar_gaps`: TLM and ICP are venue halts, not lost downloads.** TLM is
+      missing 2023-02-28..2023-03-30 (29d) and ICP 2022-08-31..2022-09-27 (26d).
+      Checked against the bucket: both symbols publish every month across the
+      window *and* the months are complete — **the missing days sit inside
+      published files**, so the archive has no bars for them either and there is
+      nothing to refetch. Binance suspended both perps for about four weeks.
+      Recorded with `--allow-gapped-assets TLM,ICP` rather than by loosening
+      `--max-gap-days` for all 200. Note this records the decision and does not
+      undo the trimming: `signals/bars.py` still starts TLM's usable history at
+      2023-03-30 and ICP's at 2022-09-27, which is correct and leaves both with
+      3+ years.
+      **A blind spot this exposed, one level below the one Phase 5.9 fixed:**
+      `classify_gap` compares a gap against the *months* the archive publishes,
+      so on this store it would answer "the archive publishes all these months
+      -> OURS, refetch this window" — confidently, and wrongly, for a halt. A
+      month-level check cannot see a within-month suspension. The comparison has
+      to be against the archive's actual **bar dates**. Not yet fixed
+      - [ ] Fix `classify_gap` to compare the gap's days against the archive's
+            bar dates rather than its published months, with TLM's real
+            2023-02-28..2023-03-30 hole as the fixture and the month-level
+            answer as the negative control
 - [x] Updated the methodology docs' §2 data-inputs sections to record that
       `ohlcv_daily` is perpetual, not spot: it changes what the backtest is a
       backtest *of*. All six, plus `TEMPLATE.md` so a new signal inherits the
@@ -1604,3 +1622,51 @@ the trigger table and the reasoning.
   §5 of every methodology doc is still empty and all six signals are still
   `draft`, for the same reason: the research in `DATA.md` §4 comes after an
   accepted backfill.
+- 2026-08-16: **The Phase 5.9 re-pull ran on the trading machine, and the gate
+  accepts the store: 9 of 10, one non-blocking warning, exit 0.** The last item
+  of the phase, and the only one that was never code.
+  128,357 bars and 514,247 funding settlements over **200 assets**,
+  2021-08-01..2026-07-31 (5.00y), in **one ingestion run**. Zero duplicates on
+  both datasets, `ohlcv_daily_price_agreement` clean at 0.1%, `asset_identity`
+  clean, 259 weekly universe snapshots at a 7-day cadence with no empties after
+  the listing-age warm-up, and a nightly that resumes from a real checkpoint.
+  The three defects are gone from the *data*, not only from the code: no
+  duplicate rows means no concurrent invocation raced for a partition file, no
+  price disagreement means no two listings merged onto one `asset_id` and no
+  spot closes spliced into a perpetual series, and 200 distinct `asset_id`s
+  against 200 pulled symbols means the canonicalisation is one rule.
+  **`bar_gaps` needed a decision, and the first answer was wrong.** Two assets
+  carry a hole: TLM 2023-02-28..2023-03-30 (29d) and ICP 2022-08-31..2022-09-27
+  (26d). Checking which *months* the bucket publishes said "all of them,
+  contiguous" — which reads as "a file we skipped, refetch it". That is the
+  wrong conclusion, because a month-level check cannot see a suspension *inside*
+  a month. Downloading both symbols' full five years from the archive and
+  diffing the bar dates settled it: the archive's own data carries exactly the
+  same two holes, to the day. Binance suspended both perps for about four weeks.
+  Nothing to refetch, so it is recorded as an operator decision —
+  `--allow-gapped-assets TLM,ICP` — rather than by loosening `--max-gap-days`
+  for all 200 assets. The trimming still applies: `signals/bars.py` starts TLM's
+  usable history at 2023-03-30 and ICP's at 2022-09-27, and both keep 3+ years.
+  **That is the same failure this phase is about, one level down, in code this
+  phase shipped.** Phase 5.9 fixed `classify_gap`'s first blind spot — checking
+  contiguity instead of the gap's dates — and left a second: it compares against
+  *months* when the question is *days*. On this store it would give a confident
+  wrong answer. Left unfixed and written down rather than quietly patched,
+  because it is a diagnostic whose whole value is being trustworthy about what
+  it can and cannot tell apart; the checklist item above says what the fix is.
+  **`universe_breadth` warns and should be read carefully:** min/median/max
+  members 33/59/150 against a `target_size` of 150. The maximum reaching the cap
+  says the recent end of the history is full; the median is dragged down by
+  2021-2022, when far fewer of the 200 symbols were listed at all. The check
+  compares a median across five years against a flat target, so **it cannot
+  separate "too few candidates were pulled" from "the venue genuinely listed
+  fewer perps back then"** — it will read low on a five-year history even after
+  a perfect pull. Non-blocking for that reason. Two ways to settle it, neither
+  taken yet: pull a wider candidate set (`--max-symbols 400 --rank-by-liquidity`)
+  so the pool is not the binding constraint at the recent end, or change the
+  check to measure members against the assets actually *listed* at each date,
+  which is the question it was trying to ask.
+  With the gate green, `data/parquet.pre-5.9` can be deleted. **Phase 5 is now
+  unblocked**: `DATA.md` §4's research steps — the walk-forward parameter grid
+  per signal in `--pit-mode event`, then the breadth report — are what fill §5
+  and §6 of the six methodology docs and take the signals out of `draft`.

@@ -1569,8 +1569,19 @@ the square root of breadth.
 
 ### Status
 
-Built, except the re-pull. `data/` is git-ignored and no store exists in the
-environment the fixes were written in, so `DATA.md` §9.5's four commands are an
-operator step on the trading machine. Until they run, the gate's verdict on the
-real store is the 3-of-7 block from 2026-08-03 — correctly, because that store
-has not changed.
+Complete. The fixes landed 2026-08-09; the re-pull ran on the trading machine on
+2026-08-16 and the gate accepts the store — 9 of 10, one non-blocking breadth
+warning, 200 assets over 5.00y in a single ingestion run with no duplicates, no
+price disagreement and no colliding `asset_id`s.
+
+Two things the run taught, both recorded in `TODO.md` rather than patched over.
+`bar_gaps` fired on TLM and ICP, and the archive turned out to carry the same
+holes to the day — Binance suspended both perps for about four weeks, so there
+was nothing to refetch and the gaps are an operator decision
+(`--allow-gapped-assets`). Reaching that answer meant diffing the archive's bar
+*dates*, because `classify_gap` compares published *months* and a month-level
+check cannot see a suspension inside a month: the same class of blind spot this
+phase fixed one level up, still present one level down. And `universe_breadth`
+warns at a median of 59 against a target of 150, which the check cannot
+attribute — a five-year median against a flat target conflates "too few
+candidates pulled" with "the venue listed fewer perps in 2021".
