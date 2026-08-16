@@ -17,6 +17,11 @@ Two things it deliberately is not:
   question about the load rather than about a decision, so they read the store
   raw. Duplicates are still collapsed with `datastore.latest_per_bar` before
   anything is counted — a bar stored twice is one bar.
+- **Not a shape report.** Phase 5.9's lesson: a count of duplicated rows is
+  consistent with a harmless re-run and with two defects, and a check that
+  cannot separate them leaves an operator holding a red result and no decision.
+  Every check here reports a verdict, and blocks only on the readings that are
+  actually defects — `audit/duplicates.py` does that classification.
 - **Not the nightly audit.** `DataAudit` runs every night over a bounded
   lookback window and can halt trading. This runs once after a backfill, over
   the whole history, and gates *research*. The overlap is deliberate and small:
@@ -40,8 +45,14 @@ from typing import cast
 
 import polars as pl
 
+from audit.duplicates import (
+    VALUE_COLUMN,
+    classify_duplicates,
+    disagreeing_bars,
+    find_concurrent_runs,
+)
 from config import DATASTORE_PATH, LOADER_CONFIG, LOG_CONFIG, UNIVERSE_CONFIG
-from datastore import ParquetStore, count_duplicate_bars, latest_per_bar
+from datastore import AssetMaster, ParquetStore, latest_per_bar
 from loaders.window import Coverage, FetchWindow, resume_window
 from logging_config import get_logger, new_run_id, set_level, set_run_id
 
@@ -85,6 +96,27 @@ class AcceptanceThresholds:
     # a thin *early* snapshot is just 2021 having fewer listed perps, so the
     # floor applies to the median across snapshots rather than to the minimum.
     min_median_universe_members: int = 20
+
+    # A median far below `UNIVERSE_CONFIG.target_size` clears the floor above
+    # while describing a materially thinner breadth machine than the config
+    # claims -- 0/64/139 against a target of 150 passed silently on the first
+    # real backfill, and the cause was upstream (alphabetical symbol selection).
+    # A warning, not a block: a smaller universe is a legitimate choice, an
+    # unnoticed one is not.
+    min_universe_share_of_target: float = 0.6
+
+    # Two copies of one bar differing by more than this are two different
+    # things, not two ingestions of one. Tight on purpose: a ticker collision
+    # shows a ratio in the hundreds, but spot-versus-perp -- the defect that
+    # hid for a whole phase -- is a fraction of a percent, so a threshold set
+    # to catch only the dramatic case would have missed the one that mattered.
+    price_disagreement_pct: float = 0.1
+
+    # Assets whose gaps the operator has looked at and accepted (a settled
+    # delisting, e.g. AUDIO). Recorded here so the decision is explicit and
+    # visible in the report rather than expressed by lowering max_gap_days for
+    # everything.
+    allow_gapped_assets: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -163,16 +195,31 @@ class AcceptanceReport:
 # ---------------------------------------------------------------------------
 
 
-def read_bars(store: ParquetStore, dataset: str, venue: str) -> pl.DataFrame:
-    """Every bar of `dataset` for `venue`, one row per bar, plus the raw count.
+def read_bars(
+    store: ParquetStore, dataset: str, venue: str, value_column: str | None = None
+) -> pl.DataFrame:
+    """Every raw row of `dataset` for `venue`, uncollapsed.
 
-    Raw rows are what `count_duplicate_bars` needs, so the collapse happens in
-    the caller that wants it collapsed rather than here.
+    Raw rows are what the duplicate and price checks need, so the collapse
+    happens in the caller that wants it collapsed rather than here.
+    `value_column` (`close`, `funding_rate`) is read only when a check needs it:
+    the columns are the read's whole cost on a store this size.
     """
+    columns = ["asset_id", "venue", "event_ts", "ingested_ts"]
+    if value_column:
+        columns.append(value_column)
     try:
-        df = store.read(dataset, columns=["asset_id", "venue", "event_ts", "ingested_ts"])
+        df = store.read(dataset, columns=columns)
     except FileNotFoundError:
         return pl.DataFrame()
+    except (pl.exceptions.ColumnNotFoundError, pl.exceptions.SchemaError):
+        # A dataset written before the column existed, or a fixture that only
+        # carries the timestamps: the value checks report "nothing to check"
+        # rather than the whole run failing to start.
+        try:
+            df = store.read(dataset, columns=columns[:-1] if value_column else columns)
+        except FileNotFoundError:
+            return pl.DataFrame()
 
     if len(df) and "venue" in df.columns:
         df = df.filter(pl.col("venue") == venue)
@@ -305,15 +352,24 @@ def check_funding_coverage(
     )
 
 
-def check_duplicate_bars(raw: pl.DataFrame, dataset: str) -> AcceptanceCheck:
-    """`count_duplicate_bars(df)` is 0 on a first archive run.
+def check_duplicate_bars(
+    raw: pl.DataFrame, dataset: str, concurrent: bool = False
+) -> AcceptanceCheck:
+    """Duplicated bars, classified into the causes that mean different things.
 
-    The archive publishes one file per (symbol, month) with no overlap, so a
-    first run cannot produce a duplicate: a non-zero count means the month loop
-    double-counted a boundary. A *re-run* of a window already loaded produces
-    them legitimately -- the store is append-only and readers collapse to the
-    latest ingestion -- so the message says which of the two it cannot tell
-    apart rather than pretending to know.
+    The raw count is not a verdict, and reporting it as one is what this check
+    used to do. Three causes produce the same number and only two are defects:
+
+    - **copies across runs that agree** -- a deliberate re-run of a window
+      already loaded. Expected under append-only storage, collapsed by
+      `latest_per_bar` on every read: a **warning**, not a block.
+    - **copies inside one ingestion run** -- either a loader emitting a bar
+      twice or (see `find_concurrent_runs`) two invocations running at once,
+      which risks a *lost* write rather than merely a duplicated one. Blocks.
+    - **copies that disagree on value** -- not a re-run of anything. Blocks.
+
+    Measured on the **raw** frame, before the `latest_per_bar` collapse every
+    other check runs behind: after it, this could only ever report zero.
     """
     if not len(raw):
         return AcceptanceCheck(
@@ -323,25 +379,158 @@ def check_duplicate_bars(raw: pl.DataFrame, dataset: str) -> AcceptanceCheck:
             blocking=False,
         )
 
-    duplicates = count_duplicate_bars(raw)
-    if duplicates == 0:
+    anatomy, _ = classify_duplicates(raw, dataset, concurrent=concurrent)
+    if not anatomy.duplicated:
         return AcceptanceCheck(
             name=f"{dataset}_duplicates",
             passed=True,
-            message=f"0 duplicate bars in {len(raw)} rows",
+            message=f"0 duplicate bars in {anatomy.rows} rows, {anatomy.runs} ingestion run(s)",
         )
 
-    unique = len(raw) - duplicates
+    share = 100.0 * anatomy.duplicated / anatomy.bars
+    summary = (
+        f"{anatomy.duplicated} of {anatomy.bars} bars stored more than once "
+        f"({share:.2f}%), across {anatomy.runs} ingestion run(s): {anatomy.verdict}"
+    )
+
+    if anatomy.blocking:
+        return AcceptanceCheck(
+            name=f"{dataset}_duplicates",
+            passed=False,
+            message=(
+                summary + ". Re-pull the window rather than repairing in place: "
+                "no column records which run wrote a given row."
+            ),
+        )
+
     return AcceptanceCheck(
         name=f"{dataset}_duplicates",
         passed=False,
+        blocking=False,
         message=(
-            f"{duplicates} of {len(raw)} rows repeat one of {unique} bars "
-            f"({100.0 * duplicates / len(raw):.2f}%). Expected 0 on a first archive "
-            f"run; this is either a month loop double-counting a boundary or a "
-            f"deliberate re-run of a window already loaded. Readers collapse to the "
-            f"latest ingestion either way, so it is not a correctness problem -- but "
-            f"on a first run it is a loader bug worth finding."
+            summary + ". Nothing to fix -- storing a re-fetched bar twice is what "
+            "append-only means, and every reader collapses to the latest ingestion."
+        ),
+    )
+
+
+def check_price_agreement(
+    raw: pl.DataFrame, dataset: str, thresholds: AcceptanceThresholds
+) -> AcceptanceCheck:
+    """No `(asset_id, event_ts)` carries two materially different prices.
+
+    The check nothing performed, and the one that would have caught both
+    identity defects at once. Two causes, both real and both found on the first
+    backfill (`DATA.md` §9.1, §9.2):
+
+    - **two listings under one `asset_id`** -- `1000CATUSDT` merged with
+      `CATUSDT` by a canonicalisation that stripped multiplier prefixes. The
+      ratio is enormous (7.1e5x for `CAT`) and impossible to miss once looked
+      for.
+    - **two instruments under one series** -- the ccxt loader reading spot while
+      the archive pulled perpetuals. This is the one worth setting a *tight*
+      threshold for: the two agree to a fraction of a percent, so it hid behind
+      every check that only asked whether the numbers were wildly different.
+    """
+    value = VALUE_COLUMN.get(dataset)
+    if not len(raw) or not value or value not in raw.columns:
+        return AcceptanceCheck(
+            name=f"{dataset}_price_agreement",
+            passed=True,
+            message="no rows to check",
+            blocking=False,
+        )
+
+    offenders = disagreeing_bars(raw, dataset, thresholds.price_disagreement_pct)
+    if not len(offenders):
+        return AcceptanceCheck(
+            name=f"{dataset}_price_agreement",
+            passed=True,
+            message=(
+                f"every repeated bar agrees on {value} to within "
+                f"{thresholds.price_disagreement_pct}%"
+            ),
+        )
+
+    assets = offenders["asset_id"].n_unique()
+    sample = "; ".join(
+        f"{row['asset_id']} {row['event_ts'].date()} {value} {row['low']:.8g} vs "
+        f"{row['high']:.8g} ({row['ratio']:.4g}x)"
+        for row in offenders.head(3).to_dicts()
+    )
+    return AcceptanceCheck(
+        name=f"{dataset}_price_agreement",
+        passed=False,
+        message=(
+            f"{len(offenders)} bar(s) across {assets} asset(s) carry two {value} "
+            f"values differing by more than {thresholds.price_disagreement_pct}%. "
+            f"A ratio of hundreds or thousands means two listings merged onto one "
+            f"asset_id; a fraction of a percent means two instruments (spot and "
+            f"perpetual) in one series. Worst: {sample}"
+        ),
+    )
+
+
+def check_asset_identity(store: ParquetStore, venue: str) -> AcceptanceCheck:
+    """No two venue symbols resolve to one `asset_id` in the asset master.
+
+    The store-side symptom of a collision is a price series that switches scale;
+    this asks the master directly, which is cheaper and names both symbols.
+    `AssetMaster.add_mapping` refuses new collisions, so a finding here is a
+    master built before the guard existed -- which is precisely the state the
+    re-pull is meant to leave behind.
+    """
+    path = store.root / "asset_master.parquet"
+    if not path.exists():
+        return AcceptanceCheck(
+            name="asset_identity",
+            passed=False,
+            blocking=False,
+            message=(
+                f"no asset master at {path}; nothing to check. The loaders write "
+                f"it as they register symbols, so an absent one means nothing has "
+                f"been ingested through them."
+            ),
+        )
+
+    collisions = [c for c in AssetMaster(path).find_collisions() if c.venue == venue]
+    if not collisions:
+        return AcceptanceCheck(
+            name="asset_identity",
+            passed=True,
+            message=f"no asset_id maps two different {venue} listings",
+        )
+
+    # Simultaneous listings are the defect; sequential ones are a rename, and
+    # also the Phase 10a trigger. Blocking on the second would stop every
+    # legitimate ticker change, which is the thing the asset master is for.
+    overlapping = [c for c in collisions if c.relation == "overlap"]
+    abutting = [c for c in collisions if c.is_redenomination_candidate]
+
+    if overlapping:
+        return AcceptanceCheck(
+            name="asset_identity",
+            passed=False,
+            message=(
+                f"{len(overlapping)} asset_id(s) map two {venue} listings that were "
+                f"live at the same time, so they are different assets sharing a "
+                f"ticker. Their bars are interleaved under one asset_id and "
+                f"latest_per_bar picks between them by ingestion time. "
+                + "; ".join(c.describe() for c in overlapping[:3])
+            ),
+        )
+
+    return AcceptanceCheck(
+        name="asset_identity",
+        passed=False,
+        blocking=False,
+        message=(
+            f"{len(abutting)} asset_id(s) map two sequential {venue} listings. That "
+            f"is a rename as far as the store is concerned, and the validity ranges "
+            f"express it -- but it is also the shape of a redenomination or a reused "
+            f"ticker, which need price adjustment (DATA.md section 10, Phase 10a). "
+            f"Check the seam before researching across it: "
+            + "; ".join(c.describe() for c in abutting[:3])
         ),
     )
 
@@ -391,6 +580,21 @@ def check_bar_gaps(
     )
 
     offenders = worst.filter(pl.col("worst_gap") > thresholds.max_gap_days)
+
+    # An accepted delisting is an operator decision, and recording it as one is
+    # better than lowering the threshold for every asset: the exemption is
+    # per asset, named, and printed in the message either way.
+    allowed = sorted(
+        set(offenders["asset_id"].to_list()) & set(thresholds.allow_gapped_assets)
+    )
+    if allowed:
+        offenders = offenders.filter(~pl.col("asset_id").is_in(allowed))
+    allowance = (
+        f" ({len(allowed)} allowed by --allow-gapped-assets: {', '.join(allowed)})"
+        if allowed
+        else ""
+    )
+
     if not len(offenders):
         biggest = int(cast(int, worst["worst_gap"].max())) if len(worst) else 0
         return AcceptanceCheck(
@@ -399,7 +603,7 @@ def check_bar_gaps(
             message=(
                 f"no asset has a gap > {thresholds.max_gap_days} days inside its "
                 f"listed range (worst is {biggest} day(s), across "
-                f"{len(worst)} assets)"
+                f"{len(worst)} assets)" + allowance
             ),
         )
 
@@ -417,6 +621,10 @@ def check_bar_gaps(
             f"signals/bars.py trims to the gap-free tail, so each of these has a "
             f"shorter usable history than its date range suggests. Worst: {sample}"
             + (f" (+{len(offenders) - 5} more)" if len(offenders) > 5 else "")
+            + allowance
+            + ". scratch/scratch_backfill_forensics.py --list-archive separates a "
+            "delisting (nothing to refetch; pass --allow-gapped-assets once you "
+            "have decided to keep the asset) from a month the loader skipped"
         ),
     )
 
@@ -469,9 +677,20 @@ def check_universe_snapshots(
     counts_by_date = {
         row["event_ts"].date(): row["members"] for row in members.to_dicts()
     }
-    empty = [d for d in dates if counts_by_date.get(d, 0) == 0]
     sizes = [counts_by_date.get(d, 0) for d in dates]
     median = int(statistics.median(sizes)) if sizes else 0
+
+    # Empties *before* the first populated snapshot are the
+    # `min_listing_age_days` warm-up, not the step-3 failure this check exists
+    # for: a history built from the same date as the first bar has no asset old
+    # enough to qualify for 30 days, and no amount of rebuilding removes that
+    # (append-only). Empties *after* it are a real failure -- the universe went
+    # from populated to empty, which nothing legitimate does.
+    populated = [d for d in dates if counts_by_date.get(d, 0) > 0]
+    first_populated = populated[0] if populated else None
+    empty = [d for d in dates if counts_by_date.get(d, 0) == 0]
+    warm_up = [d for d in empty if first_populated is None or d < first_populated]
+    empty_after = [d for d in empty if first_populated is not None and d > first_populated]
 
     if len(dates) < 2:
         return AcceptanceCheck(
@@ -499,13 +718,25 @@ def check_universe_snapshots(
             f"{len(holes)} gap(s) in an otherwise {cadence}-day cadence: {sample}"
             + (f" (+{len(holes) - 5} more)" if len(holes) > 5 else "")
         )
-    if empty:
+    if first_populated is None:
+        problems.append(f"no snapshot has any members ({len(empty)} empty)")
+    if empty_after:
         problems.append(
-            f"{len(empty)} snapshot(s) have no members (first {empty[0]})"
+            f"{len(empty_after)} snapshot(s) have no members after the universe "
+            f"was populated on {first_populated} (first {empty_after[0]})"
         )
     if median < thresholds.min_median_universe_members:
         problems.append(
             f"median {median} members < {thresholds.min_median_universe_members}"
+        )
+
+    note = ""
+    if warm_up:
+        note = (
+            f"; {len(warm_up)} leading snapshot(s) {warm_up[0]}..{warm_up[-1]} have no "
+            f"members -- the UNIVERSE_CONFIG.min_listing_age_days "
+            f"({UNIVERSE_CONFIG.min_listing_age_days}d) warm-up, not a failure. Build "
+            f"from a start date that far past the first bar to avoid them"
         )
 
     return AcceptanceCheck(
@@ -517,6 +748,71 @@ def check_universe_snapshots(
             f"{min(sizes)}/{median}/{max(sizes)} (target "
             f"{UNIVERSE_CONFIG.target_size})"
             + (f" -- {'; '.join(problems)}" if problems else "")
+            + note
+        ),
+    )
+
+
+def check_universe_breadth(
+    store: ParquetStore, venue: str, thresholds: AcceptanceThresholds
+) -> AcceptanceCheck:
+    """Is the universe anywhere near the size the config asks for?
+
+    A separate, non-blocking check because it is a separate question. The
+    snapshot check asks whether the rebuild *ran*; this asks whether the machine
+    it produced is the one `UNIVERSE_CONFIG.target_size` describes. The first
+    real backfill came back at a median of 64 against a target of 150 and
+    nothing said so -- the floor of 20 was cleared, the cadence was right, and
+    the shortfall was upstream, in an alphabetical symbol selection.
+
+    A smaller universe is a legitimate choice; an unnoticed one is a breadth
+    machine quietly running at 40%.
+    """
+    try:
+        df = store.read(UNIVERSE_DATASET, columns=["asset_id", "venue", "event_ts", "in_universe"])
+    except FileNotFoundError:
+        df = pl.DataFrame()
+
+    if len(df) and "venue" in df.columns:
+        df = df.filter(pl.col("venue") == venue)
+    if not len(df):
+        return AcceptanceCheck(
+            name="universe_breadth",
+            passed=True,
+            blocking=False,
+            message="no snapshots to size (universe_snapshots covers that)",
+        )
+
+    per_date = (
+        df.filter(pl.col("in_universe"))
+        .group_by("event_ts")
+        .agg(pl.col("asset_id").n_unique().alias("members"))
+    )
+    sizes = per_date["members"].to_list() or [0]
+    median = int(statistics.median(sizes))
+    target = UNIVERSE_CONFIG.target_size
+    floor = int(target * thresholds.min_universe_share_of_target)
+
+    if median >= floor:
+        return AcceptanceCheck(
+            name="universe_breadth",
+            passed=True,
+            message=f"median {median} members against a target of {target}",
+        )
+
+    return AcceptanceCheck(
+        name="universe_breadth",
+        passed=False,
+        blocking=False,
+        message=(
+            f"median {median} members is {100.0 * median / target:.0f}% of "
+            f"UNIVERSE_CONFIG.target_size ({target}); expected at least "
+            f"{floor}. The universe ranks by liquidity and cuts at the target, so "
+            f"a shortfall means it had too few candidates: the loaders pulled "
+            f"fewer symbols than the target, or pulled the wrong ones (the "
+            f"archive selects alphabetically unless --rank-by-liquidity or an "
+            f"explicit --symbols list is given). IR scales with the square root "
+            f"of breadth, so this is a real cost, not a cosmetic one."
         ),
     )
 
@@ -643,22 +939,41 @@ def run_acceptance_checks(
 
     logger.info("Running backfill acceptance checks for venue %s at %s", venue, store.root)
 
-    raw_bars = read_bars(store, OHLCV_DATASET, venue)
-    raw_funding = read_bars(store, FUNDING_DATASET, venue)
+    # The duplicate and price checks need the value column, so these reads are
+    # wider than the coverage checks require.
+    raw_bars = read_bars(store, OHLCV_DATASET, venue, value_column="close")
+    raw_funding = read_bars(store, FUNDING_DATASET, venue, value_column="funding_rate")
 
     # Collapse before counting anything: a bar stored twice is one bar. The
-    # duplicate checks take the raw frames, since the repeat is what they mean.
+    # duplicate and price checks take the raw frames, since the repeat is what
+    # they mean.
     bars = latest_per_bar(raw_bars)
     funding = latest_per_bar(raw_funding)
+
+    # Asked once, of both datasets together, because that is the only place the
+    # answer exists: one invocation loads its datasets in sequence, so clusters
+    # that overlap across datasets prove two processes were live.
+    concurrent = find_concurrent_runs(
+        {OHLCV_DATASET: raw_bars, FUNDING_DATASET: raw_funding}
+    )
+    if concurrent:
+        first, run_a, second, run_b = concurrent[0]
+        logger.warning(
+            "Concurrent ingestion detected: %s run %s..%s overlaps %s run %s..%s",
+            first, run_a.start, run_a.end, second, run_b.start, run_b.end,
+        )
 
     report = AcceptanceReport(
         checks=[
             check_ohlcv_coverage(bars, thresholds),
             check_funding_coverage(funding, bars, thresholds),
-            check_duplicate_bars(raw_bars, OHLCV_DATASET),
-            check_duplicate_bars(raw_funding, FUNDING_DATASET),
+            check_duplicate_bars(raw_bars, OHLCV_DATASET, concurrent=bool(concurrent)),
+            check_duplicate_bars(raw_funding, FUNDING_DATASET, concurrent=bool(concurrent)),
+            check_price_agreement(raw_bars, OHLCV_DATASET, thresholds),
+            check_asset_identity(store, venue),
             check_bar_gaps(bars, thresholds),
             check_universe_snapshots(store, venue, thresholds),
+            check_universe_breadth(store, venue, thresholds),
             check_nightly_resume(bars, venue, checkpoint_dir),
         ]
     )
@@ -715,6 +1030,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--max-gap-days", type=int, default=AcceptanceThresholds.max_gap_days
     )
+    parser.add_argument(
+        "--allow-gapped-assets",
+        default="",
+        help=(
+            "Comma-separated asset_ids whose gaps are an accepted delisting "
+            "(e.g. AUDIO). They are exempted from bar_gaps by name and listed "
+            "in the report -- an explicit operator decision rather than a "
+            "loosened threshold for everything"
+        ),
+    )
+    parser.add_argument(
+        "--max-price-disagreement-pct",
+        type=float,
+        default=AcceptanceThresholds.price_disagreement_pct,
+        help=(
+            "How far two copies of one bar may differ before they are two "
+            "different things (default: %(default)s%%)"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit the report as JSON")
     levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
     parser.add_argument("--log-level", choices=levels)
@@ -733,6 +1067,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_ohlcv_assets=args.min_assets,
         min_funding_assets=args.min_funding_assets,
         max_gap_days=args.max_gap_days,
+        price_disagreement_pct=args.max_price_disagreement_pct,
+        allow_gapped_assets=frozenset(
+            a.strip().upper() for a in args.allow_gapped_assets.split(",") if a.strip()
+        ),
     )
 
     try:

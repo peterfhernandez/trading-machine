@@ -8,6 +8,8 @@ Core principles:
 - Schema-enforced at write time
 """
 
+import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,36 @@ from polars import Schema
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _unique_filename(existing_count: int) -> str:
+    """A partition filename no concurrent writer can also choose.
+
+    The sequence number is kept because it makes a partition readable at a
+    glance — but it is decoration, not identity. Numbering *alone* is what let
+    two `python -m loaders.archive` processes both compute `data_0007.parquet`
+    from the same directory listing and race for it (`DATA.md` §9.3): the
+    module documents the two-*thread* case and appends on the calling thread,
+    and the identical argument for two *processes* was never enforced. The
+    suffix is what makes the name unique; nothing reads it.
+    """
+    return f"data_{existing_count:04d}_{uuid.uuid4().hex[:12]}.parquet"
+
+
+def _write_atomically(df: pl.DataFrame, path: Path) -> None:
+    """Write `path` via a temporary name so no reader ever sees it half-written.
+
+    `read` globs `*.parquet`, and the temporary carries a different suffix, so a
+    concurrent read either sees the whole file or does not see it at all.
+    `os.replace` is atomic within a directory on POSIX and Windows alike.
+    """
+    tmp_path = path.with_name(f".{path.stem}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        df.write_parquet(tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -104,10 +136,8 @@ class ParquetStore:
             part_path = dataset_path / f"date={part_date}"
             part_path.mkdir(parents=True, exist_ok=True)
 
-            # Check for existing files (no overwrites)
             existing_files = list(part_path.glob("*.parquet"))
-            file_num = len(existing_files)
-            file_path = part_path / f"data_{file_num:04d}.parquet"
+            file_path = part_path / _unique_filename(len(existing_files))
 
             if existing_files:
                 # Not an error, and not an overwrite: the partition already holds
@@ -118,8 +148,7 @@ class ParquetStore:
                     f"file(s); appending {file_path.name} beside them"
                 )
 
-            # Write without overwriting
-            part_df.write_parquet(file_path)
+            _write_atomically(part_df, file_path)
             logger.info(
                 f"Appended {len(part_df)} rows to {dataset}/date={part_date} -> {file_path.name}"
             )

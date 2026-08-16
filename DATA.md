@@ -595,17 +595,24 @@ A liquidity-ranked selection belongs in the re-pull.
 
 Given three overlapping defects in one dataset, repairing in place would mean
 reasoning about which defect produced each row, with no column recording the
-answer. The decision is a clean re-pull once the fixes land:
+answer. The decision is a clean re-pull once the fixes land.
+
+**The fixes landed on 2026-08-09; the re-pull has not run.** It needs the
+machine that holds the store, so it is the one operator step of Phase 5.9:
 
 ```bash
-# 1. keep the old store until the new one is accepted -- the factors,
-#    symbol sets and ingestion clusters can only be read from it
+# 1. keep the old store until the new one is accepted -- the symbol sets and
+#    ingestion clusters can only be read from it
 mv data/parquet data/parquet.pre-5.9
 
-# 2. re-pull, perps only, symbols chosen by liquidity rather than alphabet
+# 2. re-pull, perps only, symbols chosen by liquidity rather than alphabet.
+#    --rank-by-liquidity measures one month of klines per candidate and ranks
+#    by median close x volume -- the same dollar-volume definition
+#    universe/builder.py uses, so the candidate set is not cut along a
+#    different line from the universe that then ranks it. Pass --symbols
+#    instead if you have a ranking from elsewhere.
 python -m loaders.archive --market um --start 2021-08-01 --end <today> \
-    --datasets ohlcv_daily,funding_rate --symbols <liquidity-ranked list> \
-    --log-level INFO
+    --datasets ohlcv_daily,funding_rate --rank-by-liquidity --log-level INFO
 
 # 3. universe from past the listing-age warm-up
 python -m universe.builder --venue binance --pit-mode event \
@@ -616,6 +623,14 @@ python -m audit.acceptance --venue binance
 ```
 
 Do not delete `data/parquet.pre-5.9` until step 4 is green.
+
+Two things make a resumed or interrupted run cheap now, where the first attempt
+paid for both: `--skip-loaded` fetches only the (symbol, month) files the store
+does not already hold in full, and `ParquetStore.append` gives every file a
+unique name written through a rename, so two invocations can no longer race for
+one partition file. Running one at a time is still the better habit — concurrent
+runs duplicate work — but it is no longer the only thing standing between the
+store and a lost write.
 
 ---
 

@@ -19,16 +19,19 @@ from audit.acceptance import (
     AcceptanceError,
     AcceptanceReport,
     AcceptanceThresholds,
+    check_asset_identity,
     check_bar_gaps,
     check_duplicate_bars,
     check_funding_coverage,
     check_nightly_resume,
     check_ohlcv_coverage,
+    check_price_agreement,
+    check_universe_breadth,
     check_universe_snapshots,
     main,
     run_acceptance_checks,
 )
-from datastore import ParquetStore
+from datastore import AssetMaster, ParquetStore
 from loaders.schemas import FUNDING_RATE_SCHEMA, OHLCV_SCHEMA
 from universe.schema import UNIVERSE_SCHEMA
 
@@ -242,8 +245,11 @@ class TestAcceptedBackfill:
             "funding_rate_coverage",
             "ohlcv_daily_duplicates",
             "funding_rate_duplicates",
+            "ohlcv_daily_price_agreement",
+            "asset_identity",
             "bar_gaps",
             "universe_snapshots",
+            "universe_breadth",
             "nightly_resume",
         }
 
@@ -370,10 +376,11 @@ class TestDuplicateBars:
         assert check.passed
         assert "0 duplicate bars" in check.message
 
-    def test_a_double_counted_boundary_month_is_caught(self):
-        """What a month loop that re-reads its boundary produces: the same bar
-        twice, under two ingestions. The store keeps both by design, so nothing
-        upstream of here would ever raise."""
+    def test_a_re_run_of_a_loaded_window_warns_rather_than_blocks(self):
+        """Copies in different ingestion runs that agree on value are what
+        append-only storage does when a window is loaded twice. Every reader
+        collapses them, so there is nothing to fix -- and a gate that blocks on
+        it teaches an operator to ignore the gate."""
         first = make_bars(["BTC"], days=60)
         again = make_bars(["BTC"], days=60, ingested=INGESTED + timedelta(hours=1))
         raw = pl.concat([first, again.head(5)])
@@ -381,9 +388,49 @@ class TestDuplicateBars:
         check = check_duplicate_bars(raw, "ohlcv_daily")
 
         assert not check.passed
-        assert "5 of 65 rows" in check.message
-        # It must not claim to know which of the two causes this was.
+        assert not check.blocking
+        assert check.status == "WARN"
+        assert "5 of 60 bars" in check.message
         assert "re-run" in check.message
+
+    def test_copies_inside_one_run_block(self):
+        """A bar emitted twice by a single invocation is a loader defect, and
+        the message says so rather than offering both explanations."""
+        bars = make_bars(["BTC"], days=60)
+        raw = pl.concat([bars, bars.head(5)])
+
+        check = check_duplicate_bars(raw, "ohlcv_daily")
+
+        assert not check.passed
+        assert check.blocking
+        assert "single ingestion run" in check.message
+
+    def test_copies_that_disagree_block_whatever_the_runs_say(self):
+        """The reading that is a defect regardless of ingestion timing: two
+        rows for one bar carrying two different closes."""
+        first = make_bars(["CAT"], days=10)
+        second = make_bars(["CAT"], days=10, ingested=INGESTED + timedelta(hours=3))
+        second = second.with_columns(pl.col("close") * 1000.0)
+
+        check = check_duplicate_bars(pl.concat([first, second]), "ohlcv_daily")
+
+        assert not check.passed
+        assert check.blocking
+        assert "DISAGREE" in check.message
+
+    def test_concurrency_changes_the_verdict_not_the_count(self):
+        """Same bars, same counts; the verdict differs because overlapping
+        clusters mean two processes rather than one double-emitting run. This
+        is the distinction `RUN_GAP_MINUTES` alone cannot make."""
+        bars = make_bars(["BTC"], days=60)
+        raw = pl.concat([bars, bars.head(5)])
+
+        alone = check_duplicate_bars(raw, "ohlcv_daily", concurrent=False)
+        overlapping = check_duplicate_bars(raw, "ohlcv_daily", concurrent=True)
+
+        assert alone.blocking and overlapping.blocking
+        assert "single ingestion run" in alone.message
+        assert "concurrent invocations" in overlapping.message
 
     def test_it_is_measured_before_the_collapse(self, tmp_path):
         """`run_acceptance_checks` collapses for every other check, so this one
@@ -401,7 +448,7 @@ class TestDuplicateBars:
 
         duplicates = next(c for c in report.checks if c.name == "ohlcv_daily_duplicates")
         assert not duplicates.passed
-        assert "200 of 400 rows" in duplicates.message
+        assert "200 of 200 bars" in duplicates.message
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +485,41 @@ class TestBarGaps:
 
         assert check_bar_gaps(three, AcceptanceThresholds()).passed
         assert not check_bar_gaps(four, AcceptanceThresholds()).passed
+
+    def test_an_allowed_asset_is_exempted_by_name(self):
+        """A settled delisting (AUDIO: the perp stopped trading in 2024-05) is
+        an operator decision, and recording it as one keeps the threshold tight
+        for everything else. The exemption is printed either way, so it cannot
+        become an invisible loosening."""
+        bars = pl.concat(
+            [
+                make_bars(["AUDIO"], days=100, skip={"AUDIO": set(range(40, 80))}),
+                make_bars(["BTC"], days=100),
+            ]
+        )
+        strict = AcceptanceThresholds()
+        allowed = AcceptanceThresholds(allow_gapped_assets=frozenset({"AUDIO"}))
+
+        assert not check_bar_gaps(bars, strict).passed
+        check = check_bar_gaps(bars, allowed)
+        assert check.passed, check.message
+        assert "AUDIO" in check.message
+
+    def test_allowing_one_asset_does_not_excuse_another(self):
+        bars = pl.concat(
+            [
+                make_bars(["AUDIO"], days=100, skip={"AUDIO": set(range(40, 80))}),
+                make_bars(["BNX"], days=100, skip={"BNX": set(range(50, 71))}),
+            ]
+        )
+
+        check = check_bar_gaps(
+            bars, AcceptanceThresholds(allow_gapped_assets=frozenset({"AUDIO"}))
+        )
+
+        assert not check.passed
+        assert "BNX" in check.message
+        assert "1 allowed by --allow-gapped-assets" in check.message
 
     def test_a_late_listing_is_not_a_gap(self):
         """An asset listed two years in is not missing the first two years —
@@ -561,6 +643,173 @@ class TestUniverseSnapshots:
         assert check.passed, check.message
         assert "every 1 day(s)" in check.message
 
+    def test_leading_empties_are_the_listing_age_warm_up(self, tmp_path):
+        """The failure the gate reported on the first real backfill, which was
+        never a defect: a history built from the same date as the first bar has
+        30 days in which no asset is old enough to qualify. Append-only means
+        those six snapshots cannot be un-written, so the check has to know the
+        difference rather than wait for them to go away."""
+        dates = weekly_dates(30)
+        frame = make_universe(dates).with_columns(
+            pl.when(pl.col("event_ts").is_in(dates[:6]))
+            .then(False)
+            .otherwise(pl.col("in_universe"))
+            .alias("in_universe")
+        )
+        store = self._store(tmp_path, frame)
+
+        check = check_universe_snapshots(store, "binance", AcceptanceThresholds())
+
+        assert check.passed, check.message
+        assert "warm-up" in check.message
+        assert "6 leading snapshot(s)" in check.message
+
+    def test_an_empty_snapshot_after_a_populated_one_still_fails(self, tmp_path):
+        """The distinction the warm-up allowance must not blur: a universe that
+        goes from populated back to empty is the step-3 failure."""
+        dates = weekly_dates(30)
+        frame = make_universe(dates).with_columns(
+            pl.when(pl.col("event_ts").is_in(dates[:3] + [dates[20]]))
+            .then(False)
+            .otherwise(pl.col("in_universe"))
+            .alias("in_universe")
+        )
+        store = self._store(tmp_path, frame)
+
+        check = check_universe_snapshots(store, "binance", AcceptanceThresholds())
+
+        assert not check.passed
+        assert "after the universe was populated" in check.message
+
+    def test_every_snapshot_empty_is_still_a_failure(self, tmp_path):
+        dates = weekly_dates(10)
+        frame = make_universe(dates).with_columns(pl.lit(False).alias("in_universe"))
+        store = self._store(tmp_path, frame)
+
+        check = check_universe_snapshots(store, "binance", AcceptanceThresholds())
+
+        assert not check.passed
+        assert "no snapshot has any members" in check.message
+
+
+class TestUniverseBreadth:
+    """0/64/139 against a target of 150 passed silently once. Not again."""
+
+    def test_a_universe_near_the_target_passes(self, tmp_path):
+        store = ParquetStore(tmp_path / "parquet")
+        store.append(
+            "universe",
+            make_universe(weekly_dates(20), members_per_date=140),
+            UNIVERSE_SCHEMA,
+        )
+
+        check = check_universe_breadth(store, "binance", AcceptanceThresholds())
+
+        assert check.passed
+        assert "140 members" in check.message
+
+    def test_a_thin_universe_warns_without_blocking(self, tmp_path):
+        """Non-blocking on purpose: a smaller universe is a legitimate choice
+        and an unnoticed one is not. It names the upstream cause, because the
+        universe builder is not where the shortfall came from."""
+        store = ParquetStore(tmp_path / "parquet")
+        store.append(
+            "universe",
+            make_universe(weekly_dates(20), members_per_date=64),
+            UNIVERSE_SCHEMA,
+        )
+
+        check = check_universe_breadth(store, "binance", AcceptanceThresholds())
+
+        assert not check.passed
+        assert not check.blocking
+        assert "43% of UNIVERSE_CONFIG.target_size" in check.message
+        assert "--rank-by-liquidity" in check.message
+
+
+# ---------------------------------------------------------------------------
+# Two prices for one bar — the check that catches both identity defects
+# ---------------------------------------------------------------------------
+
+
+class TestPriceAgreement:
+    def test_identical_copies_pass(self):
+        bars = make_bars(["BTC"], days=30)
+        raw = pl.concat([bars, bars])
+
+        check = check_price_agreement(raw, "ohlcv_daily", AcceptanceThresholds())
+
+        assert check.passed
+
+    def test_a_merged_ticker_is_caught_by_its_ratio(self):
+        """`1000CATUSDT` and `CATUSDT` under one asset_id: 0.001336 against
+        950.37 on the same day, which is not a revision of anything."""
+        first = make_bars(["CAT"], days=30)
+        second = make_bars(["CAT"], days=30).with_columns(pl.col("close") * 1000.0)
+
+        check = check_price_agreement(
+            pl.concat([first, second]), "ohlcv_daily", AcceptanceThresholds()
+        )
+
+        assert not check.passed
+        assert check.blocking
+        assert "1000x" in check.message.replace("1e+03x", "1000x")
+
+    def test_spot_against_perp_is_caught_although_it_is_tiny(self):
+        """The defect that hid for a phase. Spot and perp closes agree to a
+        fraction of a percent, so a check tuned only for the dramatic case
+        would pass this -- which is exactly what every earlier check did."""
+        spot = make_bars(["ETH"], days=30)
+        perp = make_bars(["ETH"], days=30, ingested=INGESTED + timedelta(hours=2))
+        perp = perp.with_columns(pl.col("close") * 1.004)  # 40 bps of basis
+
+        check = check_price_agreement(
+            pl.concat([spot, perp]), "ohlcv_daily", AcceptanceThresholds()
+        )
+
+        assert not check.passed
+        assert "two instruments" in check.message
+
+    def test_a_revision_inside_the_tolerance_passes(self):
+        """A genuine vendor revision is a rounding difference, and blocking on
+        one would make the check something an operator learns to override."""
+        first = make_bars(["BTC"], days=30)
+        revised = make_bars(["BTC"], days=30).with_columns(pl.col("close") * 1.0001)
+
+        check = check_price_agreement(
+            pl.concat([first, revised]), "ohlcv_daily", AcceptanceThresholds()
+        )
+
+        assert check.passed
+
+
+class TestAssetIdentity:
+    def test_a_master_with_one_symbol_per_asset_passes(self, tmp_path):
+        store = ParquetStore(tmp_path / "parquet")
+        master = AssetMaster(store.root / "asset_master.parquet")
+        master.add_mapping("BTC", "binance", "BTCUSDT", datetime(2021, 1, 1))
+        master.add_mapping("BTC", "binance", "BTC/USDT:USDT", datetime(2021, 1, 1))
+
+        check = check_asset_identity(store, "binance")
+
+        assert check.passed, check.message
+
+    def test_two_listings_under_one_asset_id_block(self, tmp_path):
+        """What the pre-5.9 master carries. `add_mapping` refuses new ones, so
+        this can only be a master built before the guard existed -- which is
+        the state the re-pull exists to leave behind."""
+        store = ParquetStore(tmp_path / "parquet")
+        master = AssetMaster(store.root / "asset_master.parquet")
+        master.add_mapping("CAT", "binance", "CATUSDT", datetime(2026, 7, 1))
+        master.add_mapping(
+            "CAT", "binance", "1000CATUSDT", datetime(2024, 10, 1), allow_collision=True
+        )
+
+        check = check_asset_identity(store, "binance")
+
+        assert not check.passed
+        assert "1000CATUSDT" in check.message and "CATUSDT" in check.message
+
 
 # ---------------------------------------------------------------------------
 # Nightly resume
@@ -661,7 +910,7 @@ class TestReport:
         payload = json.loads(json.dumps(report.to_dict()))
 
         assert payload["passed"] is True
-        assert len(payload["checks"]) == 7
+        assert len(payload["checks"]) == 10
 
 
 class TestCli:

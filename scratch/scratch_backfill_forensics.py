@@ -9,16 +9,23 @@ from a month the loader skipped. Both distinctions matter — one pair is
 harmless and the other is a bug — and neither is answerable from the numbers
 the gate prints. Both are answerable from the store.
 
-So this asks the four follow-up questions the gate leaves open:
+So this asks the follow-up questions the gate leaves open:
 
+0. **Were two invocations running at once?** Asked first because it changes the
+   meaning of everything after it. `RUN_GAP_MINUTES` merges appends closer than
+   half an hour, so two *overlapping* invocations look like one long run and
+   their duplicates look like a within-run double-emit — which is exactly the
+   wrong answer this script gave the first time it was used (`DATA.md` §9.3).
+   Ingestion clusters that overlap across datasets settle it, because one
+   invocation loads its datasets in sequence.
 1. **Duplicates — one run or two?** Every archive append stamps `ingested_ts`
    at the moment its file was parsed, so one `python -m loaders.archive`
    invocation leaves a tight cluster of ingestion timestamps and two
    invocations are minutes or hours apart. If a duplicated bar's copies fall
    in *different* clusters the store was loaded twice, which is expected under
    append-only storage and collapsed on read. If they fall in the *same*
-   cluster, one run emitted the bar twice, which is the loader bug worth
-   finding.
+   cluster, one run emitted the bar twice — unless question 0 says the cluster
+   holds two processes.
 2. **Duplicates — do the copies agree?** Two rows for one `(asset_id,
    event_ts)` carrying different closes are not a re-run of anything. The
    likeliest cause is two archive symbols collapsing onto one `asset_id`
@@ -26,12 +33,15 @@ So this asks the four follow-up questions the gate leaves open:
    renamed contract can collide with its own predecessor), and that one *is* a
    correctness problem: `latest_per_bar` picks the latest ingestion, which
    between two price scales is an arbitrary choice.
-3. **Gaps — did the archive publish those months at all?** A hole spanning
-   months the bucket never published is a delisting, and the only decision to
-   make is whether to keep the asset. A hole inside months that *are*
-   published is a file the loader skipped — `loaders/archive.py` logs and
-   continues on a corrupt or missing file, by design — and it can be refetched.
-   `--list-archive` answers this live, for the offending symbols only.
+3. **Gaps — did the archive publish *those* months?** A hole spanning months
+   the bucket never published is a delisting, and the only decision to make is
+   whether to keep the asset (`--allow-gapped-assets` on the gate records it).
+   A hole inside months that *are* published is a file the loader skipped —
+   `loaders/archive.py` logs and continues on a corrupt or missing file, by
+   design — and it can be refetched. `--list-archive` answers this live, for the
+   offending symbols only, comparing the listing against **the gap's own dates**
+   rather than merely checking the published months are contiguous, which is
+   how it previously called `AUDIO`'s delisting a file we had skipped.
 4. **Universe — which rule emptied the early snapshots?** Every snapshot row
    carries its own `exclusion_reason`, so an empty snapshot says why it is
    empty without anything having to be re-derived.
@@ -59,6 +69,12 @@ import polars as pl
 from log_demo import start_demo_run
 
 from audit.acceptance import AcceptanceThresholds
+from audit.duplicates import (
+    RUN_GAP_MINUTES,
+    classify_duplicates,
+    find_concurrent_runs,
+    label_runs,
+)
 from config import DATASTORE_PATH, PAPER
 from datastore import ParquetStore, latest_per_bar
 from logging_config import get_logger
@@ -81,12 +97,6 @@ UNIVERSE_DATASET = "universe"
 # appends per symbol as its downloads complete, so within a run the spacing is
 # seconds; between runs it is however long the operator took to type the next
 # command. Half an hour is comfortably outside the first and inside the second.
-RUN_GAP_MINUTES = 30
-
-# The value column whose disagreement means two symbols collided on one
-# asset_id, per dataset.
-VALUE_COLUMN = {OHLCV_DATASET: "close", FUNDING_DATASET: "funding_rate"}
-
 SEPARATOR = "=" * 78
 
 
@@ -96,46 +106,14 @@ def heading(text: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Ingestion runs
+#
+# `cluster_runs`, `label_runs`, `classify_duplicates` and `find_concurrent_runs`
+# were written here and now live in `audit/duplicates.py`: the acceptance gate
+# needs the same classification to report a verdict rather than a shape, and a
+# gate and a diagnostic disagreeing about what a duplicate *is* would be the
+# Phase 5.9 defect in miniature. What stays here is the printing, the gap
+# analysis, and the archive comparison.
 # ---------------------------------------------------------------------------
-
-
-def cluster_runs(
-    stamps: list[datetime], gap_minutes: int = RUN_GAP_MINUTES
-) -> list[tuple[datetime, datetime]]:
-    """Group ingestion timestamps into the invocations that produced them.
-
-    One `[start, end]` per cluster, oldest first. The clustering is the whole
-    diagnostic: `ingested_ts` is stamped per file parsed, so it is the only
-    record the store keeps of *which run* a row came from.
-    """
-    runs: list[list[datetime]] = []
-    for ts in sorted(stamps):
-        if runs and (ts - runs[-1][1]) <= timedelta(minutes=gap_minutes):
-            runs[-1][1] = ts
-        else:
-            runs.append([ts, ts])
-    return [(lo, hi) for lo, hi in runs]
-
-
-def label_runs(df: pl.DataFrame, gap_minutes: int = RUN_GAP_MINUTES) -> pl.DataFrame:
-    """Add a `run` column naming which ingestion cluster each row belongs to."""
-    stamps = df.select("ingested_ts").unique()["ingested_ts"].to_list()
-    runs = cluster_runs(stamps, gap_minutes)
-
-    index: dict[datetime, int] = {}
-    for i, (lo, hi) in enumerate(runs):
-        for ts in stamps:
-            if lo <= ts <= hi:
-                index[ts] = i
-
-    mapping = pl.DataFrame(
-        {
-            "ingested_ts": list(index.keys()),
-            "run": list(index.values()),
-        },
-        schema={"ingested_ts": df.schema["ingested_ts"], "run": pl.Int64},
-    )
-    return df.join(mapping, on="ingested_ts", how="left")
 
 
 def describe_runs(df: pl.DataFrame, gap_minutes: int = RUN_GAP_MINUTES) -> None:
@@ -168,104 +146,50 @@ def describe_runs(df: pl.DataFrame, gap_minutes: int = RUN_GAP_MINUTES) -> None:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class DuplicateAnatomy:
-    """What a dataset's duplicate bars are, split by the two questions.
+def diagnose_concurrency(
+    frames: dict[str, pl.DataFrame], gap_minutes: int = RUN_GAP_MINUTES
+) -> list:
+    """Were two `loaders.archive` processes live at the same time?
 
-    `cross_run` and `same_run` partition the duplicated bars by whether their
-    copies came from one `loaders.archive` invocation or more than one — the
-    distinction `audit/acceptance.py` says in its own message that it cannot
-    make. `disagreeing` is orthogonal to both and is the one that means a
-    defect regardless of the answer.
+    The question the first version of this script could not ask, and got wrong
+    by not asking: `RUN_GAP_MINUTES` merges anything closer than half an hour,
+    so two overlapping invocations read as one long run and their duplicates
+    read as a within-run double-emit. One invocation loads its datasets in
+    sequence, so ingestion clusters that overlap *across* datasets are proof
+    of a second process — no threshold required.
     """
+    heading("0. Were two invocations running at once?")
 
-    rows: int
-    bars: int
-    duplicated: int
-    cross_run: int
-    same_run: int
-    same_run_on_month_boundary: int
-    disagreeing: int
-    value_column: str | None
-    runs: int
-
-    @property
-    def verdict(self) -> str:
-        if not self.duplicated:
-            return "no duplicates"
-        if self.disagreeing:
-            return "copies disagree on value -- two symbols on one asset_id"
-        if self.same_run and not self.cross_run:
-            return "one run emitted each bar twice -- a loader bug"
-        if self.cross_run and not self.same_run:
-            return "a re-run of a window already loaded -- expected, collapsed on read"
-        return "both a re-run and within-run repeats"
-
-
-def classify_duplicates(
-    raw: pl.DataFrame, dataset: str, gap_minutes: int = RUN_GAP_MINUTES
-) -> tuple[DuplicateAnatomy, pl.DataFrame]:
-    """Split the duplicated bars into the categories that mean different things.
-
-    Returns the counts and the per-bar frame behind them (`asset_id`,
-    `event_ts`, `copies`, `runs`, and `distinct_values` where the dataset has a
-    value column), so a caller can print examples without recomputing.
-    """
-    if not len(raw):
-        return (
-            DuplicateAnatomy(0, 0, 0, 0, 0, 0, 0, VALUE_COLUMN.get(dataset), 0),
-            pl.DataFrame(),
+    overlaps = find_concurrent_runs(frames, gap_minutes)
+    if not overlaps:
+        print(
+            "  No ingestion cluster in one dataset overlaps a cluster in another.\n"
+            "  (Absence of proof only: a dataset written in a single instant carries\n"
+            "  no interval to overlap with.)"
         )
+        return overlaps
 
-    labelled = label_runs(raw, gap_minutes)
-    value = VALUE_COLUMN.get(dataset)
-    aggs = [pl.len().alias("copies"), pl.col("run").n_unique().alias("runs")]
-    if value and value in labelled.columns:
-        aggs.append(pl.col(value).n_unique().alias("distinct_values"))
-
-    per_bar = labelled.group_by(["asset_id", "event_ts"]).agg(aggs)
-    duplicated = per_bar.filter(pl.col("copies") > 1)
-    same_run = duplicated.filter(pl.col("runs") == 1)
-
-    # A month loop that double-counts its boundary repeats the first and/or
-    # last bar of a month and nothing else, so the boundary rate among the
-    # within-run offenders separates that from a symbol planned twice.
-    boundary = 0
-    if len(same_run):
-        boundary = int(
-            same_run.select(
-                (
-                    (pl.col("event_ts").dt.day() == 1)
-                    | (
-                        pl.col("event_ts").dt.offset_by("1d").dt.month()
-                        != pl.col("event_ts").dt.month()
-                    )
-                ).sum()
-            ).item()
+    print(f"  {len(overlaps)} overlapping cluster pair(s) -- at least two processes:")
+    for first, run_a, second, run_b in overlaps[:5]:
+        print(
+            f"    {first} {run_a.start:%Y-%m-%d %H:%M} +{run_a.minutes:.1f}min "
+            f"overlaps {second} {run_b.start:%Y-%m-%d %H:%M} +{run_b.minutes:.1f}min"
         )
-
-    disagreeing = (
-        len(duplicated.filter(pl.col("distinct_values") > 1))
-        if "distinct_values" in duplicated.columns
-        else 0
+    print(
+        "\n  Duplicates 'inside one run' below are therefore ambiguous: the cluster\n"
+        "  spans two invocations. Two further tells, both cheap: an interrupted\n"
+        "  second pass stops part-way through the alphabet (a double-emit has no\n"
+        "  reason to), and a colliding archive symbol would show up in section 1-2\n"
+        "  as disagreeing values."
     )
-
-    anatomy = DuplicateAnatomy(
-        rows=len(raw),
-        bars=len(per_bar),
-        duplicated=len(duplicated),
-        cross_run=len(duplicated.filter(pl.col("runs") > 1)),
-        same_run=len(same_run),
-        same_run_on_month_boundary=boundary,
-        disagreeing=disagreeing,
-        value_column=value if value in labelled.columns else None,
-        runs=int(labelled["run"].n_unique()),
-    )
-    return anatomy, per_bar
+    return overlaps
 
 
 def diagnose_duplicates(
-    raw: pl.DataFrame, dataset: str, gap_minutes: int = RUN_GAP_MINUTES
+    raw: pl.DataFrame,
+    dataset: str,
+    gap_minutes: int = RUN_GAP_MINUTES,
+    concurrent: bool = False,
 ) -> None:
     """Separate a re-run from a loader bug, and both from a symbol collision."""
     heading(f"1-2. Duplicate bars in {dataset}")
@@ -275,7 +199,7 @@ def diagnose_duplicates(
         return
 
     describe_runs(raw, gap_minutes)
-    anatomy, per_bar = classify_duplicates(raw, dataset, gap_minutes)
+    anatomy, per_bar = classify_duplicates(raw, dataset, gap_minutes, concurrent)
     duplicated = per_bar.filter(pl.col("copies") > 1)
 
     print(
@@ -306,7 +230,12 @@ def diagnose_duplicates(
     )
     print(
         f"  copies within a single ingestion run:  {anatomy.same_run:,} bar(s)"
-        f"  <- one run emitted the bar twice"
+        + (
+            "  <- CLUSTERS OVERLAP ACROSS DATASETS: concurrent invocations, not a"
+            "\n     within-run double-emit"
+            if anatomy.concurrent
+            else "  <- one run emitted the bar twice"
+        )
     )
 
     if anatomy.same_run:
@@ -495,8 +424,78 @@ def _symbols_by_asset(datastore: Path) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in mapping.items()}
 
 
+@dataclass(frozen=True)
+class GapVerdict:
+    """What the archive's own listing says about one hole in an asset's history."""
+
+    symbol: str
+    published_months: tuple[str, ...]
+    gap_months: tuple[str, ...]
+    missing_from_archive: tuple[str, ...]
+    available_in_archive: tuple[str, ...]
+    starts_after_last_published: bool
+
+    @property
+    def verdict(self) -> str:
+        if not self.published_months:
+            return "nothing published for this symbol at all"
+        if self.starts_after_last_published:
+            return (
+                f"the gap begins after {self.published_months[-1]}, the last month "
+                f"the archive ever published -- DELISTED, nothing to refetch"
+            )
+        if not self.available_in_archive:
+            return "the archive published none of these months -- delisted or not listed"
+        if not self.missing_from_archive:
+            return (
+                f"the archive publishes all {len(self.available_in_archive)} of these "
+                f"months -- OURS, refetch this window"
+            )
+        return (
+            f"mixed: {', '.join(self.available_in_archive)} exist and are missing from "
+            f"the store (refetch); {', '.join(self.missing_from_archive)} were never "
+            f"published (delisting)"
+        )
+
+
+def classify_gap(
+    symbol: str, published: list[str], previous: datetime, following: datetime
+) -> GapVerdict:
+    """Compare a gap against the months the archive publishes *for that gap*.
+
+    The blind spot this replaces: the first version only asked whether the
+    published months were *contiguous* between the symbol's first and last, and
+    never compared them against the gap's own dates. So for `AUDIO` — whose
+    hole starts in 2024-05 and whose last published month **is** 2024-05 — it
+    saw an unbroken run of published months and reported "contiguous, the hole
+    is ours, refetch that window". The perp had been delisted and there was
+    nothing to refetch; the bars after the hole were spot rows from the ccxt
+    loader (`DATA.md` §9.2).
+
+    The decisive comparison is the one it was not making: does the gap begin
+    after the last month the archive ever published? A diagnostic's own
+    assumptions are part of what a diagnosis has to check.
+    """
+    gap_months = sorted(_months_between(_as_month(previous), _as_month(following)))
+    published_set = set(published)
+    starts_after_last = bool(published) and _as_month(previous) >= published[-1]
+
+    return GapVerdict(
+        symbol=symbol,
+        published_months=tuple(published),
+        gap_months=tuple(gap_months),
+        missing_from_archive=tuple(m for m in gap_months if m not in published_set),
+        available_in_archive=tuple(m for m in gap_months if m in published_set),
+        starts_after_last_published=starts_after_last,
+    )
+
+
+def _as_month(moment: datetime) -> str:
+    return f"{moment.year:04d}-{moment.month:02d}"
+
+
 def _compare_against_archive(holes: pl.DataFrame, symbols: dict[str, list[str]]) -> None:
-    """Ask the bucket which months it publishes for each offending symbol.
+    """Ask the bucket which months it publishes across each hole.
 
     Live, and the only part of this script that touches the network. It is a
     listing call per affected symbol — a handful of requests, no key, no rate
@@ -505,29 +504,40 @@ def _compare_against_archive(holes: pl.DataFrame, symbols: dict[str, list[str]])
     """
     from loaders.archive import KLINES, BinanceVisionLoader
 
-    print("\n  Months published by the archive for the offending symbols:")
+    print("\n  What the archive publishes across each gap:")
     loader = BinanceVisionLoader(market="um")
-    for asset_id in holes["asset_id"].unique().to_list():
-        for symbol in symbols.get(asset_id, []):
-            try:
-                months = loader.list_months(symbol, KLINES)
-            except Exception as e:  # a listing failure must not end the report
-                print(f"    {symbol}: could not list ({e})")
-                continue
-            if not months:
-                print(f"    {symbol}: nothing published")
-                continue
-            published = set(months)
-            expected = _months_between(months[0], months[-1])
-            unpublished = sorted(expected - published)
-            print(
-                f"    {symbol}: {len(months)} month(s) {months[0]}..{months[-1]}"
-                + (
-                    f"; NOT published: {', '.join(unpublished)}  <- delisted, nothing to refetch"
-                    if unpublished
-                    else "; contiguous  <- the hole is ours, refetch that window"
-                )
+    listings: dict[str, list[str]] = {}
+
+    for row in holes.iter_rows(named=True):
+        for symbol in symbols.get(row["asset_id"], []):
+            if symbol not in listings:
+                try:
+                    listings[symbol] = loader.list_months(symbol, KLINES)
+                except Exception as e:  # a listing failure must not end the report
+                    print(f"    {symbol}: could not list ({e})")
+                    listings[symbol] = []
+            published = listings[symbol]
+            verdict = classify_gap(
+                symbol,
+                published,
+                _to_datetime(row["previous"]),
+                _to_datetime(row["bar_date"]),
             )
+            span = (
+                f"{published[0]}..{published[-1]} ({len(published)} month(s))"
+                if published
+                else "nothing published"
+            )
+            print(
+                f"    {symbol}: archive has {span}; gap spans "
+                f"{verdict.gap_months[0]}..{verdict.gap_months[-1]}"
+            )
+            print(f"      -> {verdict.verdict}")
+
+
+def _to_datetime(value) -> datetime:
+    """A polars `date` column yields `datetime.date`; the month maths wants both."""
+    return value if isinstance(value, datetime) else datetime(value.year, value.month, 1)
 
 
 def _months_between(first: str, last: str) -> set[str]:
@@ -635,16 +645,25 @@ def build_report(
     print(f"Backfill forensics: store={store.root}, venue={venue}")
     print(f"Datasets: {', '.join(sorted(store.list_datasets()))}")
 
+    frames: dict[str, pl.DataFrame] = {}
     for dataset in (OHLCV_DATASET, FUNDING_DATASET):
         try:
             raw = store.read(dataset)
         except FileNotFoundError:
-            heading(f"1-2. Duplicate bars in {dataset}")
-            print("  dataset not in the store")
+            frames[dataset] = pl.DataFrame()
             continue
         if len(raw) and "venue" in raw.columns:
             raw = raw.filter(pl.col("venue") == venue)
-        diagnose_duplicates(raw, dataset, gap_minutes)
+        frames[dataset] = raw
+
+    concurrent = diagnose_concurrency(frames, gap_minutes)
+
+    for dataset, raw in frames.items():
+        if not len(raw):
+            heading(f"1-2. Duplicate bars in {dataset}")
+            print("  dataset not in the store")
+            continue
+        diagnose_duplicates(raw, dataset, gap_minutes, concurrent=bool(concurrent))
 
     try:
         bars = latest_per_bar(
@@ -662,14 +681,22 @@ def build_report(
     print(
         "  - duplicates that span runs and agree on value: expected under\n"
         "    append-only storage, collapsed by `latest_per_bar` on every read.\n"
-        "    Nothing to fix in the loader.\n"
-        "  - duplicates inside one run, or that disagree on value: a real defect.\n"
-        "    Disagreeing copies mean two archive symbols share one asset_id, and\n"
+        "    Nothing to fix in the loader; the gate warns rather than blocking.\n"
+        "  - duplicates inside one run, or that disagree on value: a real defect,\n"
+        "    and the gate blocks on both. Disagreeing copies mean two listings\n"
+        "    share one asset_id, or two instruments share one series, and\n"
         "    `latest_per_bar` is choosing between them by ingestion time.\n"
-        "  - gaps over months the archive never published: a delisting.\n"
+        "  - overlapping ingestion clusters: two processes wrote the same\n"
+        "    partition. `ParquetStore.append` now names files uniquely, so that\n"
+        "    can no longer lose a write -- but a store loaded before that fix has\n"
+        "    no record of which run wrote what, which is why the answer is a\n"
+        "    clean re-pull rather than a repair.\n"
+        "  - gaps over months the archive never published: a delisting. Record it\n"
+        "    with `--allow-gapped-assets` on the gate rather than loosening\n"
+        "    --max-gap-days for every asset.\n"
         "  - empty universe snapshots before the first populated one: the\n"
-        "    min_listing_age_days warm-up, and rebuilding from a later --start is\n"
-        "    the fix. Empty ones after it are not, and need explaining."
+        "    min_listing_age_days warm-up, which the gate now treats as such.\n"
+        "    Empty ones after it are not, and need explaining."
     )
     return 0
 

@@ -173,6 +173,146 @@ class TestParquetStore:
         info = store.dataset_info("ohlcv")
         assert info["row_count"] == 2
 
+    def test_two_writers_racing_on_one_partition_lose_nothing(self, tmp_store_path):
+        """Two *processes* pick their filename from the same directory listing.
+
+        `append` numbered its output from the count already in the partition, so
+        two concurrent `python -m loaders.archive` runs both computed
+        `data_0007.parquet` and one clobbered the other (`DATA.md` §9.3). The
+        module documented the two-*thread* case and appended on the calling
+        thread; nothing covered the case that actually happened.
+
+        Simulated deterministically here — the two writers are interleaved by
+        hand rather than by luck — because a race reproduced by threads is a
+        test that passes on a fast machine.
+        """
+        store = ParquetStore(tmp_store_path)
+        schema = DatasetSchema(
+            name="ohlcv",
+            fields={
+                "asset_id": pl.Utf8,
+                "close": pl.Float64,
+                "event_ts": pl.Datetime("us"),
+                "ingested_ts": pl.Datetime("us"),
+            },
+        )
+        base_time = datetime(2024, 1, 1)
+
+        def frame(asset: str) -> pl.DataFrame:
+            return pl.DataFrame(
+                {
+                    "asset_id": [asset],
+                    "close": [1.0],
+                    "event_ts": [base_time],
+                    "ingested_ts": [base_time],
+                }
+            )
+
+        # Both writers see an empty partition, then both write.
+        original = pl.DataFrame.write_parquet
+        seen: list[str] = []
+
+        def spy(self, path, *args, **kwargs):
+            seen.append(str(path))
+            return original(self, path, *args, **kwargs)
+
+        pl.DataFrame.write_parquet = spy
+        try:
+            store.append("ohlcv", frame("BTC"), schema)
+            store.append("ohlcv", frame("ETH"), schema)
+        finally:
+            pl.DataFrame.write_parquet = original
+
+        partition = tmp_store_path / "ohlcv" / "date=2024-01-01"
+        assert len(list(partition.glob("*.parquet"))) == 2
+        assert len(set(seen)) == 2, "two appends must never choose one filename"
+        assert sorted(store.read("ohlcv")["asset_id"].to_list()) == ["BTC", "ETH"]
+
+    def test_a_reader_never_sees_a_half_written_file(self, tmp_store_path):
+        """Written to a temporary name and renamed into place, so a `*.parquet`
+        glob either finds the whole file or does not find it."""
+        store = ParquetStore(tmp_store_path)
+        schema = DatasetSchema(
+            name="ohlcv",
+            fields={
+                "asset_id": pl.Utf8,
+                "close": pl.Float64,
+                "event_ts": pl.Datetime("us"),
+                "ingested_ts": pl.Datetime("us"),
+            },
+        )
+        base_time = datetime(2024, 1, 1)
+        partition = tmp_store_path / "ohlcv" / "date=2024-01-01"
+
+        original = pl.DataFrame.write_parquet
+        during: list[list[str]] = []
+
+        def spy(self, path, *args, **kwargs):
+            result = original(self, path, *args, **kwargs)
+            during.append([p.name for p in partition.glob("*.parquet")])
+            return result
+
+        pl.DataFrame.write_parquet = spy
+        try:
+            store.append(
+                "ohlcv",
+                pl.DataFrame(
+                    {
+                        "asset_id": ["BTC"],
+                        "close": [1.0],
+                        "event_ts": [base_time],
+                        "ingested_ts": [base_time],
+                    }
+                ),
+                schema,
+            )
+        finally:
+            pl.DataFrame.write_parquet = original
+
+        # At the moment the bytes hit the disk, the file is not yet a *.parquet.
+        assert during == [[]]
+        assert len(list(partition.glob("*.parquet"))) == 1
+
+    def test_a_failed_write_leaves_no_temporary_behind(self, tmp_store_path):
+        store = ParquetStore(tmp_store_path)
+        schema = DatasetSchema(
+            name="ohlcv",
+            fields={
+                "asset_id": pl.Utf8,
+                "close": pl.Float64,
+                "event_ts": pl.Datetime("us"),
+                "ingested_ts": pl.Datetime("us"),
+            },
+        )
+        base_time = datetime(2024, 1, 1)
+
+        original = pl.DataFrame.write_parquet
+
+        def explode(self, path, *args, **kwargs):
+            original(self, path, *args, **kwargs)
+            raise OSError("disk full")
+
+        pl.DataFrame.write_parquet = explode
+        try:
+            with pytest.raises(OSError):
+                store.append(
+                    "ohlcv",
+                    pl.DataFrame(
+                        {
+                            "asset_id": ["BTC"],
+                            "close": [1.0],
+                            "event_ts": [base_time],
+                            "ingested_ts": [base_time],
+                        }
+                    ),
+                    schema,
+                )
+        finally:
+            pl.DataFrame.write_parquet = original
+
+        partition = tmp_store_path / "ohlcv" / "date=2024-01-01"
+        assert list(partition.iterdir()) == []
+
     def test_point_in_time_read(self, tmp_store_path):
         """Test point-in-time (asof) reads."""
         store = ParquetStore(tmp_store_path)

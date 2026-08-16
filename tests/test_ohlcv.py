@@ -65,6 +65,60 @@ class TestOHLCVLoader:
         assert loader.lookback_days == 7
 
     @patch("loaders.ohlcv.ccxt.binance")
+    def test_the_exchange_is_opened_against_the_perp_market_type(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """One market type per venue (Phase 5.9).
+
+        This loader read the venue's *default* (spot) markets from Phase 2
+        until then, while the archive backfill pulled `futures/um` and the
+        other three loaders read derivatives — so `ohlcv_daily` carried spot
+        closes and perp closes under one `venue` and one `asset_id`, with no
+        column recording which (`DATA.md` §9.2).
+        """
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        OHLCVLoader("binance", store=temp_store, asset_master=mock_asset_master)
+
+        assert mock_binance_class.call_args.args[0] == {
+            "options": {"defaultType": LOADER_CONFIG.perp_market_type}
+        }
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_perpetual_symbols_are_preferred_over_spot(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """Opening the venue on derivatives is only half of it: a venue that
+        lists both notations must still be read on the perp one."""
+        mock_ccxt_binance.symbols = ["BTC/USDT", "BTC/USDT:USDT", "ETH/USDT:USDT"]
+        mock_binance_class.return_value = mock_ccxt_binance
+
+        loader = OHLCVLoader(
+            "binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master
+        )
+        loader.fetch(timeframe="1d")
+
+        queried = {c.args[0] for c in mock_ccxt_binance.fetch_ohlcv.call_args_list}
+        assert queried == {"BTC/USDT:USDT", "ETH/USDT:USDT"}
+
+    @patch("loaders.ohlcv.ccxt.binance")
+    def test_a_spot_only_venue_still_works(
+        self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
+    ):
+        """One market type per venue does not mean futures everywhere: a venue
+        that rejects the option, or lists no perps, falls back to its default
+        markets rather than fetching nothing."""
+        mock_ccxt_binance.symbols = ["BTC/USDT", "ETH/USDT"]
+        mock_binance_class.side_effect = [ValueError("no futures"), mock_ccxt_binance]
+
+        loader = OHLCVLoader(
+            "binance", lookback_days=7, store=temp_store, asset_master=mock_asset_master
+        )
+        df = loader.fetch(timeframe="1d")
+
+        assert len(df) > 0
+
+    @patch("loaders.ohlcv.ccxt.binance")
     def test_symbol_budget_is_configurable_and_usdt_only(
         self, mock_binance_class, mock_asset_master, temp_store, mock_ccxt_binance
     ):

@@ -6,7 +6,13 @@ from datetime import UTC, datetime, timedelta
 
 from audit.auditor import DataAudit
 from config import DATASTORE_PATH, LOADER_CONFIG, LOG_CONFIG
-from datastore import AssetMaster, ParquetStore
+from datastore import (
+    AssetIdCollisionError,
+    AssetMaster,
+    ParquetStore,
+    canonical_asset_id_for_market,
+    parse_venue_symbol,
+)
 from loaders.backfill import BackfillRunner
 from loaders.window import utc_now
 from logging_config import get_logger, new_run_id, prune_old_logs, set_level, set_run_id
@@ -129,38 +135,49 @@ class NightlyPipeline:
             logger.warning(f"Log pruning failed: {e}")
 
     def _venue_markets(self, venue: str) -> dict[str, dict]:
-        """Collect USDT markets across every market type the loaders use.
+        """Collect the USDT markets the loaders read, from one market type.
 
-        The OHLCV loader runs against the venue's default (spot) markets while
-        the funding-rate and open-interest loaders run against derivatives
-        (`LOADER_CONFIG.perp_market_type`). Both symbol namespaces must be in
-        the asset master, or the perp loaders resolve every symbol to None and
-        write nothing.
+        **One market type per venue** (Phase 5.9, `DATA.md` §8 decision 1). All
+        four loaders now read derivatives (`LOADER_CONFIG.perp_market_type`);
+        until this phase the OHLCV loader read the venue's default *spot*
+        markets, so `ohlcv_daily` held spot closes and archive perp closes under
+        one `venue` and one `asset_id`, with no column recording which. The
+        symbols must therefore come from the same market type the loaders will
+        iterate, or the perp loaders resolve everything to None and write
+        nothing.
+
+        A venue with no derivatives markets falls back to its defaults — a
+        spot-only venue is a legitimate configuration, and the point of the rule
+        is one market type per venue, not futures everywhere.
         """
         import ccxt
 
         exchange_class = getattr(ccxt, venue)
+        market_type = LOADER_CONFIG.perp_market_type
         markets: dict[str, dict] = {}
 
-        for options in ({}, {"options": {"defaultType": LOADER_CONFIG.perp_market_type}}):
+        attempts = ({"options": {"defaultType": market_type}}, {})
+        for options in attempts:
             try:
                 exchange = exchange_class(options) if options else exchange_class()
                 exchange.load_markets()
             except Exception as e:
-                logger.warning(f"Could not load {venue} markets with {options or 'defaults'}: {e}")
+                logger.warning(
+                    f"Could not load {venue} markets with {options or 'defaults'}: {e}"
+                )
                 continue
 
             for symbol in exchange.symbols or []:
-                if "/USDT" not in symbol:
+                # `parse_venue_symbol` decides what is ingestable: USDT-quoted,
+                # dated futures excluded. resolve_symbol() matches on the
+                # literal string, so the mapping preserves the venue's exact
+                # spelling rather than a reconstructed "{asset}/USDT".
+                if parse_venue_symbol(symbol) is None:
                     continue
-                # Map every exact symbol string to its base asset. Loaders
-                # iterate exchange.symbols directly and may see spot
-                # ("BTC/USDT"), perpetual ("BTC/USDT:USDT"), or quarterly
-                # ("BTC/USDT:USDT-260327") notation; resolve_symbol() matches on
-                # the literal string, so the mapping must preserve whatever
-                # exact form each market uses rather than reconstructing a
-                # synthetic "{asset}/USDT" symbol.
                 markets.setdefault(symbol, exchange.markets.get(symbol) or {})
+
+            if markets:
+                break
 
         return markets
 
@@ -179,6 +196,7 @@ class NightlyPipeline:
             base_date = datetime.now(UTC).replace(tzinfo=None)
             added = 0
             skipped = 0
+            refused = 0
             for symbol, market in sorted(markets.items()):
                 # add_mapping appends unconditionally, so re-adding a symbol on
                 # every nightly run would grow the master without bound and make
@@ -192,16 +210,27 @@ class NightlyPipeline:
                     skipped += 1
                     continue
 
-                base = market.get("base") or symbol.split("/")[0]
+                # The same canonicalisation `loaders/archive.py` uses, from
+                # `datastore.identity`. Two answers to this question in one
+                # codebase is what put `1000CAT` and `CAT` in one store.
+                asset_id = canonical_asset_id_for_market(symbol, market)
+                if asset_id is None:
+                    continue
                 try:
-                    am.add_mapping(base, venue, symbol, base_date)
+                    am.add_mapping(asset_id, venue, symbol, base_date)
                     added += 1
+                except AssetIdCollisionError as e:
+                    # Refused, not resolved: a second listing under this
+                    # asset_id means the loader must not write its rows there.
+                    logger.error(f"Not mapping {symbol}: {e.collision.describe()}")
+                    refused += 1
                 except Exception as e:
                     logger.warning(f"Failed to add mapping for {symbol}: {e}")
 
             logger.info(
                 f"✓ Asset master: {added} new {venue} symbols added, "
-                f"{skipped} already mapped ({len(markets)} USDT symbols seen)"
+                f"{skipped} already mapped, {refused} refused by the collision "
+                f"guard ({len(markets)} USDT symbols seen)"
             )
         except Exception as e:
             logger.warning(f"Failed to auto-populate asset master: {e}", exc_info=True)

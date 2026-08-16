@@ -53,7 +53,14 @@ import polars as pl
 import requests
 
 from config import DATASTORE_PATH, LOADER_CONFIG, LOG_CONFIG
-from datastore import AssetMaster, DatasetSchema, ParquetStore
+from datastore import (
+    AssetIdCollisionError,
+    AssetMaster,
+    DatasetSchema,
+    ParquetStore,
+    canonical_asset_id,
+)
+from datastore import is_supported_symbol as _is_supported_symbol
 from loaders.base import BaseLoader
 from loaders.schemas import FUNDING_RATE_SCHEMA, OHLCV_SCHEMA
 from loaders.window import FetchWindow, utc_now
@@ -75,6 +82,9 @@ DEFAULT_TIMEFRAME = "1d"
 
 KLINES = "klines"
 FUNDING_RATE = "fundingRate"
+
+# Which store dataset each archive file kind lands in.
+DATASET_FOR_KIND = {KLINES: "ohlcv_daily", FUNDING_RATE: "funding_rate"}
 
 # Kline CSV layout. `volume` (index 5) is *base* volume, which is what
 # OHLCV_SCHEMA wants: `universe/builder.py` computes dollar volume as
@@ -106,16 +116,6 @@ FUNDING_COLUMNS = ("calc_time", "funding_interval_hours", "last_funding_rate")
 MICROSECOND_THRESHOLD = 100_000_000_000_000
 
 QUOTE_ASSET = "USDT"
-
-# Multiplier contracts (`1000BONKUSDT`, `1MBABYDOGEUSDT`) are the same
-# underlying at a scaled contract size, and returns are invariant to a constant
-# multiplier — so they map to the underlying base. Two of them under two
-# `asset_id`s would be a pair of perfectly correlated "independent" bets, which
-# is exactly the lie the breadth report exists to prevent.
-#
-# The lookahead is what keeps `1INCHUSDT` intact: it starts with "1" but not
-# with any multiplier prefix, and a naive strip would score it as "NCH".
-_MULTIPLIER_RE = re.compile(r"^(?:1000000|100000|10000|1000|1M)(?=[A-Z]{2,})")
 
 _MONTH_RE = re.compile(r"-(\d{4}-\d{2})\.zip$")
 
@@ -310,27 +310,26 @@ def list_all(
 def is_supported_symbol(symbol: str) -> bool:
     """Whether an archive symbol is one we ingest.
 
-    USDT-quoted perpetual/spot listings only. `BTCUSDC` and `BTCBUSD` are
-    separate listings of the same asset and would double-count rows against one
-    `asset_id`; dated futures (`BTCUSDT_240329`) are a different instrument with
-    its own basis and expiry.
+    USDT-quoted listings only. `BTCUSDC` and `BTCBUSD` are separate listings of
+    the same asset and would double-count rows against one `asset_id`; dated
+    futures (`BTCUSDT_240329`) are a different instrument with its own basis and
+    expiry. The rule itself lives in `datastore.identity` because
+    `pipeline/nightly.py` has to apply the same one — two answers to this
+    question in one codebase is Phase 5.9.
     """
-    if "_" in symbol:
-        return False
-    if not symbol.endswith(QUOTE_ASSET):
-        return False
-    return len(symbol) > len(QUOTE_ASSET)
+    return _is_supported_symbol(symbol)
 
 
 def asset_id_for(symbol: str) -> str | None:
     """Canonical `asset_id` for an archive symbol, or None if unsupported.
 
-    `1000BONKUSDT -> BONK`, `1MBABYDOGEUSDT -> BABYDOGE`, `1INCHUSDT -> 1INCH`.
+    `BTCUSDT -> BTC`, `1000SHIBUSDT -> 1000SHIB`, `1INCHUSDT -> 1INCH`. The
+    multiplier prefix is **kept**: Binance uses it both for a scaled contract
+    size and to disambiguate two different tokens sharing a ticker
+    (`1000CATUSDT` beside `CATUSDT`, listed simultaneously), and stripping it
+    merged the second pair into one price series. See `datastore/identity.py`.
     """
-    if not is_supported_symbol(symbol):
-        return None
-    base = symbol[: -len(QUOTE_ASSET)]
-    return _MULTIPLIER_RE.sub("", base) or base
+    return canonical_asset_id(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +466,24 @@ def month_start(month: str) -> datetime:
     return datetime.strptime(month, "%Y-%m")
 
 
+def month_end(month: str) -> datetime:
+    """The last instant of `month` (its successor's start, minus a microsecond)."""
+    following = (month_start(month) + timedelta(days=32)).replace(day=1)
+    return following - timedelta(microseconds=1)
+
+
+def _month_within(month: str, window: FetchWindow) -> bool:
+    """Whether `window` covers the whole of `month`, both ends included."""
+    return window.start <= month_start(month) and month_end(month) <= window.end
+
+
+def _default_rank_month() -> str:
+    """The last complete month, which is the most recent one fully published."""
+    first_of_this_month = utc_now().replace(day=1)
+    previous = first_of_this_month - timedelta(days=1)
+    return f"{previous.year:04d}-{previous.month:02d}"
+
+
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
@@ -496,6 +513,9 @@ class BinanceVisionLoader(BaseLoader):
         http: ArchiveHttp | None = None,
         verify_checksums: bool = True,
         chunk: str = "symbol",
+        skip_loaded: bool = False,
+        rank_by_liquidity: bool = False,
+        rank_month: str | None = None,
     ):
         """
         Args:
@@ -513,6 +533,13 @@ class BinanceVisionLoader(BaseLoader):
             verify_checksums: Check every file against its published SHA-256.
             chunk: "symbol" (default) or "month" — how much is accumulated
                 before an append. See `_append_frames`.
+            skip_loaded: Do not re-download a (symbol, month) the store already
+                holds. See `_drop_loaded_months` for what "already holds"
+                means and why it is deliberately conservative.
+            rank_by_liquidity: When enumerating symbols, rank them by traded
+                dollar volume instead of alphabetically. See `list_symbols`.
+            rank_month: The `YYYY-MM` to measure that liquidity over (default:
+                the most recent month every candidate publishes).
         """
         super().__init__(venue, store, asset_master)
         if market not in ("um", "spot"):
@@ -529,6 +556,9 @@ class BinanceVisionLoader(BaseLoader):
         self.http = http or ArchiveHttp()
         self.verify_checksums = verify_checksums
         self.chunk = chunk
+        self.skip_loaded = skip_loaded
+        self.rank_by_liquidity = rank_by_liquidity
+        self.rank_month = rank_month
 
     # -- paths --------------------------------------------------------------
 
@@ -559,12 +589,15 @@ class BinanceVisionLoader(BaseLoader):
         """Every supported symbol the archive publishes for this market.
 
         The cap is applied after the USDT filter (the Phase 2 lesson: a list
-        interleaves quote currencies, so capping first starves the budget), but
-        it is still *alphabetical*, and the archive carries no liquidity
-        information to rank by. At 938 symbols and a 200 budget that silently
-        favours everything beginning with a digit or an early letter, so an
-        explicit `symbols=` list — chosen from the venue's volume ranking — is
-        the better input whenever you have one.
+        interleaves quote currencies, so capping first starves the budget). How
+        it is applied is the Phase 5.9 lesson: **alphabetically** by default,
+        which at 938 symbols against a 200 budget silently favours the front of
+        the alphabet, and produced a universe with a median of 64 members
+        against a `target_size` of 150 (`DATA.md` §9.4). Two better inputs:
+
+        - `symbols=[...]`, when you have a ranking from elsewhere;
+        - `rank_by_liquidity=True`, which measures one month and ranks by it
+          (`rank_symbols_by_liquidity`).
         """
         listing = list_all(self.http, self.prefix_for(kind))
         symbols = sorted(
@@ -575,14 +608,78 @@ class BinanceVisionLoader(BaseLoader):
             }
         )
         if self.max_symbols and len(symbols) > self.max_symbols:
-            logger.warning(
-                f"Archive lists {len(symbols)} supported symbols; capping at "
-                f"{self.max_symbols} alphabetically. Pass symbols=[...] to choose "
-                f"by liquidity instead."
-            )
-            symbols = symbols[: self.max_symbols]
+            if self.rank_by_liquidity:
+                symbols = self.rank_symbols_by_liquidity(symbols)[: self.max_symbols]
+            else:
+                logger.warning(
+                    f"Archive lists {len(symbols)} supported symbols; capping at "
+                    f"{self.max_symbols} alphabetically. Pass symbols=[...] or "
+                    f"rank_by_liquidity=True to choose by liquidity instead."
+                )
+                symbols = symbols[: self.max_symbols]
         logger.info(f"Enumerated {len(symbols)} symbols under {self.prefix_for(kind)}")
         return symbols
+
+    def rank_symbols_by_liquidity(
+        self, symbols: Sequence[str], month: str | None = None
+    ) -> list[str]:
+        """Order `symbols` by median daily dollar volume over one probe month.
+
+        The archive publishes no liquidity ranking, so this measures one — it
+        downloads a single month of daily klines per candidate and takes the
+        median of `close * volume`, the same dollar-volume definition
+        `universe/builder.py` uses. That is deliberate: a symbol list selected
+        on a different definition of liquidity from the one the universe ranks
+        on would cut the candidate set along a slightly different line, and the
+        universe would be quietly choosing from the wrong 200.
+
+        One extra file per candidate (~938 small zips, minutes at eight
+        workers) buys a candidate set that is actually the most traded, which is
+        what the re-pull in `DATA.md` §9.5 needs.
+
+        A symbol that does not publish the probe month sorts last, keeping the
+        alphabetical order among those — it is not evidence of low volume, only
+        of absence, and an arbitrary but stable order beats a random one.
+        """
+        month = month or self.rank_month or _default_rank_month()
+        logger.info(
+            f"Ranking {len(symbols)} symbols by median dollar volume over {month}"
+        )
+
+        volumes: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self.download, symbol, month, KLINES): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    frame = future.result()
+                except ArchiveError as e:
+                    logger.debug(f"{symbol}: no {month} probe file ({e})")
+                    continue
+                if frame.is_empty():
+                    continue
+                median = (
+                    frame.select((pl.col("close") * pl.col("volume")).median()).item()
+                )
+                if median is not None:
+                    volumes[symbol] = float(median)
+
+        ranked = sorted(symbols, key=lambda s: (-volumes.get(s, -1.0), s))
+        measured = len(volumes)
+        top = ", ".join(ranked[:5])
+        logger.info(
+            f"Liquidity ranking: measured {measured} of {len(symbols)} symbols over "
+            f"{month}; leaders {top}"
+        )
+        if measured < len(symbols):
+            logger.warning(
+                f"{len(symbols) - measured} symbol(s) publish no {month} file and "
+                f"sort last; pass rank_month= to measure a month they all cover"
+            )
+        return ranked
 
     def list_months(self, symbol: str, kind: str = KLINES) -> list[str]:
         """Every `YYYY-MM` published for a symbol, oldest first.
@@ -644,25 +741,34 @@ class BinanceVisionLoader(BaseLoader):
 
     # -- asset master -------------------------------------------------------
 
-    def register_symbols(self, first_months: dict[str, str]) -> int:
-        """Map archive symbols to canonical `asset_id`s. Returns rows added.
+    def register_symbols(self, first_months: dict[str, str]) -> set[str]:
+        """Map archive symbols to canonical `asset_id`s. Returns those refused.
 
         `NightlyPipeline._populate_asset_master` builds the master from
         `exchange.load_markets()`, which is exactly the call that is
-        unreachable here — so the archive route registers its own symbols.
+        unreachable here — so the archive route registers its own symbols,
+        through the same `datastore.identity` rule the nightly uses.
 
         The mapping is stored under the **exact** archive string (`BTCUSDT`, no
         slash), because `resolve_symbol` matches literally and the ccxt loaders
-        will separately register their own notation (`BTC/USDT`,
-        `BTC/USDT:USDT`) for the same `asset_id`. Validity starts at the first
-        month the archive published for that symbol, which is the closest thing
-        to a listing date the archive offers.
+        will separately register their own notation (`BTC/USDT:USDT`) for the
+        same `asset_id`. Validity starts at the first month the archive
+        published for that symbol, which is the closest thing to a listing date
+        the archive offers.
+
+        A symbol the collision guard refuses is returned rather than mapped, and
+        the caller drops it from the plan: its rows have no `asset_id` they can
+        honestly be written under, and writing them under a shared one is the
+        defect (`DATA.md` §9.1). One refused symbol does not abandon the run.
         """
         added = 0
+        refused: set[str] = set()
+
         for symbol, month in sorted(first_months.items()):
             asset_id = asset_id_for(symbol)
             if asset_id is None:
                 logger.debug(f"Skipping unsupported archive symbol {symbol}")
+                refused.add(symbol)
                 continue
 
             validity_start = month_start(month)
@@ -672,14 +778,25 @@ class BinanceVisionLoader(BaseLoader):
             if existing is not None:
                 continue
 
-            self.asset_master.add_mapping(asset_id, self.venue, symbol, validity_start)
+            try:
+                self.asset_master.add_mapping(
+                    asset_id, self.venue, symbol, validity_start
+                )
+            except AssetIdCollisionError as e:
+                logger.error(
+                    f"Not ingesting {symbol}: {e.collision.describe()}"
+                )
+                refused.add(symbol)
+                continue
             added += 1
 
         logger.info(
             f"Asset master: {added} new archive symbol(s) registered under "
-            f"venue={self.venue} ({len(first_months)} seen)"
+            f"venue={self.venue} ({len(first_months)} seen"
+            + (f", {len(refused)} refused" if refused else "")
+            + ")"
         )
-        return added
+        return refused
 
     # -- running ------------------------------------------------------------
 
@@ -759,8 +876,77 @@ class BinanceVisionLoader(BaseLoader):
                 if months:
                     plan[symbol] = months
 
-        self.register_symbols(first_months)
+        for symbol in self.register_symbols(first_months):
+            plan.pop(symbol, None)
         return plan
+
+    def _loaded_months(self, dataset: str) -> set[tuple[str, str]]:
+        """`(asset_id, "YYYY-MM")` for every month the store already holds."""
+        try:
+            stored = self.store.read(dataset, columns=["asset_id", "venue", "event_ts"])
+        except FileNotFoundError:
+            return set()
+        if not len(stored):
+            return set()
+        if "venue" in stored.columns:
+            stored = stored.filter(pl.col("venue") == self.venue)
+        if not len(stored):
+            return set()
+
+        months = stored.select(
+            pl.col("asset_id"),
+            pl.col("event_ts").dt.strftime("%Y-%m").alias("month"),
+        ).unique()
+        return {(row["asset_id"], row["month"]) for row in months.iter_rows(named=True)}
+
+    def _drop_loaded_months(
+        self, plan: dict[str, list[str]], dataset: str, window: FetchWindow
+    ) -> dict[str, list[str]]:
+        """Remove months already in the store, so a resumed run is cheap.
+
+        Two deliberate conservatisms, because the cost of skipping a month that
+        is *not* fully there is a hole in the history and the cost of
+        re-fetching one that is, is one download:
+
+        - **Only months that lie entirely inside the window.** The window's end
+          months are trimmed on ingest (`_download_prepared` filters to
+          `[start, end]`), so a stored partial month must be re-fetched if a
+          later run asks for a wider window.
+        - **Presence of any bar means the month's file was ingested.** The
+          archive publishes whole months and the loader parses and appends whole
+          files, so there is no partially-parsed month; an interrupted run loses
+          whole symbols, not halves of a month.
+
+        This is not the checkpoint `DATA.md` §3 step 6 asks for — it asks the
+        store rather than a side file, which cannot go stale against it.
+        """
+        loaded = self._loaded_months(dataset)
+        if not loaded:
+            return plan
+
+        trimmed: dict[str, list[str]] = {}
+        skipped = 0
+        for symbol, months in plan.items():
+            asset_id = asset_id_for(symbol)
+            keep = [
+                month
+                for month in months
+                if not (
+                    asset_id is not None
+                    and (asset_id, month) in loaded
+                    and _month_within(month, window)
+                )
+            ]
+            skipped += len(months) - len(keep)
+            if keep:
+                trimmed[symbol] = keep
+
+        if skipped:
+            logger.info(
+                f"--skip-loaded: {skipped} (symbol, month) file(s) already in "
+                f"{dataset}; {sum(len(m) for m in trimmed.values())} left to fetch"
+            )
+        return trimmed
 
     def _download_prepared(
         self, symbols: Sequence[str], kind: str, window: FetchWindow
@@ -768,11 +954,17 @@ class BinanceVisionLoader(BaseLoader):
         """Yield `(symbol, prepared frame)` per chunk, as downloads complete.
 
         Downloads are concurrent; the frames are yielded (and therefore
-        appended) on the calling thread, because `ParquetStore.append` numbers
-        its output file from the count already in the partition and two threads
-        would race for the same name.
+        appended) on the calling thread. That used to be the *only* thing
+        keeping two writers off one filename, and it could never have covered
+        the case that actually happened — two `loaders.archive` processes, which
+        race exactly as two threads would (`DATA.md` §9.3).
+        `ParquetStore.append` now names each file uniquely and writes it through
+        a rename, so appending here is about keeping one symbol's months in one
+        file rather than about safety.
         """
         plan = self._plan(symbols, kind, window)
+        if self.skip_loaded:
+            plan = self._drop_loaded_months(plan, DATASET_FOR_KIND[kind], window)
         if not plan:
             logger.warning(f"Nothing to fetch for {kind} over {window}")
             return
@@ -915,6 +1107,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--chunk", default="symbol", choices=("symbol", "month"))
     parser.add_argument("--no-verify-checksums", action="store_true")
+    parser.add_argument(
+        "--skip-loaded",
+        action="store_true",
+        help=(
+            "Do not re-download a (symbol, month) the store already holds in "
+            "full. Makes a resumed run cheap instead of duplicating history."
+        ),
+    )
+    parser.add_argument(
+        "--rank-by-liquidity",
+        action="store_true",
+        help=(
+            "Choose the capped symbol set by median dollar volume rather than "
+            "alphabetically (costs one extra month per candidate). Ignored when "
+            "--symbols is given."
+        ),
+    )
+    parser.add_argument(
+        "--rank-month",
+        help="YYYY-MM to measure --rank-by-liquidity over (default: last complete month)",
+    )
     levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
     parser.add_argument(
         "--log-level",
@@ -952,6 +1165,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         workers=args.workers,
         verify_checksums=not args.no_verify_checksums,
         chunk=args.chunk,
+        skip_loaded=args.skip_loaded,
+        rank_by_liquidity=args.rank_by_liquidity,
+        rank_month=args.rank_month,
     )
 
     logger.info(f"run_id={run_id}, market={args.market}, window={window}, datasets={datasets}")

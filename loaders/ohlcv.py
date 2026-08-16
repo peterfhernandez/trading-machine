@@ -16,7 +16,21 @@ logger = get_logger(__name__)
 
 
 class OHLCVLoader(BaseLoader):
-    """Load OHLCV data from ccxt exchanges (Binance, Deribit, etc.)."""
+    """Load OHLCV data from ccxt exchanges (Binance, Deribit, etc.).
+
+    **Perpetuals, not spot** (Phase 5.9; `DATA.md` §8 decision 1 and §9.2). This
+    loader read the venue's default spot markets from Phase 2 until then, while
+    the archive backfill pulled `futures/um` and the funding-rate and
+    open-interest loaders read derivatives. Same `venue`, same `asset_id`, two
+    instruments, and no column recording which — so the price series switched
+    instrument wherever the two overlapped, and `carry` (perp funding) was being
+    paired with spot closes.
+
+    It hides where a naming defect does not: spot and perp closes agree to a
+    fraction of a percent, so only the *count* of disagreeing bars gave it away
+    (~112 assets, ~61 days, exactly the overlap window). The acceptance gate's
+    `price_agreement` check now looks for that directly.
+    """
 
     def __init__(
         self,
@@ -34,11 +48,28 @@ class OHLCVLoader(BaseLoader):
         self.exchange = self._init_exchange(venue)
 
     def _init_exchange(self, venue: str):
-        """Initialize ccxt exchange instance."""
+        """Initialize ccxt exchange instance against the perp market type.
+
+        Same shape as `FundingRateLoader._init_exchange`, deliberately: one
+        market type per venue means all four loaders open the venue the same
+        way. A venue that rejects the option is spot-only, which is a
+        legitimate configuration rather than a failure.
+        """
         exchange_class = getattr(ccxt, venue.lower())
-        exchange = exchange_class()
+        market_type = LOADER_CONFIG.perp_market_type
+        try:
+            exchange = exchange_class({"options": {"defaultType": market_type}})
+        except Exception as e:
+            logger.warning(
+                f"{venue} rejected defaultType={market_type} ({e}); "
+                f"falling back to venue default markets"
+            )
+            exchange = exchange_class()
         exchange.load_markets()
-        logger.info(f"Initialized {venue} exchange; {len(exchange.symbols)} symbols loaded")
+        logger.info(
+            f"Initialized {venue} exchange (market type: {market_type}); "
+            f"{len(exchange.symbols)} symbols loaded"
+        )
         return exchange
 
     def fetch(
@@ -61,7 +92,7 @@ class OHLCVLoader(BaseLoader):
         rows = []
 
         usdt_symbols = select_usdt_symbols(
-            self.exchange.symbols, max_symbols=self.max_symbols
+            self.exchange.symbols, max_symbols=self.max_symbols, prefer_perps=True
         )
         logger.info(f"Selected {len(usdt_symbols)} USDT symbols (cap: {self.max_symbols})")
 

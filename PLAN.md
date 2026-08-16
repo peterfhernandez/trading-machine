@@ -30,7 +30,7 @@ substitute.
 | Research pods (R → prod) | Researcher + dev + tester teams | Research notebooks/scripts → productionized module, both written with Claude Code; the methodology doc is the spec Claude Code works from |
 | Execution desk | Implementation team | Paper trading on Deribit testnet / exchange testnets first; tiny live size later |
 | Observability | Splunk / Datadog / ELK | Python `logging` → per-component rotating JSON files in `logs/` (10 MB rotation, 12-month retention, decoupled mechanisms); Telegram remains the alert channel — see `LOGGING.md` |
-| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 617 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
+| CI / release | Jenkins or Buildkite, a staging environment, a release train | GitHub Actions: `ci.yml` gates the merge (ruff + 933 hermetic tests on 3.11, 3.12 and 3.14), `deploy.yml` gates the deployment — it runs the suite against the incoming commit in a throwaway worktree *on the trading machine* before `git reset --hard` moves the live checkout |
 
 ## 3. Architecture (the whiteboard)
 
@@ -94,11 +94,16 @@ full design, rotation/retention mechanism, and per-module retrofit map are in
 - Read API returns Polars frames; write API enforces schema + no-overwrite.
 - **Asset master**: canonical `asset_id`, per-venue symbol maps with validity
   date ranges (the crypto version of security matching / point-in-time IDs).
-  The canonicalisation rule is **one shared function**, used by every loader —
-  two loaders answering "what is this symbol called internally?" differently is
-  how the same asset acquires two `asset_id`s and two different assets acquire
-  one (see the Phase 5.9 notes). A **collision guard** enforces it: two venue
-  symbols resolving to one `asset_id` refuses the ingest and names both.
+  The canonicalisation rule is **one shared function**
+  (`datastore/identity.py`), used by every loader — two loaders answering "what
+  is this symbol called internally?" differently is how the same asset acquires
+  two `asset_id`s and two different assets acquire one (see the Phase 5.9
+  notes). A **collision guard** enforces it: two venue symbols resolving to one
+  `asset_id` are named, and the relation between their validity windows decides
+  what happens — *overlapping* means two listings were live at once and the
+  ingest is refused; *abutting* is a rename, which the validity ranges exist to
+  express, so it is recorded with a warning and reported as the Phase 10a
+  trigger.
 - Every dataset row carries `event_ts` and `ingested_ts` (knowledge date) so
   backtests can ask "what did I know then?" — the look-ahead-bias defence.
 
@@ -108,9 +113,11 @@ full design, rotation/retention mechanism, and per-module retrofit map are in
   funding rates, open interest; Deribit options summary (reuse calendar-bot
   knowledge later).
 - **One market type per venue.** All four datasets read perpetuals
-  (`LOADER_CONFIG.perp_market_type`). OHLCV read the venue's *default* (spot)
-  markets until Phase 5.9, which put spot closes and futures closes into one
-  `asset_id` with no column recording which — see `DATA.md` §9.2.
+  (`LOADER_CONFIG.perp_market_type`) from Phase 5.9. OHLCV read the venue's
+  *default* (spot) markets until then, which put spot closes and futures closes
+  into one `asset_id` with no column recording which — see `DATA.md` §9.2. A
+  venue with no derivatives falls back to its defaults: the rule is one market
+  type per venue, not futures everywhere.
 - Each loader: fetch → validate → transform → append to datastore. Idempotent,
   resumable, unique per vendor cadence — exactly the video's "data loader".
 
@@ -1465,3 +1472,105 @@ the natural moment to fix the *fourth*, non-blocking finding: symbol selection
 is alphabetical, so the universe came back at a median of 64 members against a
 `target_size` of 150. The old store is kept until the new one passes the gate,
 because the symbol sets and ingestion clusters can only be read from it.
+
+### What changed on contact with the code
+
+Three decisions were made while building this that the design above did not
+settle, and each is a place where the obvious reading of the checklist was
+wrong.
+
+**The collision guard refuses overlap and records abutment.** The checklist says
+"two venue symbols resolving to one `asset_id` refuses the ingest and names
+both", and taken literally that breaks a capability Phase 1 shipped on purpose:
+a symbol that *ends* where another *begins* is a rename, which is exactly what
+point-in-time validity ranges exist to express, and
+`tests/test_datastore.py::test_symbol_rename_point_in_time` has asserted it
+since Phase 1. So the relation decides. Overlapping windows mean two contracts
+were live at once, which cannot be one asset under two names — refused, and
+`loaders/archive.py` drops the symbol from its fetch plan so its rows are not
+written under a borrowed `asset_id`. Abutting windows are recorded with a
+WARNING and surfaced by `find_collisions()`, which is the Phase 10a trigger
+(`DATA.md` §10's table). The distinction the guard makes is not "is this a new
+symbol?" but "is this a *different listing*?", and that is
+`datastore.identity.symbol_key`: `BTCUSDT`, `BTC/USDT` and `BTC/USDT:USDT` are
+three spellings of one listing and share a key, while `1000CATUSDT` and
+`CATUSDT` do not. Without that, the guard would fire on the ordinary contents of
+an asset master.
+
+**Concurrency cannot be detected by a gap threshold, so it is not.** The
+forensics inferred runs by clustering `ingested_ts` with a 30-minute gap, and
+that heuristic *cannot* separate two invocations that overlap in time — which is
+how it reported a within-run double-emit for what was two concurrent processes.
+The replacement is not a better threshold. One invocation loads its datasets in
+sequence, so an ingestion cluster in `ohlcv_daily` overlapping one in
+`funding_rate` proves a second process, with no tuning involved
+(`audit.duplicates.find_concurrent_runs`). Where it fires, the duplicate verdict
+says so instead of asserting the confident wrong answer. The overlap test is
+*strict* on both sides, so two instantaneous clusters — a fixture, or a dataset
+written in one append — never read as concurrent: a point has no interval, and
+inferring concurrency from one would repeat the original error in the other
+direction.
+
+**`--skip-loaded` asks the store, and skips less than it could.** `DATA.md` §3
+step 6 wanted a checkpoint carrying the archive's covered interval; a side file
+recording what a directory contains is a second source of truth that can go
+stale against the first. Asking the store cannot. The conservatism is
+deliberate in one specific way: a month is skipped only when it lies *entirely*
+inside the requested window, because the window's end months are trimmed on
+ingest, so a stored partial month must be re-fetched when a later run asks for
+a wider window. Skipping it would leave a hole — and a hole is precisely the
+defect class the gate's gap check exists for, so buying one to save a download
+would be a poor trade.
+
+### The gate blocks on defects, warns on the rest
+
+The most important change is not any single check but what a red result now
+means. Before this phase the duplicate check reported a count and said, in its
+own message, that it could not tell a harmless re-run from two different
+defects. That is honest, and it is also how a gate becomes something an operator
+overrides by habit. `audit/duplicates.py` splits the three causes; the gate
+blocks on the two that are defects and warns on the one that is append-only
+storage working as designed.
+
+Two of the three new checks exist because a defect had already slipped past
+everything: `price_agreement` asks whether one `(asset_id, event_ts)` carries
+two materially different prices — the shape of *both* identity defects, and
+tuned at 0.1% because the spot-versus-perp version is a fraction of a percent
+rather than the dramatic 711,000× one. `asset_identity` asks the master the same
+question directly. The third, `universe_breadth`, is not about correctness at
+all: 0/64/139 members against a `target_size` of 150 cleared every existing
+threshold while describing a breadth machine running at 43%, and IR scales with
+the square root of breadth.
+
+### Testing Coverage (Phase 5.9)
+
+- `tests/test_asset_identity.py`: 37 tests — the rule over both notations and
+  over real symbol strings (including the assertion that the archive path and
+  the nightly path agree, which nothing else can make since neither module
+  calls the other), every unsupported form, and the guard: refusing an overlap,
+  not recording the refused mapping, recording a rename, reporting it as the
+  Phase 10a trigger, and letting an unrecognised notation through
+- `tests/test_duplicates.py`: 24 tests — the three causes fabricated to identical
+  counts with only the ingestion spacing or the values differing, plus the
+  concurrency signal and both sides of the price-disagreement tolerance
+- `tests/test_backfill_forensics.py`: the gap classification, with the negative
+  control that contiguity alone — the property the old check tested — gives the
+  opposite answer for `AUDIO` and `BNX`
+- `tests/test_datastore.py`: +3 — two writers interleaved deterministically
+  (a race reproduced by threads is a test that passes on a fast machine), no
+  `*.parquet` visible mid-write, and no temporary left behind by a failed write
+- `tests/test_archive_loader.py`, `tests/test_acceptance.py`,
+  `tests/test_nightly.py`, `tests/test_ohlcv.py`: `--skip-loaded` including the
+  partial-month case, liquidity ranking including that it uses `close * volume`,
+  the refused symbol never reaching the store, the new checks on both sides, and
+  the perp market type on the ccxt path
+
+933 tests passing; `ruff check .` clean.
+
+### Status
+
+Built, except the re-pull. `data/` is git-ignored and no store exists in the
+environment the fixes were written in, so `DATA.md` §9.5's four commands are an
+operator step on the trading machine. Until they run, the gate's verdict on the
+real store is the 3-of-7 block from 2026-08-03 — correctly, because that store
+has not changed.

@@ -177,7 +177,10 @@ an error. Evidence in `DATA.md` §9, design rationale in the Phase 5.9
 Implementation Notes in `PLAN.md`. **Nothing here is a gate change dressed up as
 a fix — the gate was right to block.**
 
-- [ ] **One canonicalisation of `asset_id`, shared by every loader.** Stop
+- [x] **One canonicalisation of `asset_id`, shared by every loader.**
+      `datastore/identity.py` (`canonical_asset_id`, `parse_venue_symbol`,
+      `symbol_key`), called by `loaders/archive.py` and
+      `pipeline/nightly.py::_populate_asset_master`. Stop
       stripping multiplier prefixes: keep the venue's own base, so
       `1000SHIBUSDT → 1000SHIB` and `1000CATUSDT`/`CATUSDT` stay two assets.
       The strip assumed a prefix always means the same asset at a different
@@ -187,24 +190,42 @@ a fix — the gate was right to block.**
       symbol strings — the existing "already mapped?" guard could not catch the
       disagreement because it matches the literal symbol, and `1000CATUSDT` is
       not `1000CAT/USDT:USDT`
-- [ ] **Collision guard.** Two venue symbols resolving to one `asset_id` refuses
-      the ingest and names both. It is also the detector for the two cases that
-      *do* need Phase 10a: overlapping validity windows mean a ticker collision
-      (keep them apart), abutting windows mean a redenomination or a reused
-      equity ticker (build the adjustment engine)
-- [ ] **One market type per venue.** `OHLCVLoader` moves onto
+- [x] **Collision guard.** `AssetMaster.check_collision` / `add_mapping`
+      (`AssetIdCollisionError`) and `find_collisions()`, plus an `asset_identity`
+      check on the gate. Two venue symbols resolving to one `asset_id` names
+      both, and the relation decides what happens: **overlapping** validity
+      windows mean two listings were live at once, which cannot be one asset
+      under two names — the ingest is refused, and `loaders/archive.py` drops
+      the symbol from its fetch plan so no rows are written under a borrowed
+      `asset_id`. **Abutting** windows are recorded with a warning instead, and
+      reported by `find_collisions()`: a symbol that ends where another begins
+      is a *rename*, which point-in-time validity ranges exist to express and
+      which Phase 1 shipped deliberately (`tests/test_datastore.py::
+      test_symbol_rename_point_in_time`). Refusing those would break every
+      legitimate ticker change to catch a case that is not this one — and it is
+      the same shape as a redenomination or a reused equity ticker, so it is
+      surfaced as the Phase 10a trigger rather than blocked
+- [x] **One market type per venue.** `OHLCVLoader` moves onto
       `LOADER_CONFIG.perp_market_type`, joining the funding-rate and
       open-interest loaders. Spot and perp closes agree to a fraction of a
       percent, so this hides where the identity defect does not — only the
       *count* of disagreeing bars (~112 assets × ~61 days, exactly the overlap
       window) gave it away
-- [ ] **The append race.** `ParquetStore.append` numbers its output file from
+- [x] **The append race.** Fixed by a collision-proof filename
+      (`data_<n>_<uuid>.parquet`) written through a temporary name and
+      `os.replace`, so two processes can neither choose one name nor expose a
+      half-written file to a reader. `--skip-loaded` on the archive loader asks
+      the *store* which (symbol, month) files it already holds — no checkpoint
+      to go stale — and skips only months lying entirely inside the window,
+      since a window's end months are trimmed on ingest.
+      `ParquetStore.append` numbered its output file from
       the count already in the partition, so two *processes* race for one
       filename exactly as two threads would — `loaders/archive.py` documents the
       thread case and nothing enforced the process case. Collision-proof
       filename or a partition claim, plus `--skip-loaded` on the archive loader
       so a resumed run is cheap rather than duplicating what is already stored
-- [ ] **The gate reports verdicts, not shapes.** Promote `classify_duplicates`
+- [x] **The gate reports verdicts, not shapes.** All of it, and the gate is
+      now 10 checks rather than 7. Promoted `classify_duplicates`
       out of `scratch/scratch_backfill_forensics.py` into `audit/duplicates.py`
       so the gate blocks specifically on same-run and value-disagreeing
       duplicates and warns on cross-run agreeing ones; add a check that no
@@ -214,13 +235,20 @@ a fix — the gate was right to block.**
       `UNIVERSE_CONFIG.target_size` (0/64/139 against 150 currently passes
       silently); and `--allow-gapped-assets` to record a settled delisting like
       `AUDIO` as an explicit operator decision
-- [ ] **Fix the forensics' own blind spots**, found by using it: the run
+- [x] **Fixed the forensics' own blind spots**, found by using it: the run
       clustering cannot separate invocations that overlap in time, and
       `_compare_against_archive` only checks that `[first..last]` published
       months are contiguous — it never compares against the *gap's* dates, so it
       told us "the hole is ours" for `AUDIO`, whose hole starts after the last
       month the archive ever published. A diagnostic's own assumptions are part
-      of what a diagnosis has to check
+      of what a diagnosis has to check. Concurrency now has its own section, and
+      its signal is not a threshold: one invocation loads its datasets in
+      sequence, so ingestion clusters that overlap *across* datasets prove a
+      second process (`find_concurrent_runs`). `classify_gap` compares the
+      listing against the gap's own dates and against the last month ever
+      published, which is what separates `AUDIO` (delisted) from `BNX` (a file
+      we skipped) — `tests/test_backfill_forensics.py` pins both, with the
+      negative control that contiguity alone gives opposite answers
 - [ ] **Re-pull the store clean.** Three defects overlap in one dataset and no
       column records which produced a row, so repair would mean inferring
       provenance from ambiguous timestamps. `mv data/parquet
@@ -228,10 +256,27 @@ a fix — the gate was right to block.**
       symbol list (fixing the median-64-against-150 universe), rebuild the
       universe from 2021-09-01, then re-run the gate. **Do not delete the old
       store until the gate is green** — the symbol sets and ingestion clusters
-      can only be read from it
-- [ ] Update the methodology docs' §2 data-inputs sections to record that
+      can only be read from it.
+      **The only item on this list that is not code, and it has not been run:**
+      it needs the trading machine's store and a twenty-minute network pull, and
+      neither exists in the environment the fixes were written in. Everything it
+      depends on is now in place — `--rank-by-liquidity` (with `--rank-month`)
+      replaces the alphabetical selection, `--skip-loaded` makes an interrupted
+      run cheap to resume, and the gate has the checks to tell whether the
+      result is clean:
+
+      ```bash
+      mv data/parquet data/parquet.pre-5.9
+      python -m loaders.archive --market um --start 2021-08-01 --end <today> \
+          --datasets ohlcv_daily,funding_rate --rank-by-liquidity --log-level INFO
+      python -m universe.builder --venue binance --pit-mode event \
+          --start 2021-09-01 --end <today> --freq weekly
+      python -m audit.acceptance --venue binance
+      ```
+- [x] Updated the methodology docs' §2 data-inputs sections to record that
       `ohlcv_daily` is perpetual, not spot: it changes what the backtest is a
-      backtest *of*
+      backtest *of*. All six, plus `TEMPLATE.md` so a new signal inherits the
+      requirement rather than rediscovering it
 
 ## Phase 5.5 — Logging & Observability Retrofit (cross-cutting)
 
@@ -1467,3 +1512,95 @@ the trigger table and the reasoning.
   and the Phase 5.9 notes, this file's Phase 5.9 and 10a checklists, and
   `README.md`. **No code has changed yet**, and the gate still blocks at 3 of 7,
   correctly.
+- 2026-08-09: **Phase 5.9 built — the three defects fixed, and the gate taught to
+  report verdicts.** Everything on the Phase 5.9 checklist except the re-pull
+  itself, which needs the trading machine's store and a network pull. 933 tests
+  passing (843 before), `ruff check .` clean.
+  **One canonicalisation, in one place.** `datastore/identity.py` owns the rule
+  and every loader calls it: `canonical_asset_id`, `parse_venue_symbol`,
+  `symbol_key`. It keeps the venue's own base and never strips — `1000SHIBUSDT →
+  1000SHIB`, `1000CATUSDT` and `CATUSDT` two assets — and it accepts both
+  notations, because the whole defect was that two modules answered the same
+  question differently and nothing could notice: the "already mapped?" guard
+  matches the literal symbol, and `1000CATUSDT` is not `1000CAT/USDT:USDT`.
+  `tests/test_asset_identity.py` asserts the two paths agree over a fixture of
+  real symbol strings, which is the only thing that can, since neither module
+  calls the other. What the new rule costs is that a genuine redenomination
+  produces two sequential `asset_id`s rather than one spliced series — the
+  better failure, because splicing two price scales without an adjustment factor
+  manufactures a return that never happened, and a short history does not.
+  **The collision guard refuses overlap and reports abutment, and that split is
+  a deliberate reading of the checklist rather than the literal one.**
+  Simultaneous listings under one `asset_id` cannot be one asset under two
+  names, so `add_mapping` raises and `loaders/archive.py` drops the symbol from
+  its fetch plan — rows with no honest `asset_id` are not written under a
+  borrowed one, and one refused symbol does not abandon a twenty-minute run.
+  Abutting windows are a **rename**, which is what point-in-time validity ranges
+  are *for* and which Phase 1 shipped with a test
+  (`test_symbol_rename_point_in_time`); blocking those would break every
+  legitimate ticker change to catch a case that is not this one. They are
+  recorded with a WARNING and reported by `find_collisions()`, which is the
+  Phase 10a trigger — the same query, distinguished by whether the windows
+  overlap or abut, exactly as `DATA.md` §10's table says.
+  **One market type per venue.** `OHLCVLoader` opens the venue with
+  `defaultType=LOADER_CONFIG.perp_market_type` and selects perpetual symbols,
+  joining the other three loaders; `pipeline/nightly.py::_venue_markets` follows,
+  registering the perp namespace and excluding dated futures, with a fallback to
+  the venue's defaults so a spot-only venue is still usable. Not futures
+  everywhere — one market type per venue.
+  **The append race, and a second thing it was hiding.**
+  `ParquetStore.append` now names each file `data_<n>_<uuid>.parquet` and writes
+  it to a temporary name before `os.replace`, so two *processes* can neither
+  choose one filename nor let a reader see a half-written file. The sequence
+  number is kept because it makes a partition readable; nothing reads it. The
+  race is tested by interleaving two writers deterministically rather than by
+  threads, since a race reproduced by luck is a test that passes on a fast
+  machine. `--skip-loaded` asks the store which (symbol, month) files it holds —
+  not a checkpoint, which could go stale against it — and deliberately skips
+  only months lying **entirely** inside the window, because a window's end
+  months are trimmed on ingest and skipping a trimmed month would leave a hole
+  that nothing reports as one.
+  **The gate reports verdicts: 7 checks became 10.** `classify_duplicates` and
+  the run clustering moved out of the scratch script into `audit/duplicates.py`,
+  because a gate and a diagnostic disagreeing about what a duplicate *is* would
+  be this phase's own defect in miniature. Duplicates now block on same-run and
+  value-disagreeing copies and **warn** on cross-run agreeing ones — the count
+  alone was consistent with one harmless cause and two defects, which is how an
+  operator ends up ignoring a red check. New: `ohlcv_daily_price_agreement` (no
+  `(asset_id, event_ts)` carrying two prices more than 0.1% apart — tight
+  because the spot/perp splice is a *fraction of a percent*, so a threshold set
+  for the dramatic case would have missed the one that mattered);
+  `asset_identity` (reads the master, blocks on overlap, warns on abutment); and
+  `universe_breadth` (warns when the median falls below 60% of
+  `target_size` — 0/64/139 against 150 passed silently before). Universe empties
+  *before* the first populated snapshot are now recognised as the
+  `min_listing_age_days` warm-up, and empties *after* it still fail, which is
+  the distinction append-only storage makes unavoidable: those six snapshots
+  cannot be un-written. `--allow-gapped-assets AUDIO` records a settled
+  delisting by name instead of loosening `--max-gap-days` for everything.
+  **The forensics' own blind spots, both found by using it.** Concurrency has
+  its own section now, and its signal is not a threshold at all: one invocation
+  loads its datasets in sequence, so ingestion clusters that overlap *across*
+  datasets prove a second process (`find_concurrent_runs`). Where that fires,
+  the duplicate verdict says "concurrent invocations, not necessarily a
+  within-run double-emit" rather than the confident wrong answer it gave on
+  2026-08-09. And `classify_gap` compares the archive listing against the
+  **gap's own dates** and against the last month ever published, which is what
+  separates `AUDIO` (hole begins after 2024-05, its final published month —
+  delisted, nothing to refetch) from `BNX` (hole inside published months — ours).
+  The negative control is that contiguity alone, the property the old check
+  tested, gives opposite answers on the two.
+  **For the re-pull:** `--rank-by-liquidity` (with `--rank-month`) measures one
+  month of klines per candidate and ranks by median `close * volume` — the same
+  dollar-volume definition `universe/builder.py` uses, deliberately, so the
+  candidate set is not cut along a different line from the universe that then
+  ranks it. One extra file per candidate buys 200 symbols that are actually the
+  most traded, which is the fix for the median-64-against-150 universe.
+  **Not done, and it is the one item that cannot be done here:** the re-pull.
+  `data/` is git-ignored and no store exists in this environment, so the four
+  commands in the checklist above are an operator step on the trading machine.
+  Until they run, the gate's verdict on the real store is still the 3-of-7
+  block from 2026-08-03 — correctly, since the store it read has not changed.
+  §5 of every methodology doc is still empty and all six signals are still
+  `draft`, for the same reason: the research in `DATA.md` §4 comes after an
+  accepted backfill.
