@@ -2,7 +2,7 @@
 
 A single-person, low-cost implementation of a multifactor crypto trading system.
 
-**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a clean backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied · Phase 5.7 (universe over backfilled history) — applied · Phase 5.8 (backfill acceptance gate) — applied, and run against the real backfill: BLOCKED, 3 of 7 · Phase 5.9 (asset identity, one market type, the append race) — **built**, except the re-pull itself, which is an operator step on the trading machine. The three defects behind the gate's four failures are fixed and the gate now reports verdicts rather than shapes; see [What is not done](#what-is-not-done) and `DATA.md` §9**
+**Status: Phase 5 (Signals → alphas) — code complete, backtest evidence pending a clean backfill · Phase 5.5 (Logging & observability) — applied and audited · Phase 5.6 (CI, test isolation, observability fixes) — applied · Phase 5.7 (universe over backfilled history) — applied · Phase 5.8 (backfill acceptance gate) — applied, and run against the real backfill: BLOCKED, 3 of 7 · Phase 5.9 (asset identity, one market type, the append race) — **complete**: the three defects are fixed, the gate reports verdicts rather than shapes, and the clean re-pull ran on 2026-08-16 — **ACCEPTED, 9 of 10**, one non-blocking breadth warning. **Phase 5's backtest evidence is now unblocked**; see [What is not done](#what-is-not-done) and `DATA.md` §9**
 
 ## Quick Start
 
@@ -1362,10 +1362,9 @@ would have caught them —
 [`price_agreement`, `asset_identity`, `universe_breadth`](#backfill-acceptance-gate)
 — and now blocks on defective duplicates while warning on a re-run.
 
-**What remains is the re-pull itself, which is an operator step.** Three defects
-overlap in one dataset and no column records which produced a given row, so the
-decision was a clean re-pull rather than an in-place repair. `data/` is
-git-ignored, so it has to run where the store lives:
+**The re-pull ran on 2026-08-16, and the gate accepts the store: 9 of 10.**
+Three defects overlapped in one dataset and no column recorded which produced a
+given row, so the decision was a clean re-pull rather than an in-place repair:
 
 ```bash
 mv data/parquet data/parquet.pre-5.9      # keep it until the gate is green
@@ -1373,19 +1372,36 @@ python -m loaders.archive --market um --start 2021-08-01 --end <today> \
     --datasets ohlcv_daily,funding_rate --rank-by-liquidity --log-level INFO
 python -m universe.builder --venue binance --pit-mode event \
     --start 2021-09-01 --end <today> --freq weekly
-python -m audit.acceptance --venue binance
+python -m audit.acceptance --venue binance --allow-gapped-assets TLM,ICP
 ```
 
-`--rank-by-liquidity` is what addresses the finding nothing flagged: member
-counts of 0/64/139 against a `target_size` of 150 cleared the gate's median
-floor of 20 while describing a materially thinner breadth machine, because the
-200 symbols pulled were the alphabetically first, not the most traded. Until
-those commands run, the gate's verdict on the real store is still the 3-of-7
-block from 2026-08-03 — correctly, because that store has not changed.
+128,357 bars and 514,247 settlements over 200 assets, 2021-08-01..2026-07-31
+(5.00y), in **one ingestion run**: zero duplicates on both datasets,
+`price_agreement` and `asset_identity` clean, 259 weekly universe snapshots with
+no empties after the warm-up. The three defects are gone from the data, not only
+from the code.
 
-And §5 of every methodology doc is still empty with all six signals still
-`draft`, because the research steps in `DATA.md` §4 come *after* an accepted
-backfill, not alongside it.
+Two findings from that run are worth carrying forward:
+
+- **`bar_gaps`: TLM and ICP are venue halts, not lost downloads.** TLM is
+  missing 2023-02-28..2023-03-30 and ICP 2022-08-31..2022-09-27. The bucket
+  publishes every month across the window *and* the months are complete — the
+  missing days sit inside published files, so the archive has no bars for them
+  either. Recorded with `--allow-gapped-assets TLM,ICP`. This exposed a blind
+  spot in `classify_gap`, one level below the one Phase 5.9 fixed: it compares a
+  gap against published *months*, and a month-level check cannot see a
+  suspension inside a month, so it answers "refetch this window" for a halt.
+  Written down in `TODO.md` rather than quietly patched.
+- **`universe_breadth` warns, and the check cannot fully be trusted here.**
+  Members are 33/59/150 against a target of 150 — the maximum reaches the cap, so
+  the recent end is full, and the median is dragged down by 2021-2022 when few of
+  the 200 symbols were listed at all. Comparing a five-year median against a flat
+  target cannot separate "too few candidates pulled" from "the venue listed fewer
+  perps then", which is why it does not block.
+
+§5 of every methodology doc is still empty with all six signals still `draft` —
+but that is now a matter of running the research in `DATA.md` §4, not of waiting
+for data.
 
 **Price adjustments are deliberately not being built yet.** The first plan for
 this was to treat `BOB` and `CAT` as redenominations and build split-style
@@ -1423,12 +1439,10 @@ See `TODO.md` for detailed phase breakdown and progress log.
 
 ---
 
-**Next**: **the Phase 5.9 re-pull**, which is the one item of that phase that is
-not code. The three defects are fixed — one shared canonicalisation with a
-collision guard, one market type per venue, collision-proof partition filenames
-— and the gate reports verdicts rather than shapes, with the three checks that
-would have caught them. What is left is running the four commands in
-[What is not done](#what-is-not-done) on the machine that holds the store, with
-a liquidity-ranked symbol list and the universe rebuilt from past the
-listing-age warm-up, and getting a green gate. Only then the backtest evidence
-for the six signals, and then Phase 6, the factor risk model (see `TODO.md`)
+**Next**: **the backtest evidence for the six signals**, which an accepted
+backfill has finally unblocked. `DATA.md` §4 in order: a walk-forward parameter
+grid per signal selecting on prior folds only, run in `--pit-mode event` and
+labelled as research indications rather than live-fidelity results, then
+`scratch/scratch_signal_breadth.py` against the store to fill §6 with measured
+correlations. That is what takes the signals out of `draft`. Then Phase 6, the
+factor risk model (see `TODO.md`)
